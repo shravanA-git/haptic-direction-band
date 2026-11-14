@@ -116,8 +116,23 @@ def scaled(cue: Cue, intensity: str = "medium") -> Cue:
     f = INTENSITY[intensity]
     if f == 1.0:
         return list(cue)
-    return [(int(round(off * f)), m, max(MIN_PULSE_MS, min(MAX_PULSE_MS, int(round(ms * f)))))
-            for off, m, ms in cue]
+    out = [(int(round(off * f)), m, max(MIN_PULSE_MS, min(MAX_PULSE_MS, int(round(ms * f)))))
+           for off, m, ms in cue]
+    return _limit_overlap(out)
+
+
+MAX_AT_ONCE = 2            # firmware runs at most 2 motors at once (protocol change B)
+
+
+def _limit_overlap(steps: Cue) -> Cue:
+    """Scaling shrinks gaps but not the 60 ms minimum pulse, so pulses can start to
+    overlap. Delay a step until fewer than MAX_AT_ONCE earlier ones are still on."""
+    placed: Cue = []
+    for off, m, ms in sorted(steps, key=lambda s: s[0]):
+        while sum(1 for o, _, d in placed if o <= off < o + d) >= MAX_AT_ONCE:
+            off = min(o + d for o, _, d in placed if o <= off < o + d)
+        placed.append((off, m, ms))
+    return placed
 
 
 _epoch = 0

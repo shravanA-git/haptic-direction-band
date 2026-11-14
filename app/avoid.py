@@ -53,7 +53,10 @@ NEAR_M = 2.5              # closer than this: "near" (still passable)
 BLOCK_M = 1.3             # closer than this: "blocked" (steer around)
 STOP_M = 0.9              # centre closer than this: crash warning
 STOP_FRAMES = 3           # updates in a row before warning (one-frame flukes)
-STOP_REPEAT_S = 0.8
+STOP_PULSE_MS, STOP_GAP_MS, STOP_PAUSE_MS = 300, 150, 400   # approved by Shravan + Jason, Nov 14
+STOP_PULSES = 3
+STOP_REPEAT_S = (STOP_PULSES * STOP_PULSE_MS + (STOP_PULSES - 1) * STOP_GAP_MS + STOP_PAUSE_MS) / 1000
+STOP_MAX = 5              # warnings in a row, then Generic attention until the path clears
 STEER_REPEAT_S = 1.2      # walking with no find target: steer cue this often
 PAD = 0.04                # widen each box by this share of the frame (body width)
 SMOOTH_N = 3              # median of the last N distances per sector
@@ -219,10 +222,10 @@ class Avoider:
 
 
 def stop_cue() -> list:
-    """Crash warning from existing cues: two generic-attention pulses (300 ms front)
-    150 ms apart. PROVISIONAL until HDB-Protocol signs off a distinct pattern."""
-    g = haptics.generic_attention()[0]
-    return [g, (g[2] + 150, g[1], g[2])]
+    """Crash warning (protocol change D, Nov 14): 3 x 300 ms on the front motor,
+    150 ms gaps (1.2 s). Distinct from Centered (2 x 100 ms) and Generic (one 300 ms)."""
+    step = STOP_PULSE_MS + STOP_GAP_MS
+    return [(k * step, haptics.FRONT, STOP_PULSE_MS) for k in range(STOP_PULSES)]
 
 
 class AvoidLoop:
@@ -245,6 +248,8 @@ class AvoidLoop:
         self.steer = STEER              # False: crash warning only
         self._last_frame = None
         self._next_stop = 0.0
+        self._stops = 0                 # warnings played in this episode
+        self.halt: Optional[Callable[[], object]] = None   # STOP + clear queued pulses first
         self._next_steer = 0.0
         self._stop = threading.Event()
         self.fps = 0.0
@@ -297,10 +302,17 @@ class AvoidLoop:
     def _act(self, d: AvoidDecision, now: float) -> None:
         if d.action == "stop":
             if now >= self._next_stop:          # warns even while guiding (override)
-                self.play(stop_cue())
+                if self._stops == 0 and self.halt:
+                    try:
+                        self.halt()             # STOP first so queued guidance can't mix in
+                    except Exception as e:
+                        print(f"[avoid] halt error: {e}")
+                # after STOP_MAX warnings drop to Generic attention until the path clears
+                self.play(stop_cue() if self._stops < STOP_MAX else haptics.generic_attention())
+                self._stops += 1
                 self._next_stop = now + STOP_REPEAT_S
             return
-        self._next_stop = 0.0
+        self._next_stop, self._stops = 0.0, 0
         if not self.steer or self.guiding():
             return                               # warning only / ObjectGuide applies steer
         if d.action in ("steer", "turn") and now >= self._next_steer:

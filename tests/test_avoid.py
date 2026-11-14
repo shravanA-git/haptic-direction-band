@@ -245,3 +245,49 @@ def test_default_is_crash_warning_only():
     for k in range(A.STOP_FRAMES + 1):
         loop.step(frame, now=1 + 0.05 * k)
     assert played == [A.stop_cue()] and loop.override(1.2).action == "stop"
+
+
+def test_stop_cue_is_three_300ms_front_pulses_with_150ms_gaps():     # protocol change D
+    assert A.stop_cue() == [(0, 0, 300), (450, 0, 300), (900, 0, 300)]
+    assert A.STOP_REPEAT_S == 1.6                                       # 1.2 s cue + 400 ms pause
+    assert A.stop_cue() != haptics.centered() and A.stop_cue() != haptics.generic_attention()
+
+
+def test_stop_halts_first_then_caps_at_five_then_generic_until_clear():
+    v, played, halts = FakeVision(), [], []
+    loop = A.AvoidLoop(v, play=played.append)
+    loop.halt = lambda: halts.append(1)
+    frame = np.zeros((H, W, 3), np.uint8)
+    v.detector.dets = [("person", 200, 0, 440, H, 0.9)]
+    t = 0.0
+    for _ in range(A.STOP_FRAMES + 40):
+        loop.step(frame, now=t)
+        t += 0.5
+    assert halts == [1]                                                 # STOP once, at the start
+    assert played[:5] == [A.stop_cue()] * 5
+    assert all(c == haptics.generic_attention() for c in played[5:]) and len(played) > 5
+    v.detector.dets = []
+    for _ in range(4):
+        loop.step(frame, now=t)
+        t += 0.5
+    v.detector.dets = [("person", 200, 0, 440, H, 0.9)]                 # cleared, then blocked again
+    n = len(played)
+    for _ in range(A.STOP_FRAMES):
+        loop.step(frame, now=t)
+        t += 0.5
+    assert played[n] == A.stop_cue() and halts == [1, 1]
+
+
+def test_every_cue_respects_the_firmware_limits():                     # protocol changes B, C
+    from app.link import MAX_PULSE_MS
+    cues = [haptics.directional(m) for m in range(8)] + [
+        haptics.generic_attention(), haptics.centered(), haptics.lost(), haptics.target_ack(),
+        haptics.target_unknown(), A.stop_cue(), haptics.taught_sound(), haptics.walk()]
+    cues += [haptics.taught_sound(c) for c in haptics.SOUND_PATTERNS]
+    for cue in cues:
+        for intensity in ("low", "medium", "high"):
+            steps = haptics.scaled(cue, intensity)
+            assert all(0 < ms <= MAX_PULSE_MS for _, _, ms in steps)
+            for off, _, ms in steps:                       # at most 2 motors on at any instant
+                on = sum(1 for o, _, d in steps if o <= off < o + d)
+                assert on <= 2, (cue, intensity)

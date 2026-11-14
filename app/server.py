@@ -161,6 +161,7 @@ class App:
         and are logged; decisions go to the dashboard as {"type":"avoid",...}."""
         self.avoid = loop
         loop.play = self._play_avoid
+        loop.halt = lambda: (haptics.cancel_all(), self.link.stop())   # STOP before a warning
         loop.on_decision = lambda d: self.emit(d.to_msg())
 
     def _play_avoid(self, cue) -> None:
