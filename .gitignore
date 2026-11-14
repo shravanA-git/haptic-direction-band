@@ -22,3 +22,6 @@ recordings/
 build/
 # caregiver texting bridge (npm install in tools/photon)
 node_modules/
+
+# Matterport model cache (tools/costar_nav.py): CoStar/Matterport data, not ours to commit
+mp_cache/
