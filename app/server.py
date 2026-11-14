@@ -9,6 +9,7 @@ WebSocket, page -> server (JSON):
   {"cmd":"replay","name":"fixtures/back_left.json"}  {"cmd":"replay_stop"}
   {"cmd":"target","name":"banana"}   (typed target for vision)
   {"cmd":"action","down":bool}       (dashboard hold-to-talk = BTN ACTION DOWN/UP)
+  {"cmd":"name","name":"Shravan"}    (name to listen for; comma-separated ok)
   {"cmd":"bench","name":"gate|walk|cardinals"}   (gate checks by feel; STOP cancels)
 server -> page:
   {"type":"mic","ms":..,"levels":[f,r,b,l],"replay":bool}
@@ -43,20 +44,22 @@ class App:
         self.clients: set[web.WebSocketResponse] = set()
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.recorder = trace.Recorder()
-        self.clock = direction.ClockSync()
+        self.live = direction.LiveEstimator()   # MIC buffer + clock sync for name alerts
+        self.names = None
         self.replayer: Optional[trace.Replayer] = None
         self.state = {"object": None, "name": None, "heard": None}
         self.vision = None
         self.guide = None
         self.speech = None
         link.subscribe(self._on_event)
+        link.subscribe(self.live)
         link.subscribe(self.recorder)
         link.on_sent(self._on_sent)
 
     # ---------------------------------------------------------- broadcast
     def emit(self, msg: dict) -> None:
         """Thread-safe: may be called from the link or replay threads."""
-        if self.loop is None:
+        if self.loop is None or self.loop.is_closed():
             return
         data = json.dumps(msg)
         self.loop.call_soon_threadsafe(self._fanout, data)
@@ -95,6 +98,29 @@ class App:
         else:
             self.emit({"type": "log", "text": f"heard target {r.target}, but vision isn't running"})
 
+    def attach_names(self, listener) -> None:
+        """listener: app.speech.NameListener (or anything with on_hit,
+        pause/resume, set_names). A hit -> direction estimate -> cue."""
+        self.names = listener
+        listener.on_hit = self.on_name_hit
+
+    def on_name_hit(self, hit) -> None:
+        """Name heard at hit.start..hit.end (laptop monotonic seconds):
+        estimate direction from the band mics over that window and buzz."""
+        e, win = self.live.estimate(hit.start, hit.end)
+        haptics.play(haptics.name_alert(e.motor), self.link.pulse)
+        where = (f"{haptics.MOTOR_NAMES[e.motor]} (motor {e.motor})" if e.motor is not None
+                 else f"generic: {e.reason}")
+        self.state["name"] = f"{hit.name} → {where}"
+        self.emit({"type": "state", **self.state})
+        self.emit({"type": "estimate", "trace": f"live: {hit.name}", "motor": e.motor,
+                   "angle": e.angle_deg, "consistency": round(e.consistency, 2),
+                   "strength": round(e.strength, 2), "frames": e.frames_used,
+                   "reason": e.reason, "window": win,
+                   "latency": round(getattr(hit, "latency", 0.0), 2)})
+        if win and self.recorder.active:   # recorded traces get the alert window for replay
+            self.recorder.mark_alert(*win)
+
     def _action(self, down: bool) -> None:
         """Action button (board or dashboard): alert window while recording,
         no cues while held, hold-to-talk speech."""
@@ -103,6 +129,8 @@ class App:
         if self.vision:
             for obj in (self.vision, self.guide):
                 (obj.pause if down else obj.resume)()
+        if self.names:   # hold-to-talk owns the mic while Action is held
+            (self.names.pause if down else self.names.resume)()
         if self.speech:
             try:
                 self.speech.on_button(down)
@@ -118,7 +146,6 @@ class App:
     # ----------------------------------------------------------- link side
     def _on_event(self, ev) -> None:
         if isinstance(ev, MicFrame):
-            self.clock.add(ev.ms, ev.rx)
             self.emit({"type": "mic", "ms": ev.ms, "levels": list(ev.levels), "replay": False})
         elif isinstance(ev, ButtonEvent):
             self.emit({"type": "btn", "name": ev.name, "down": ev.down})
@@ -155,6 +182,11 @@ class App:
             down = bool(m.get("down"))
             self.emit({"type": "btn", "name": "ACTION", "down": down})
             self._action(down)
+        elif cmd == "name":
+            if not self.names:
+                return {"type": "log", "text": "name listener not running (start with --name)"}
+            self.names.set_names(m.get("name") or "")
+            return {"type": "log", "text": f"listening for: {', '.join(self.names.names) or 'nothing'}"}
         elif cmd == "bench":
             return self.bench(m.get("name"))
         elif cmd == "record_start":

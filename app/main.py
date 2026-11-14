@@ -7,6 +7,7 @@
   python -m app.main --target banana      # webcam find-an-object cues on the band
   python -m app.main --vision             # webcam + hold Action, say "find the banana"
   python -m app.main --sim --vision --mirror   # laptop's own camera facing you
+  python -m app.main --name Shravan       # buzz toward whoever calls the name
 Then open http://localhost:8765
 """
 from __future__ import annotations
@@ -34,6 +35,7 @@ def main(argv=None) -> int:
     ap.add_argument("--mirror", action="store_true",
                     help="camera faces you (laptop webcam): swap left/right")
     ap.add_argument("--no-speech", action="store_true", help="with vision: typed target only")
+    ap.add_argument("--name", help="listen for this name (comma-separated ok) and buzz its direction")
     a = ap.parse_args(argv)
 
     if a.sim:
@@ -74,10 +76,24 @@ def main(argv=None) -> int:
                 print("[hdb] hold-to-talk on Action (whisper loads on first use)")
             except Exception as e:  # faster-whisper/sounddevice not installed
                 print(f"[hdb] speech off ({e}); typed Find box only")
+    names = None
+    if a.name:
+        try:
+            from .speech import NameListener
+            shared = getattr(app.speech, "transcriber", None)  # one whisper model, not two
+            names = NameListener(a.name, transcriber=shared)
+            app.attach_names(names)
+            names.start()
+            print(f"[hdb] listening for name(s): {', '.join(names.names)}")
+        except Exception as e:  # no faster-whisper/sounddevice, or no mic permission
+            names = None
+            print(f"[hdb] name listener off: {e}")
     print(f"[hdb] serial: {link.device}  dashboard: http://localhost:{a.http}")
     try:
         web.run_app(app.make_app(), host="127.0.0.1", port=a.http, print=None)
     finally:
+        if names:
+            names.stop()
         if vision:
             vision.stop()
             guide.close()

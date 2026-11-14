@@ -9,6 +9,9 @@ timestamps to ESP32 ms comes later (ClockSync below is the hook).
 from __future__ import annotations
 
 import math
+import threading
+import time
+from collections import deque
 from dataclasses import dataclass
 from statistics import median
 from typing import Optional, Sequence
@@ -92,3 +95,55 @@ class ClockSync:
         if not self._d:
             return None
         return laptop_monotonic * 1000 - min(self._d)
+
+
+class LiveEstimator:
+    """Live name alerts: buffers recent MIC frames, maps laptop-monotonic
+    speech timestamps onto the ESP32 clock and runs estimate() on the window.
+
+    Feed it every MicFrame (it is a Link listener). Stale evidence (no frames
+    yet, or the stream stopped more than stale_s ago) gives motor None, i.e.
+    the generic attention cue.
+    """
+
+    def __init__(self, keep_ms: int = 8000, pad_ms: int = 100, stale_s: float = 1.0,
+                 clock: Optional[ClockSync] = None):
+        self.keep_ms, self.pad_ms, self.stale_s = keep_ms, pad_ms, stale_s
+        self.clock = clock or ClockSync()
+        self._frames: deque = deque()
+        self._last_rx = 0.0
+        self._lock = threading.Lock()
+
+    def __call__(self, ev) -> None:
+        ms, levels, rx = getattr(ev, "ms", None), getattr(ev, "levels", None), getattr(ev, "rx", 0.0)
+        if ms is None or levels is None:
+            return
+        with self._lock:
+            if self._frames and ms < self._frames[-1]["ms"]:   # ESP32 rebooted: clock restarted
+                self._frames.clear()
+                self.clock = ClockSync(self.clock.window)
+            self.clock.add(ms, rx)
+            self._frames.append({"ms": ms, "levels": list(levels)})
+            while self._frames and ms - self._frames[0]["ms"] > self.keep_ms:
+                self._frames.popleft()
+            self._last_rx = rx
+
+    def window(self, start_s: float, end_s: float):
+        """Laptop monotonic seconds -> padded (start_ms, end_ms) on the ESP32 clock."""
+        a, b = self.clock.to_esp_ms(start_s), self.clock.to_esp_ms(end_s)
+        if a is None or b is None:
+            return None
+        return int(a) - self.pad_ms, int(b) + self.pad_ms
+
+    def estimate(self, start_s: float, end_s: float, now: Optional[float] = None):
+        """Returns (Estimate, esp_window or None)."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            frames = list(self._frames)
+            win = self.window(start_s, end_s)
+            last_rx = self._last_rx
+        if win is None or not frames:
+            return Estimate(None, None, 0.0, 0.0, 0, "no MIC frames (band not streaming)"), None
+        if now - last_rx > self.stale_s:
+            return Estimate(None, None, 0.0, 0.0, 0, f"MIC stream stale ({now - last_rx:.1f} s)"), win
+        return estimate(frames, *win), win

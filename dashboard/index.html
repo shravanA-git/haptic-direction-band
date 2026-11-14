@@ -84,7 +84,11 @@
         <input id="tgt" placeholder="target, e.g. banana" style="font:inherit;background:#2a2f3a;color:var(--ink);border:1px solid #454c5c;border-radius:8px;padding:7px;flex:1">
         <button id="find">Find</button>
       </div>
-      <button id="talk" title="same as holding the band's Action button">Hold to talk</button>
+      <div class="row">
+        <button id="talk" title="same as holding the band's Action button">Hold to talk</button>
+        <input id="nm" placeholder="name to listen for" style="font:inherit;background:#2a2f3a;color:var(--ink);border:1px solid #454c5c;border-radius:8px;padding:7px;flex:1">
+        <button id="setnm">Listen</button>
+      </div>
     </section>
     <section>
       <h2>Record &amp; replay</h2>
@@ -168,6 +172,8 @@ $("talk").onpointerdown = () => { $("talk").classList.add("active"); send({cmd: 
 $("talk").onpointerup = $("talk").onpointerleave = () => {
   if ($("talk").classList.contains("active")) { $("talk").classList.remove("active"); send({cmd: "action", down: false}); }
 };
+$("setnm").onclick = () => send({cmd: "name", name: $("nm").value});
+$("nm").onkeydown = e => { if (e.key === "Enter") $("setnm").onclick(); };
 $("halt").onclick = () => send({cmd: "replay_stop"});
 
 // ---- websocket
