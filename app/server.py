@@ -16,7 +16,9 @@ WebSocket, page -> server (JSON):
   {"cmd":"ask","text":"who called me?"}   (Recall chatbot; reply {"type":"recall",..})
   {"cmd":"setting","setting":"intensity","value":"high"}   {"cmd":"settings"}
   {"cmd":"caregiver_test"}           (send a test text; caregiver_texts toggles via "setting")
-  {"cmd":"teach","seconds":2.5}      (Teach a Sound: make the sound once)  {"cmd":"forget_sound"}
+  {"cmd":"teach","seconds":2.5,"label":"doorbell","add":bool}   (Teach a Sound: make the sound once;
+                                     add=true adds an example to that label)
+  {"cmd":"forget_sound","label":"doorbell"?}   (no label: forget all)   {"cmd":"sounds"}
   {"cmd":"avoid","on":bool}          (obstacle avoidance on/off, with --avoid)
 HTTP GET /video: MJPEG (multipart/x-mixed-replace) of the vision camera's
   annotated frames (tracked box, dead band, "target: STATE"); 503 without vision.
@@ -26,6 +28,7 @@ server -> page:
   {"type":"btn","name":"ACTION","down":bool}      {"type":"raw","text":..}
   {"type":"status",...,"faults":{"serial"|"camera"|"mic"|"speech": text}}  {"type":"estimate",...}  {"type":"traces","items":[..]}
   {"type":"state","object":..,"name":..,"heard":..,"sound":..}  {"type":"log","text":..}
+  {"type":"sounds","items":[{"label","category","description","pitch_hz","examples"}]}
   {"type":"settings",...Settings.snapshot()}  {"type":"caregiver",...Caregiver.status()}  {"type":"recall","q":..,"a":..,"via":..,"actions":[..]}
   {"type":"alert",...AlertLog record}  {"type":"label",...}  {"type":"alerts","items":[..]}
 """
@@ -278,6 +281,17 @@ class App:
         listener.on_taught = self._on_taught
         self.state["sound"] = "taught, listening" if listener.template else "not taught yet"
 
+    def sounds_msg(self) -> dict:
+        """Taught sounds for the dashboard, grouped by category, low pitch first."""
+        sl, items = self.sound, []
+        if sl is not None:
+            for cat, rows in sl.categories().items():
+                for label, pitch, desc in rows:
+                    items.append({"label": label, "category": cat, "description": desc,
+                                  "pitch_hz": round(pitch) if pitch else None,
+                                  "examples": len(sl.sounds.get(label, []))})
+        return {"type": "sounds", "items": items}
+
     def on_sound(self, hit) -> None:
         """Taught sound recognised (laptop mic) at hit.start..hit.end. If the band
         is streaming MIC frames, estimate where it came from over that window (as
@@ -308,9 +322,11 @@ class App:
     def _on_taught(self, tpl, msg: str) -> None:
         # a failed teach keeps the sounds taught before
         known = tpl or getattr(self.sound, "template", None)
-        self.state["sound"] = "taught, listening" if known else "not taught yet"
+        self.state["sound"] = (f"taught '{tpl.label}' [{tpl.category}], listening" if tpl
+                               else "taught, listening" if known else "not taught yet")
         self.emit({"type": "state", **self.state})
         self.emit({"type": "log", "text": f"teach a sound: {msg}"})
+        self.emit(self.sounds_msg())
 
     def _action(self, down: bool) -> None:
         """Action button (board or dashboard): alert window while recording,
@@ -402,13 +418,24 @@ class App:
             if not self.sound:
                 return {"type": "log", "text": "sound listener not running (start with --sound)"}
             secs = min(max(float(m.get("seconds", 2.5)), 0.5), 10.0)
-            self.sound.teach(secs)
-            self.state["sound"] = f"teaching: make the sound now ({secs:g} s)"
+            label = str(m.get("label") or "").strip() or None
+            add = bool(m.get("add"))
+            self.sound.teach(secs, label=label, add=add)
+            what = f"'{label}'" if label else "the sound"
+            self.state["sound"] = (f"teaching {what}{' (another example)' if add else ''}: "
+                                   f"make it now ({secs:g} s)")
             self.emit({"type": "state", **self.state})
         elif cmd == "forget_sound" and self.sound:
-            self.sound.forget()
-            self.state["sound"] = "not taught yet"
+            label = str(m.get("label") or "").strip() or None
+            if label and label not in self.sound.sounds:
+                return {"type": "log", "text": f"no taught sound called '{label}'"}
+            self.sound.forget(label)
+            self.state["sound"] = "taught, listening" if self.sound.sounds else "not taught yet"
             self.emit({"type": "state", **self.state})
+            self.emit(self.sounds_msg())
+            return {"type": "log", "text": f"forgot {repr(label) if label else 'all taught sounds'}"}
+        elif cmd == "sounds":
+            return self.sounds_msg()
         elif cmd == "label":
             return self.label(m.get("truth"), m.get("id"))
         elif cmd == "missed":
@@ -643,6 +670,8 @@ class App:
         await ws.send_str(json.dumps({"type": "settings", **self.settings.snapshot()}))
         if self.caregiver:
             await ws.send_str(json.dumps({"type": "caregiver", **self.caregiver.status()}))
+        if self.sound:
+            await ws.send_str(json.dumps(self.sounds_msg()))
         async for msg in ws:
             if msg.type != WSMsgType.TEXT:
                 continue

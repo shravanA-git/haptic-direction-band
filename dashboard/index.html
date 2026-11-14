@@ -122,12 +122,17 @@
       <div class="row">
         <div class="row">
           <button id="talk" title="same as holding the band's Action button">Hold to talk</button>
-          <button id="teach" title="Teach a Sound: make the sound once within 2.5 s">Teach a sound</button>
-          <button id="forget" title="forget the taught sound">Forget</button>
         </div>
         <input id="nm" placeholder="name to listen for" style="font:inherit;background:#2a2f3a;color:var(--ink);border:1px solid #454c5c;border-radius:8px;padding:7px;flex:1">
         <button id="setnm">Listen</button>
       </div>
+      <div class="row">
+        <input id="sndname" placeholder="sound name, e.g. doorbell" style="font:inherit;background:#2a2f3a;color:var(--ink);border:1px solid #454c5c;border-radius:8px;padding:7px;flex:1">
+        <button id="teach" title="Teach a Sound: make the sound once within 2.5 s (same name again replaces it)">Teach a sound</button>
+        <button id="addex" title="make the sound again: adds another example to this name">Add example</button>
+        <button id="forget" title="forget every taught sound">Forget all</button>
+      </div>
+      <div id="sounds" style="font-size:15px;margin-top:6px"></div>
     </section>
     <section>
       <h2>Record &amp; replay</h2>
@@ -262,8 +267,28 @@ $("askbtn").onclick = ask;
 $("askq").onkeydown = e => { if (e.key === "Enter") ask(); };
 $("cgtoggle").onclick = () => send({cmd: "setting", setting: "caregiver_texts", value: settings.caregiver_texts === "on" ? "off" : "on"});
 $("cgtest").onclick = () => send({cmd: "caregiver_test"});
-$("teach").onclick = () => send({cmd: "teach", seconds: 2.5});
+const sndName = () => $("sndname").value.trim();
+$("teach").onclick = () => send({cmd: "teach", seconds: 2.5, label: sndName()});
+$("addex").onclick = () => {
+  if (!sndName()) { log("add example: type the sound's name first"); return; }
+  send({cmd: "teach", seconds: 2.5, label: sndName(), add: true});
+};
 $("forget").onclick = () => send({cmd: "forget_sound"});
+function showSounds(items) {
+  const box = $("sounds"); box.textContent = "";
+  if (!items.length) { box.textContent = "no sounds taught"; return; }
+  for (const it of items) {
+    const row = document.createElement("div"); row.className = "row";
+    const t = document.createElement("span"); t.style.flex = "1";
+    t.textContent = `${it.label} [${it.category}] ${it.description}` +
+                    (it.examples > 1 ? ` (${it.examples} examples)` : " (1 example)");
+    t.title = "click to put this name in the box (then Add example)";
+    t.onclick = () => { $("sndname").value = it.label; };
+    const b = document.createElement("button"); b.textContent = "Forget";
+    b.onclick = () => send({cmd: "forget_sound", label: it.label});
+    row.append(t, b); box.appendChild(row);
+  }
+}
 $("talk").onpointerdown = () => { $("talk").classList.add("active"); send({cmd: "action", down: true}); };
 $("talk").onpointerup = $("talk").onpointerleave = () => {
   if ($("talk").classList.contains("active")) { $("talk").classList.remove("active"); send({cmd: "action", down: false}); }
@@ -352,6 +377,7 @@ function connect() {
         break; }
       case "state": $("obj").textContent = m.object ?? "–"; $("name").textContent = m.name ?? "–"; $("heard").textContent = m.heard ?? "–"; $("sound").textContent = m.sound ?? "–"; break;
       case "log": log(m.text); break;
+      case "sounds": showSounds(m.items || []); break;
       case "recall":
         chat("recall", m.a);
         $("recallvia").textContent = `(${m.via})`;
