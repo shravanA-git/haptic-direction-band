@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from .vision import REPO_ROOT, resolve_target
+from .vision import COCO_CLASSES, REPO_ROOT, resolve_target
 
 DEFAULT_MODEL = "anthropic:claude-opus-5-5"
 MEMORY_PATH = "/seen_objects.md"
@@ -212,7 +212,7 @@ def _make_tools(scene: SceneTools):
     return look, sweep, start_guiding
 
 
-def load_model(name: Optional[str] = None):
+def load_model(name: Optional[str] = None, **kwargs):
     from langchain.chat_models import init_chat_model
     name = name or os.environ.get("HDB_AGENT_MODEL", DEFAULT_MODEL)
     if name.startswith("anthropic:"):
@@ -220,8 +220,91 @@ def load_model(name: Optional[str] = None):
         if not key:
             raise RuntimeError("ANTHROPIC_API_KEY is not set (export it or add it to .env, "
                                "which is gitignored)")
-        return init_chat_model(name, api_key=key)
-    return init_chat_model(name)
+        return init_chat_model(name, api_key=key, **kwargs)
+    return init_chat_model(name, **kwargs)
+
+
+# --------------------------------------------------------------------------
+# Hold-to-talk target picker: one fast LangChain call for the live app
+# --------------------------------------------------------------------------
+# The keyword matcher in app/speech.py handles "find the banana" instantly. When it
+# finds no detector class ("I'm thirsty", "where did I put the thing I read with"),
+# app/speech.py asks this picker. It runs only on that path, never in the cue loop.
+
+PICK_MODEL = os.environ.get("HDB_TARGET_MODEL", "anthropic:claude-haiku-5-5")
+PICK_TIMEOUT_S = 6.0
+
+PICK_PROMPT = """A blind or low-vision person wearing a haptic band with a head camera \
+held a button and said something (speech-to-text, may contain mishearings). Decide which \
+physical object they want help finding, and call TargetChoice.
+
+Prefer exactly one of these detector classes when one fits (it is faster and more \
+reliable): {classes}.
+If none fits, give a short concrete noun phrase (1-3 words) an open-vocabulary detector \
+can look for, e.g. "keys", "headphones", "white cane".
+If they are not asking to find a physical object, set target to null.
+Examples: "I'm thirsty" -> bottle; "where did I leave my keys" -> keys; \
+"I want to sit down" -> chair; "what time is it" -> null."""
+
+
+def _target_choice_tool():
+    from pydantic import BaseModel, Field
+
+    class TargetChoice(BaseModel):
+        """The object the wearer wants to find."""
+        target: Optional[str] = Field(
+            None, description="detector class or short noun phrase; null if no object asked for")
+        reason: str = Field("", description="a few words on why")
+
+    return TargetChoice
+
+
+def pick_target(text: str, model=None) -> Optional[str]:
+    """Free speech -> object to find (COCO class if one fits, else a short phrase), or
+    None. Raises on model/network errors; callers fall back to keywords."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+    if not (text or "").strip():
+        return None
+    tool = _target_choice_tool()
+    if model is None:
+        model = load_model(PICK_MODEL, timeout=PICK_TIMEOUT_S, max_retries=1)
+    llm = model.bind_tools([tool], tool_choice="TargetChoice")
+    msg = llm.invoke([SystemMessage(PICK_PROMPT.format(classes=", ".join(COCO_CLASSES))),
+                      HumanMessage(text)])
+    calls = getattr(msg, "tool_calls", None) or []
+    raw = calls[0]["args"].get("target") if calls else _text(msg)
+    t = " ".join(str(raw or "").lower().strip(" .\"'").split())
+    if not t or t in ("null", "none", "nothing"):
+        return None
+    return resolve_target(t) or t
+
+
+def target_picker(model=None) -> Optional[Callable[[str], Optional[str]]]:
+    """The picker app/speech.py should use, or None if LangChain is off.
+
+    HDB_TARGET_LLM=0 turns it off, =1 forces it on; by default it is on when
+    langchain is installed and the model's API key is set."""
+    mode = os.environ.get("HDB_TARGET_LLM", "auto").lower()
+    if mode in ("0", "off", "false", "no"):
+        return None
+    if model is None and mode not in ("1", "on", "true", "yes"):
+        if PICK_MODEL.startswith("anthropic:") and not os.environ.get("ANTHROPIC_API_KEY"):
+            return None
+        if PICK_MODEL.startswith("google_genai:") and not os.environ.get("GOOGLE_API_KEY"):
+            return None
+    try:
+        import langchain_core  # noqa: F401
+    except ImportError:
+        return None
+    cache = {}
+
+    def pick(text: str) -> Optional[str]:
+        if "m" not in cache:  # build the client once, on first use
+            cache["m"] = model if model is not None else load_model(
+                PICK_MODEL, timeout=PICK_TIMEOUT_S, max_retries=1)
+        return pick_target(text, cache["m"])
+
+    return pick
 
 
 def build_agent(scene: SceneTools, model=None, scout_model=None, memory_model=None):
