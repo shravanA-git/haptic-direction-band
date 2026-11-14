@@ -13,8 +13,9 @@ from tests.test_server import FakeVision
 
 
 @pytest.mark.parametrize("text,want", [
-    ("find my glasses", None), ("where are my reading glasses", None),
-    ("find my sunglasses", None), ("find the wine glasses", "wine glass"),
+    ("find my glasses", "glasses"), ("where are my reading glasses", "reading glasses"),
+    ("find my sunglasses", "sunglasses"), ("find the wine glasses", "wine glass"),
+    ("where are my headphones?", "headphones"), ("hello there", None), ("find", None),
     ("find a glass of water", "cup"), ("find my coffee", "cup"),
     ("find my coffee mug", "cup"), ("find my MacBook", "laptop"),
     ("find my glasses and my phone", "cell phone"), ("find the banana", "banana"),

@@ -134,10 +134,9 @@ class SceneTools:
                    or "nothing recognizable"))
 
     def start_guiding(self, target: str) -> str:
-        cls = resolve_target(target)
-        if cls is None:
-            return f"cannot guide to '{target}': not a class the detector knows"
-        self.vision.set_target(cls)
+        cls = self.vision.set_target(target)   # COCO class, or an open-vocabulary phrase
+        if not cls:
+            return f"cannot guide to '{target}': the camera can't look for that"
         self.guiding = cls
         return (f"guiding to {cls} now: the band buzzes left/right, two front pulses when "
                 "centered, one long buzz if lost")

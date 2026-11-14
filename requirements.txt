@@ -13,5 +13,9 @@ ultralytics>=8.0
 # torch 2.15 aborts on macOS 14 with the MPS backend
 torch<2.12
 opencv-python>=4.8
+# open-vocabulary find ("where are my headphones"): YOLO-World's CLIP text encoder.
+# Then run `python -m app.vision --fetch` once, online, to download every model.
+clip @ git+https://github.com/ultralytics/CLIP.git
+certifi
 # Recall chatbot (optional): uses Claude when credentials exist, offline parser otherwise
 anthropic>=2.8

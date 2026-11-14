@@ -40,6 +40,8 @@ Running it
     python -m app.vision --target banana --show          # webcam 0, live window
     python -m app.vision --target banana --source clip.mp4
     python -m app.vision --check                         # is this computer ready? camera, mic, weights
+    python -m app.vision --fetch                         # download all models now (before the demo)
+    python -m app.vision --target "my headphones" --show # not a COCO class: YOLO-World (open vocabulary)
     python -m app.vision --selftest                      # tracker logic, no camera/weights
     python -m app.vision --target banana --show --log recordings/banana.csv   # tuning run
         (also --dead-band, --dead-band-exit, --lost-after, --smoothing, --min-score)
@@ -59,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -96,12 +99,18 @@ SYNONYMS = {
 }
 
 
+EYEWEAR = {"glasses", "eyeglasses", "eye glasses", "spectacles", "sunglasses",
+           "sun glasses", "reading glasses", "specs"}
+
+
 def resolve_target(name: str) -> Optional[str]:
     """Map a typed or spoken target ("the bananas", "my phone") to a COCO class."""
     s = " ".join(name.lower().replace("_", " ").replace("-", " ").split())
     for prefix in ("find the ", "find my ", "find a ", "find ", "the ", "my ", "a ", "an "):
         if s.startswith(prefix):
             s = s[len(prefix):]
+    if s in EYEWEAR:
+        return None   # "glasses" are eyewear, not "glass" -> cup (open vocabulary finds them)
     candidates = [s]
     if s.endswith("es"):
         candidates.append(s[:-2])
@@ -153,6 +162,7 @@ class TargetTracker:
     def __init__(self, config: Optional[TrackerConfig] = None):
         self.cfg = config or TrackerConfig()
         self.target: Optional[str] = None
+        self.min_score: Optional[float] = None
         self._reset()
 
     def _reset(self) -> None:
@@ -163,8 +173,11 @@ class TargetTracker:
         self._cand_since = 0.0
         self._state = "idle" if self.target is None else "searching"
 
-    def set_target(self, target: Optional[str]) -> None:
+    def set_target(self, target: Optional[str], min_score: Optional[float] = None) -> None:
+        """min_score: per-target score floor (open-vocabulary phrases score lower
+        than COCO classes); None = TrackerConfig.min_score."""
         self.target = target
+        self.min_score = min_score
         self._reset()
 
     @property
@@ -181,7 +194,7 @@ class TargetTracker:
         cands = []
         for b in boxes:
             x1, y1, x2, y2, score = b[:5]
-            if score < self.cfg.min_score:
+            if score < (self.min_score if self.min_score is not None else self.cfg.min_score):
                 continue
             cx = (x1 + x2) / 2.0
             off = (cx / frame_width) * 2.0 - 1.0
@@ -350,6 +363,7 @@ class Detector:
         self._lock = threading.Lock()
         self.imgsz = imgsz
         self.device = device or pick_device()
+        self.open_vocab: Optional["OpenVocab"] = None   # created on the first open phrase
         names = self.model.names
         self.class_ids = {(n.replace("_", " ")): i for i, n in names.items()}
 
@@ -365,8 +379,9 @@ class Detector:
 
     def detect(self, frame, target: str) -> list:
         cid = self.class_ids.get(target)
-        if cid is None:
-            return []
+        if cid is None:   # not a COCO class: the open-vocabulary model, if it has it
+            ov = self.open_vocab
+            return ov.detect(frame) if ov is not None and ov.phrase == target else []
         with self._lock:
             res = self.model.predict(frame, imgsz=self.imgsz, classes=[cid], conf=DETECT_CONF,
                                      device=self.device, verbose=False)[0]
@@ -374,6 +389,110 @@ class Detector:
         for xyxy, conf in zip(res.boxes.xyxy.tolist(), res.boxes.conf.tolist()):
             out.append((*xyxy, float(conf)))
         return out
+
+
+# --------------------------------------------------------------------------
+# Open vocabulary: YOLO-World for anything that isn't a COCO class
+# --------------------------------------------------------------------------
+
+OPEN_WEIGHTS = os.environ.get("HDB_OPEN_WEIGHTS", "yolov8s-worldv2.pt")
+OPEN_CONF = 0.05        # detector floor
+OPEN_MIN_SCORE = 0.15   # tracker floor for open phrases (YOLO-World scores run lower)
+
+_FILLERS = {"the", "my", "a", "an", "some", "our", "your", "his", "her", "their", "me",
+            "please", "now", "again", "for", "is", "are", "where", "where's", "wheres",
+            "find", "look", "looking", "locate", "get", "can", "you", "help", "i", "to",
+            "it", "them", "here", "there", "of", "this", "that", "these", "those", "hey"}
+_TRIGGERS = ("where are my", "where is my", "where are the", "where is the", "where's my",
+             "where's the", "wheres my", "where are", "where is", "where's", "looking for",
+             "look for", "search for", "find", "locate", "where")
+
+
+def clean_phrase(text: str, require_trigger: bool = False) -> Optional[str]:
+    """The object asked for, as a short noun phrase: "where are my headphones?" ->
+    "headphones", "find the red umbrella please" -> "red umbrella". Words after a
+    find/where trigger if there is one (required for speech, where "hello there"
+    isn't a request); fillers stripped; at most 4 words."""
+    s = " ".join(re.sub(r"[^a-z' ]+", " ", (text or "").lower().replace("-", " ")).split())
+    for trig in _TRIGGERS:
+        k = s.find(trig)
+        if k >= 0 and (k == 0 or s[k - 1] == " "):
+            s = s[k + len(trig):]
+            break
+    else:
+        if require_trigger:
+            return None
+    s = re.split(r"\b(?:and|or|so|because|but|then)\b", s)[0]
+    words = [w for w in s.split() if w not in _FILLERS]
+    return " ".join(words[:4]) or None
+
+
+def _models_cwd():
+    """Ultralytics drops downloads (YOLO-World weights, the CLIP text encoder) into
+    the cwd; run those steps inside models/ (gitignored)."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def cm():
+        MODELS_DIR.mkdir(exist_ok=True)
+        cwd = os.getcwd()
+        os.chdir(MODELS_DIR)
+        try:
+            yield
+        finally:
+            os.chdir(cwd)
+    return cm()
+
+
+def _https_certs() -> None:
+    """The python.org macOS build has no CA bundle for urllib (CLIP's downloader):
+    point it at certifi's unless the user set one."""
+    if not os.environ.get("SSL_CERT_FILE"):
+        try:
+            import certifi
+            os.environ["SSL_CERT_FILE"] = certifi.where()
+        except ImportError:
+            pass
+
+
+def open_vocab_ready() -> Optional[str]:
+    """None if open-vocabulary find can run here, else the reason."""
+    if os.environ.get("HDB_OPEN_VOCAB", "1") == "0":
+        return "disabled (HDB_OPEN_VOCAB=0)"
+    try:
+        import clip  # noqa: F401  (ultralytics' CLIP fork, text encoder for YOLO-World)
+    except ImportError:
+        return "pip install git+https://github.com/ultralytics/CLIP.git"
+    return None
+
+
+class OpenVocab:
+    """YOLO-World with one phrase at a time. set_phrase() costs ~2-3 s (CLIP text
+    encoding; ~10 s on first use while it loads), detect() ~35 ms/frame on MPS."""
+
+    def __init__(self, device: str, imgsz: int = DEFAULT_IMGSZ, lock=None):
+        from ultralytics import YOLO
+        _https_certs()
+        with _models_cwd():
+            self.model = YOLO(OPEN_WEIGHTS)
+        self.device, self.imgsz = device, imgsz
+        self.phrase: Optional[str] = None
+        self._lock = lock or threading.Lock()
+
+    def set_phrase(self, phrase: str) -> None:
+        if phrase == self.phrase:
+            return
+        _https_certs()
+        with self._lock, _models_cwd():
+            self.model.set_classes([phrase])
+        self.phrase = phrase
+
+    def detect(self, frame) -> list:
+        with self._lock:
+            res = self.model.predict(frame, imgsz=self.imgsz, conf=OPEN_CONF,
+                                     device=self.device, verbose=False)[0]
+        return [(*xyxy, float(c)) for xyxy, c in
+                zip(res.boxes.xyxy.tolist(), res.boxes.conf.tolist())]
 
 
 # --------------------------------------------------------------------------
@@ -402,6 +521,7 @@ class Vision:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self.detector: Optional[Detector] = None
+        self._ov_lock = threading.Lock()   # one OpenVocab, even if preload and a lookup race
         self.fps = 0.0
         self.error: Optional[str] = None
 
@@ -410,16 +530,54 @@ class Vision:
         self._callbacks.append(cb)
 
     def set_target(self, name: Optional[str]) -> Optional[str]:
-        target = None
+        """Typed or spoken target -> what is being tracked now, or None.
+        A COCO class ("my phone" -> "cell phone") uses the fast COCO detector;
+        anything else ("headphones") becomes an open-vocabulary phrase for
+        YOLO-World (first use loads it: several seconds). Returns None, and
+        tracks nothing, for an empty phrase or when open vocabulary is
+        unavailable (see open_vocab_ready())."""
+        target, floor = None, None
         if name:
             target = resolve_target(name)
             if target is None:
-                raise ValueError(f"unknown target {name!r}; try one of the COCO classes")
+                target = self._open_phrase(name)
+                floor = OPEN_MIN_SCORE
         with self._lock:
-            self.tracker.set_target(target)
+            self.tracker.set_target(target, floor)
         self._publish(VisionDecision(self.tracker.state, None, 0.0, None, target,
                                      time.monotonic(), True))
         return target
+
+    def _warm_open_vocab(self) -> None:
+        """Load YOLO-World + CLIP in the background (~10 s) so the first open
+        phrase costs only the ~2 s text encoding."""
+        try:
+            with self._ov_lock:
+                if self.detector is not None and self.detector.open_vocab is None:
+                    ov = OpenVocab(self.detector.device, self.detector.imgsz)
+                    ov.set_phrase("object")
+                    self.detector.open_vocab = ov
+        except Exception as e:
+            print(f"[vision] open vocabulary preload failed: {e}")
+
+    def _open_phrase(self, name: str) -> Optional[str]:
+        phrase = clean_phrase(name)
+        why = open_vocab_ready()
+        if not phrase or why or self.detector is None:
+            if phrase and why:
+                print(f"[vision] can't look for {phrase!r}: open vocabulary {why}")
+            return None
+        try:
+            with self._ov_lock:
+                if self.detector.open_vocab is None:
+                    self.detector.open_vocab = OpenVocab(self.detector.device,
+                                                         self.detector.imgsz)
+            self.detector.open_vocab.set_phrase(phrase)
+            return phrase
+        except Exception as e:
+            self.error = f"open vocabulary failed: {e}"
+            print(f"[vision] {self.error}")
+            return None
 
     def latest(self) -> VisionDecision:
         return self._latest
@@ -447,7 +605,11 @@ class Vision:
         if self._running:
             return True
         try:
-            self.detector = Detector(self.weights, self.imgsz)
+            # Load once: the app's camera watchdog calls start() every few seconds
+            # while the camera is missing, and reloading YOLO each time churned
+            # hundreds of MB and starved the dashboard's event loop (soak, Nov 14).
+            if self.detector is None:
+                self.detector = Detector(self.weights, self.imgsz)
         except Exception as e:
             return self._fail(f"detector failed to load ({type(e).__name__}: {e}); "
                               "pip install ultralytics opencv-python, and be online on first run "
@@ -466,6 +628,9 @@ class Vision:
         self._thread = threading.Thread(target=self._loop, args=(cap,), name="vision",
                                         daemon=True)
         self._thread.start()
+        if open_vocab_ready() is None and os.environ.get("HDB_OPEN_VOCAB_PRELOAD", "1") != "0":
+            threading.Thread(target=self._warm_open_vocab, name="open-vocab-load",
+                             daemon=True).start()
         return True
 
     def _fail(self, msg: str, strict: bool) -> bool:
@@ -758,6 +923,27 @@ def check(camera=0) -> bool:
     except Exception as e:
         line(False, f"detector: {e}", "be online once so weights download into models/; "
              "if it crashed, try HDB_VISION_DEVICE=cpu")
+    why = open_vocab_ready()
+    if why:
+        line(False, f"open vocabulary off: {why}", "python -m app.vision --fetch")
+    else:
+        try:
+            import numpy as np
+            ov = OpenVocab(pick_device())
+            t = time.monotonic()
+            ov.set_phrase("person")
+            img = np.full((480, 640, 3), 127, np.uint8)
+            try:
+                import cv2
+                import ultralytics
+                img = cv2.imread(str(Path(ultralytics.__file__).parent / "assets" / "bus.jpg"))
+            except Exception:
+                pass
+            n = len(ov.detect(img))
+            line(True, f"open vocabulary {OPEN_WEIGHTS}: 'person' x{n} "
+                       f"({time.monotonic() - t:.1f}s incl. text encoding)")
+        except Exception as e:
+            line(False, f"open vocabulary: {e}", "python -m app.vision --fetch (needs internet once)")
     try:
         import cv2
         v = Vision(camera=camera)
@@ -814,9 +1000,20 @@ def main(argv=None) -> None:
     p.add_argument("--min-score", type=float, default=d.min_score)
     p.add_argument("--selftest", action="store_true")
     p.add_argument("--analyze", metavar="CSV", help="summarize a --log file and exit")
+    p.add_argument("--fetch", action="store_true",
+                   help="download every model into models/ now (COCO, YOLO-World, CLIP text encoder)")
     p.add_argument("--check", action="store_true",
                    help="is this computer ready? (imports, weights, camera, mic, port)")
     a = p.parse_args(argv)
+    if a.fetch:
+        Detector()
+        why = open_vocab_ready()
+        if why:
+            raise SystemExit(f"[vision] open vocabulary: {why}")
+        OpenVocab("cpu").set_phrase("object")
+        print(f"[vision] models ready in {MODELS_DIR}: {DEFAULT_WEIGHTS}, {OPEN_WEIGHTS}, "
+              "CLIP ViT-B/32 (weights/clip)")
+        return
     if a.check:
         raise SystemExit(0 if check(int(a.source) if a.source.isdigit() else a.source) else 1)
     if a.analyze:

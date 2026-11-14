@@ -101,8 +101,11 @@ _UNKNOWN = {"glasses", "eyeglasses", "eye glasses", "spectacles", "sunglasses",
 
 
 def match_target(text: str) -> Optional[str]:
-    """Find the object asked for in free speech. Prefers the words after
-    "find"/"where"/"look for"; longest phrase wins ("cell phone" over "phone")."""
+    """Find the object asked for in free speech. A COCO class if one is named
+    (prefers the words after "find"/"where"/"look for"; longest phrase wins,
+    "cell phone" over "phone"); otherwise the spoken noun phrase for
+    open-vocabulary search ("where are my headphones" -> "headphones"). None if
+    nothing was asked for. Vision.set_target decides whether it can look for it."""
     words = _norm(text)
     if not words:
         return None
@@ -112,7 +115,11 @@ def match_target(text: str) -> Optional[str]:
             hit = _scan(tail)
             if hit:
                 return hit
-    return _scan(words)
+    hit = _scan(words)
+    if hit:
+        return hit
+    from .vision import clean_phrase
+    return clean_phrase(text, require_trigger=True)
 
 
 def _scan(words: list[str]) -> Optional[str]:

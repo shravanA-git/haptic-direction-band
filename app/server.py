@@ -144,6 +144,11 @@ class App:
             self.emit({"type": "log", "text": f"heard target {r.target}, but vision isn't running"})
             self.notify.cue("find", "unknown", heard=r.text, reason="vision not running")
 
+    def _set_open_target(self, typed: str) -> None:
+        cls = self.vision.set_target(typed)
+        self._target_feedback(cls, typed=typed)
+        self.emit({"type": "log", "text": f"target: {cls or 'none (can not look for that)'}"})
+
     def _target_feedback(self, cls, **detail) -> None:
         if cls:
             self.notify.cue("find", "ack", target=cls, **detail)
@@ -379,6 +384,13 @@ class App:
             if not self.vision:
                 return {"type": "log", "text": "vision not running (start with --target)"}
             typed = (m.get("name") or "").strip()
+            from .vision import resolve_target
+            if typed and resolve_target(typed) is None:
+                # Not a COCO class: open-vocabulary lookup takes seconds (CLIP text
+                # encoding); don't block the dashboard's event loop on it.
+                threading.Thread(target=self._set_open_target, args=(typed,),
+                                 name="open-target", daemon=True).start()
+                return {"type": "log", "text": f"target: looking for '{typed}' (open vocabulary)..."}
             cls = self.vision.set_target(typed or None)
             if typed:
                 self._target_feedback(cls, typed=typed)
