@@ -115,7 +115,7 @@ async def drive(url: str, seconds: float, sample_every: float, pid: int, rows: l
             await ws.send_json({"cmd": "stop"})
             await asyncio.sleep(1)
             task.cancel()
-    return {"sent": sent, "errors": errors}
+    return {"sent": sent, "errors": errors, "seconds": time.monotonic() - t0}
 
 
 def verdict(rows: list, alive: bool) -> tuple:
@@ -169,7 +169,8 @@ def main(argv=None) -> int:
                                     child.pid, rows, a.seed)) if child.poll() is None else {}
         except Exception as e:
             print(f"[soak] driver error: {type(e).__name__}: {e}")
-            res = {}
+            res = {"driver_error": f"{type(e).__name__}: {e}",
+                   "seconds": rows[-1]["t"] if rows else 0}
         alive = child.poll() is None
         if alive:
             rows.append({**proc_stats(child.pid), "t": rows[-1]["t"] + 1 if rows else 0,
@@ -185,6 +186,14 @@ def main(argv=None) -> int:
         for r in rows:
             f.write(f"{r['t']},{r['rss_mb']},{r['threads']},{r['files']},{r['frames']},{r['faults']}\n")
     ok, problems = verdict(rows, alive)
+    # A run that ended early proves nothing: the driver losing the dashboard
+    # WebSocket (e.g. the event loop blocked past the heartbeat) is itself a failure.
+    if res.get("driver_error"):
+        ok = False
+        problems.append(f"driver lost the dashboard: {res['driver_error']}")
+    if res.get("seconds", 0) < 0.9 * a.minutes * 60:
+        ok = False
+        problems.append(f"ran {res.get('seconds', 0):.0f} s of {a.minutes * 60:.0f} s")
     print(f"[soak] commands sent {res.get('sent', 0)}, error replies {res.get('errors', 0)}; "
           f"samples -> {csv.name}")
     print(f"[soak] {'PASS' if ok else 'FAIL'}" + ("" if ok else ": " + "; ".join(problems)))
