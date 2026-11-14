@@ -68,11 +68,9 @@ def main(argv=None) -> int:
     app = App(link, AlertLog(alert_path), recall_mode=a.recall)
     vision = guide = None
     if a.target is not None or a.vision:
-        from . import haptics
         from .guide import ObjectGuide
         from .vision import Vision  # heavy import (YOLO); only when asked
-        guide = ObjectGuide(lambda cue: None if app.settings.is_muted("find")
-                            else haptics.play(cue, link.pulse)).start()
+        guide = ObjectGuide(lambda cue: app.play_cue(cue, "find")).start()
         vision = Vision(camera=a.camera, mirror=a.mirror)
         app.attach_vision(vision, guide)
         vision.start()

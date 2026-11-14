@@ -14,6 +14,12 @@
   .dot.ok { background:var(--ok); }
   .dot.warn { background:var(--on); }
   #health { font-size:15px; color:var(--dim); }
+  .seg button { border-radius:0; margin-left:-1px; }
+  .seg button:first-of-type { border-radius:8px 0 0 8px; }
+  .seg button:last-of-type { border-radius:0 8px 8px 0; }
+  .seg button.sel, button.toggle.sel { background:var(--ok); color:#0f1115; border-color:var(--ok); font-weight:700; }
+  button.toggle.off { background:#3a2a2a; color:var(--dim); text-decoration:line-through; }
+  #ihdr { font-size:15px; color:var(--dim); }
   main { display:grid; grid-template-columns: minmax(420px, 1.2fr) 1fr; gap:20px; padding:20px 24px; }
   section { background:var(--panel); border-radius:12px; padding:16px 20px; }
   h2 { font-size:16px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin:0 0 12px; }
@@ -54,6 +60,7 @@
   <div><span id="conn" class="dot"></span><span id="dev">–</span></div>
   <div id="health" title="link state · MIC interval · lines received">–</div>
   <div><span id="frames">0</span> frames</div>
+  <div id="ihdr">intensity –</div>
   <div id="btn">Action: up</div>
 </header>
 <main>
@@ -73,6 +80,15 @@
       <button data-bench="walk" title="H9: each motor in order; it should buzz where the ring lights">Walk ring 0→7</button>
       <button data-bench="cardinals" title="fallback: front, right, back, left">Cardinals</button>
     </div>
+    <div class="row">
+      <span style="color:var(--dim);font-size:15px">Intensity:</span>
+      <span class="seg"><button data-int="low">Low</button><button data-int="medium">Med</button><button data-int="high">High</button></span>
+      <span style="color:var(--dim);font-size:15px;margin-left:10px">Buzz for:</span>
+      <button class="toggle" data-mute="name_alerts">Names</button>
+      <button class="toggle" data-mute="find_cues">Find</button>
+      <button class="toggle" data-mute="sound_alerts">Sound</button>
+    </div>
+    <div style="font-size:13px;color:var(--dim)">Intensity scales cue pulse length (low ×0.6, high ×1.5, max 1000 ms). Test pulses and STOP are never affected.</div>
     <button id="stop" title="Esc">STOP</button>
   </section>
   <div style="display:grid; gap:20px; align-content:start">
@@ -196,6 +212,20 @@ function send(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); el
 // ---- controls
 $("stop").onclick = () => { send({cmd: "stop"}); allOff(); };
 document.addEventListener("keydown", e => { if (e.key === "Escape") $("stop").onclick(); });
+let settings = {};
+document.querySelectorAll("[data-int]").forEach(b => b.onclick = () => send({cmd: "setting", setting: "intensity", value: b.dataset.int}));
+document.querySelectorAll("[data-mute]").forEach(b => b.onclick = () =>
+  send({cmd: "setting", setting: b.dataset.mute, value: settings[b.dataset.mute] === "off" ? "on" : "off"}));
+function showSettings(m) {
+  settings = m;
+  document.querySelectorAll("[data-int]").forEach(b => b.classList.toggle("sel", b.dataset.int === m.intensity));
+  document.querySelectorAll("[data-mute]").forEach(b => {
+    const off = m[b.dataset.mute] === "off";
+    b.classList.toggle("sel", !off); b.classList.toggle("off", off);
+    b.title = off ? "muted: logged, no buzz (click to unmute)" : "click to mute";
+  });
+  $("ihdr").textContent = `intensity ${m.intensity}`;
+}
 document.querySelectorAll("[data-bench]").forEach(b => b.onclick = () => send({cmd: "bench", name: b.dataset.bench}));
 document.querySelectorAll("[data-cue]").forEach(b => b.onclick = () => send({cmd: "cue", name: b.dataset.cue}));
 $("rec").onclick = () => send({cmd: recording ? "record_stop" : "record_start"});
@@ -239,7 +269,7 @@ function addAlert(a) {
   if (!tr) { tr = tb.insertRow(0); alertRows.set(a.id, tr); while (tb.rows.length > 30) { alertRows.delete(+tb.rows[tb.rows.length - 1].dataset.id); tb.deleteRow(-1); } }
   tr.dataset.id = a.id; tr.className = a.dry ? "dry" : "";
   tr._a = a;
-  const cells = [a.id, a.time, a.source + (a.dry ? " (dry)" : "") + (a.repeat ? " ↻" : ""), a.cue,
+  const cells = [a.id, a.time, a.source + (a.dry ? " (dry)" : "") + (a.repeat ? " ↻" : "") + (a.muted ? " (muted)" : ""), a.cue,
     a.direction ?? "–", a.confidence ?? "–", a.latency_ms != null ? a.latency_ms + " ms" : "–", truthText(a.truth)];
   tr.innerHTML = cells.map(c => `<td>${c}</td>`).join("");
   tr.cells[7].className = verdict(a);
@@ -295,6 +325,7 @@ function connect() {
         (m.actions || []).forEach(a => log(`recall used ${a.tool} ${JSON.stringify(a.input)}`));
         break;
       case "settings": {
+        showSettings(m);
         const muted = ["name_alerts", "find_cues", "sound_alerts"].filter(k => m[k] === "off").map(k => k.replace("_", " "));
         $("settings").textContent = `intensity ${m.intensity}` + (muted.length ? ` · muted: ${muted.join(", ")}` : "")
           + (m.names ? ` · names: ${m.names}` : "");

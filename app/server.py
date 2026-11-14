@@ -161,6 +161,13 @@ class App:
             self.sound.threshold = float(value)
         self.emit({"type": "settings", **self.settings.snapshot()})
 
+    def play_cue(self, cue, source: str):
+        """Play a pattern someone else built (ObjectGuide) with the current
+        intensity, unless that source is muted. Logging stays with the caller."""
+        if self.settings.is_muted(source):
+            return None
+        return haptics.play(haptics.scaled(cue, self.settings.intensity), self.link.pulse)
+
     @property
     def recall(self) -> RecallBot:
         if self._recall is None:

@@ -43,5 +43,6 @@ class Notifier:
         if not dry and self.settings.is_muted(source):
             play, detail["muted"] = False, True
         if play:
-            haptics.play(pattern(cue, motor), self.dry_send if dry else self.send)
+            steps = haptics.scaled(pattern(cue, motor), self.settings.intensity)
+            haptics.play(steps, self.dry_send if dry else self.send)
         return self.log.add(source, cue, motor, confidence, latency_ms, dry, **detail)

@@ -189,3 +189,32 @@ def test_ws_ask_and_setting():
             await ws.close()
         link.close()
     asyncio.run(run())
+
+
+# ------------------------------------------------------------- intensity
+def test_intensity_scales_cues_within_cap_and_keeps_rhythm():
+    from app import haptics
+    assert haptics.scaled(haptics.directional(3), "low") == [(0, 3, 120)]
+    assert haptics.scaled(haptics.directional(3), "high") == [(0, 3, 300)]
+    assert haptics.scaled(haptics.lost(), "high")[0][2] == 900
+    assert haptics.scaled([(0, 0, 900)], "high") == [(0, 0, 1000)]           # cap
+    assert haptics.scaled([(0, 0, 80)], "low") == [(0, 0, 60)]               # floor
+    c = haptics.scaled(haptics.centered(), "high")
+    assert c == [(0, 0, 150), (300, 0, 150)]                                 # gap scales too
+    assert haptics.scaled(haptics.centered(), "medium") == haptics.centered()
+
+
+def test_intensity_applies_to_cues_not_tests_or_stop():
+    port = SimPort()
+    link = Link(port).start()
+    app = App(link)
+    app.handle({"cmd": "setting", "setting": "intensity", "value": "high"})
+    app.handle({"cmd": "cue", "name": "generic"})
+    time.sleep(0.05)
+    app.handle({"cmd": "pulse", "motor": 2, "ms": 150})                      # test pulse
+    app.handle({"cmd": "stop"})
+    app.play_cue([(0, 6, 200)], "find").join()
+    app.settings.set("find_cues", "off")
+    assert app.play_cue([(0, 6, 200)], "find") is None
+    link.close()
+    assert port.sent == ["PULSE 0 450", "PULSE 2 150", "STOP", "PULSE 6 300", "STOP"]

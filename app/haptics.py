@@ -12,6 +12,8 @@ import threading
 import time
 from typing import Callable
 
+from .link import MAX_PULSE_MS
+
 FRONT = 0
 MOTOR_NAMES = ["front", "front-right", "right", "back-right",
                "back", "back-left", "left", "front-left"]
@@ -57,6 +59,22 @@ def test_pulse(motor: int) -> Cue:
 def name_alert(motor) -> Cue:
     """Estimator result -> cue: a motor index, or None for generic attention."""
     return generic_attention() if motor is None else directional(motor)
+
+
+# Intensity: scales a cue's pulse lengths *and* offsets, so multi-pulse
+# patterns (centered, taught sound) keep their rhythm. Laptop-side only:
+# the protocol has no duty-cycle field. Test pulses and bench sequences are
+# never scaled, and STOP is a separate line that intensity never touches.
+INTENSITY = {"low": 0.6, "medium": 1.0, "high": 1.5}
+MIN_PULSE_MS = 60          # coin motors barely spin up below this
+
+
+def scaled(cue: Cue, intensity: str = "medium") -> Cue:
+    f = INTENSITY[intensity]
+    if f == 1.0:
+        return list(cue)
+    return [(int(round(off * f)), m, max(MIN_PULSE_MS, min(MAX_PULSE_MS, int(round(ms * f)))))
+            for off, m, ms in cue]
 
 
 _epoch = 0
