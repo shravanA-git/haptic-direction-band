@@ -507,13 +507,25 @@ class NameListener:
     def _work(self) -> None:
         while True:
             item = self._q.get()
-            if item is None:
-                return
-            audio, t0 = item
             try:
+                if item is None:
+                    return
+                audio, t0 = item
                 self.process(audio, t0)
             except Exception as e:
                 print(f"[names] error: {e}")
+            finally:
+                self._q.task_done()
+
+    def drain(self, timeout: float = 30.0) -> bool:
+        """Wait until every queued utterance has been fully processed (both
+        decodes and on_hit). True if drained within timeout."""
+        end = time.monotonic() + timeout
+        while self._q.unfinished_tasks:
+            if time.monotonic() > end:
+                return False
+            time.sleep(0.02)
+        return True
 
     def process(self, audio, t0: float) -> Optional[NameHit]:
         """Transcribe one utterance that started at monotonic t0; report a hit."""
@@ -616,21 +628,19 @@ def _selftest_names(tr) -> None:
             pad = np.zeros(SAMPLE_RATE, np.float32)
             audio = np.concatenate([pad, speech, pad, pad])
             audio = audio + rng.normal(0, 0.001, len(audio)).astype(np.float32)
-            done = threading.Event()
-            hits = []
-            nl = NameListener(names, on_hit=lambda h: (hits.append(h), done.set()),
-                              transcriber=tr)
-            seen = []
-            nl.on_text = lambda text, words: (seen.append(text), done.set())
+            hits, seen = [], []
+            nl = NameListener(names, on_hit=hits.append, transcriber=tr)
+            nl.on_text = lambda text, words: seen.append(text)
             for i in range(0, len(audio), 1600):  # 100 ms blocks, stamped like the mic
                 nl.feed(audio[i:i + 1600], T0 + i / SAMPLE_RATE)
-            done.wait(30)
-            time.sleep(0.2)
+            t_fed = time.monotonic()
+            assert nl.drain(60), "name listener did not finish"
+            busy = time.monotonic() - t_fed
             nl.stop()
             got = hits[0] if hits else None
             print(f"  {phrase!r} names={names} heard={seen} -> "
                   + (f"{got.name} '{got.heard}' {got.start - T0:.2f}-{got.end - T0:.2f}s "
-                     f"score={got.score}" if got else "no hit"))
+                     f"score={got.score}" if got else "no hit") + f"  (decode {busy:.2f}s)")
             assert (got.name if got else None) == want, (phrase, got, seen)
             if got:  # name sits inside the spoken part (1.0 s .. 1.0 s + clip)
                 clip = len(speech) / SAMPLE_RATE
