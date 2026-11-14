@@ -33,6 +33,9 @@ class ObjectGuide:
         self._next: Optional[float] = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        # Optional app.avoid.AvoidLoop: before each directional cue, steer around an
+        # obstacle (veer/turn motor) or give the crash warning instead.
+        self.avoid = None
 
     def on_decision(self, d, now: Optional[float] = None) -> None:
         now = time.monotonic() if now is None else now
@@ -69,8 +72,13 @@ class ObjectGuide:
 
     def _fire(self, now: float, repeat: bool) -> None:
         m = LEFT_MOTOR if self.state == "left" else RIGHT_MOTOR
-        self.play(haptics.directional(m))
+        ov = self.avoid.override(now) if self.avoid is not None else None
         self._next = now + self.repeat_s
+        if ov is not None and ov.action == "stop":
+            return                      # AvoidLoop is playing the crash warning
+        if ov is not None and ov.motor is not None:
+            m = ov.motor                # steer around the obstacle toward the target
+        self.play(haptics.directional(m))
         self._report("directional", m, now, repeat)
 
     def _report(self, kind: str, motor: Optional[int], now: float, repeat: bool) -> None:

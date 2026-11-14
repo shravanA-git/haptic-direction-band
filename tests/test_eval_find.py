@@ -60,7 +60,9 @@ def test_perfect_detector_passes_clip_metrics(tmp_path):
     assert m["seen_coco"] == 100.0 and m["seen_open"] is None
     assert m["false_out"] == 0.0 and m["detect_s"] == 0.0 and m["cue_s"] == 0.0
     assert m["side_acc"] == 100.0 and m["wrong_cue"] == 0.0 and m["flips_min"] == 0.0
-    assert 1.9 <= m["lost_s"] <= 2.2          # TrackerConfig.lost_after_s = 2.0
+    from app.vision import TrackerConfig
+    la = TrackerConfig().lost_after_s
+    assert la - 0.1 <= m["lost_s"] <= la + 0.2
     v = ef.verdict(m)
     assert v["seen_open"] == "SKIP" and v["det_fps"] == "PASS"
     assert all(v[k] == "PASS" for k in m if k in v and k != "seen_open"), v

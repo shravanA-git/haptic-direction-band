@@ -38,6 +38,8 @@ def main(argv=None) -> int:
     ap.add_argument("--mirror", action="store_true",
                     help="camera faces you (laptop webcam): swap left/right")
     ap.add_argument("--no-speech", action="store_true", help="with vision: typed target only")
+    ap.add_argument("--avoid", action="store_true",
+                    help="with vision: obstacle avoidance (steer around, crash warning)")
     ap.add_argument("--name", help="listen for this name (comma-separated ok) and buzz its direction")
     ap.add_argument("--recall", choices=("auto", "claude", "offline"), default="auto",
                     help="Recall chatbot backend (auto: Claude if credentials exist, else offline)")
@@ -85,6 +87,9 @@ def main(argv=None) -> int:
         vision = Vision(camera=a.camera, mirror=a.mirror)
         app.attach_vision(vision, guide)
         vision.start()
+        if a.avoid:
+            from .avoid import AvoidLoop
+            app.attach_avoid(AvoidLoop(vision, play=lambda cue: None, guide=guide).start())
         if a.target:
             vision.set_target(a.target)
         if not a.no_speech:

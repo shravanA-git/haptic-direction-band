@@ -346,7 +346,8 @@ def run_clip(frames: Iterable, fps: float, target: str, detect: Callable,
         t_det = time.perf_counter()
         boxes = detect(frame, target)
         dt = time.perf_counter() - t_det
-        d = tracker.update(boxes, width, t, mirror)
+        shape = getattr(frame, "shape", None)
+        d = tracker.update(boxes, width, t, mirror, shape[0] if shape else None)
         if d.changed:
             guide.on_decision(d, now=t)
         guide.tick(now=t)

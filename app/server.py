@@ -17,6 +17,7 @@ WebSocket, page -> server (JSON):
   {"cmd":"setting","setting":"intensity","value":"high"}   {"cmd":"settings"}
   {"cmd":"caregiver_test"}           (send a test text; caregiver_texts toggles via "setting")
   {"cmd":"teach","seconds":2.5}      (Teach a Sound: make the sound once)  {"cmd":"forget_sound"}
+  {"cmd":"avoid","on":bool}          (obstacle avoidance on/off, with --avoid)
 HTTP GET /video: MJPEG (multipart/x-mixed-replace) of the vision camera's
   annotated frames (tracked box, dead band, "target: STATE"); 503 without vision.
 server -> page:
@@ -112,6 +113,31 @@ class App:
         vision.on_change(self._on_vision)
         if getattr(guide, "on_cue", ...) is None:   # log find cues the guide plays
             guide.on_cue = self._on_find_cue
+
+    def attach_avoid(self, loop) -> None:
+        """loop: app.avoid.AvoidLoop. Its cues play here (intensity, mute "avoid")
+        and are logged; decisions go to the dashboard as {"type":"avoid",...}."""
+        self.avoid = loop
+        loop.play = self._play_avoid
+        loop.on_decision = lambda d: self.emit(d.to_msg())
+
+    def _play_avoid(self, cue) -> None:
+        d = self.avoid.decision if self.avoid else None
+        stop = d is not None and d.action == "stop"
+        near = d.nearest if d is not None else None
+        self.play_cue(cue, "avoid")
+        # Log the first cue of each action (and every 5 s while it lasts), not every
+        # repeat: a blocked path would otherwise flood the alert table at 1.25 Hz.
+        key, now = (d.action if d else None, cue[0][1]), time.monotonic()
+        last = getattr(self, "_avoid_logged", (None, 0.0))
+        if last[0] == key and now - last[1] < 5.0:
+            return
+        self._avoid_logged = (key, now)
+        # logged as existing cue kinds: crash warning = generic (front), steer = directional
+        self.notify.cue("avoid", "generic" if stop else "directional",
+                        None if stop else cue[0][1], play=False, action=d.action if d else None,
+                        obstacle=near.cls if near else None,
+                        metres=round(near.distance_m, 2) if near else None)
 
     def _on_find_cue(self, kind, motor, info) -> None:
         self.notify.cue("find", kind, motor, info.get("confidence"), info.get("latency_ms"),
@@ -334,6 +360,11 @@ class App:
     # ------------------------------------------------------------ commands
     def handle(self, m: dict) -> Optional[dict]:
         cmd = m.get("cmd")
+        if cmd == "avoid":
+            if not getattr(self, "avoid", None):
+                return {"type": "log", "text": "avoidance is off (start with --avoid)"}
+            self.avoid.enabled = bool(m.get("on", True))
+            return {"type": "log", "text": f"avoidance {'on' if self.avoid.enabled else 'off'}"}
         if cmd == "stop":
             haptics.cancel_all()
             self.link.stop()

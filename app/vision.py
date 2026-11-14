@@ -144,16 +144,27 @@ class VisionDecision:
 
 @dataclass
 class TrackerConfig:
-    dead_band: float = 0.12        # |offset| <= this enters "centered"
-    # Tuned on the demo camera (Shravan's Logitech USB cam, dim room, Nov 14): 9-10 fps,
-    # target seen in 67% of frames, median score 0.44, gaps p50 0.46 s / max 1.36 s,
-    # 8.2 state flips/min with the old 0.18 / 1.2 s / 0.3 s settings.
-    dead_band_exit: float = 0.24   # |offset| > this leaves "centered" (hysteresis 0.12)
-    lost_after_s: float = 2.0      # no detection this long -> "lost" (bridges the 1.4 s gaps)
-    smoothing: float = 0.5         # EMA weight of the newest offset (1.0 = no smoothing)
+    # Swept offline on the 4 labelled eval clips (banana, cell phone, cap, fruit
+    # snacks; Logitech, Nov 14) against tools/eval_find: side correct 87.3 -> 93.3%,
+    # flips 10.0 -> 7.8/min, false detections while out 3.5 -> 3.0%. The recorder's
+    # "center" is the middle third, so the centered band is wider than before.
+    # Earlier tuning (Logitech, dim room): 9-10 fps, gaps p50 0.46 s / max 1.36 s.
+    dead_band: float = 0.22        # |offset| <= this enters "centered" (was 0.12)
+    dead_band_exit: float = 0.33   # |offset| > this leaves "centered" (was 0.24)
+    lost_after_s: float = 1.5      # no detection this long -> "lost" (still bridges 1.36 s gaps)
+    smoothing: float = 0.7         # EMA weight of the newest offset (1.0 = none; was 0.5)
     max_jump: float = 0.6          # prefer boxes within this offset distance of the last one
     min_score: float = 0.25
-    min_dwell_s: float = 0.4       # a new side must hold this long (~4 frames at 10 fps)
+    min_dwell_s: float = 0.2       # a new side must hold this long (~2 frames at 10 fps)
+    # Boxes touching the top edge and shorter than this share of the frame height
+    # are slivers, not targets (eval clips: hair read as "hat"). Bottom edge off by
+    # default: the strip there was the real snack pack, partly in view. 0 = off.
+    edge_sliver: float = 0.15
+    edge_sliver_bottom: float = 0.0
+    # Frames in a row needed to accept a box after a gap. 2 didn't remove the false
+    # hits that mattered and slowed first cues by >1 s (open-vocab boxes flicker).
+    confirm_hits: int = 1
+    reacquire_gap_s: float = 0.5
 
 
 class TargetTracker:
@@ -190,7 +201,7 @@ class TargetTracker:
         return self._state
 
     def update(self, boxes: Sequence[Box], frame_width: int, t: float,
-               mirror: bool = False) -> VisionDecision:
+               mirror: bool = False, frame_height: Optional[int] = None) -> VisionDecision:
         prev = self._state
         if self.target is None:
             self._state = "idle"
@@ -201,15 +212,26 @@ class TargetTracker:
             x1, y1, x2, y2, score = b[:5]
             if score < (self.min_score if self.min_score is not None else self.cfg.min_score):
                 continue
+            if frame_height and self.cfg.edge_sliver and \
+                    ((y1 <= 2 and (y2 - y1) < self.cfg.edge_sliver * frame_height) or
+                     (y2 >= frame_height - 2 and (y2 - y1) < self.cfg.edge_sliver_bottom * frame_height)):
+                continue
             cx = (x1 + x2) / 2.0
             off = (cx / frame_width) * 2.0 - 1.0
             if mirror:
                 off = -off
             cands.append((off, score, (x1, y1, x2, y2)))
 
-        if cands and prev in ("searching", "lost", "idle"):
+        # Confirmation: a box after a gap (first sighting, lost, or nothing for
+        # reacquire_gap_s while holding a side) must repeat on consecutive frames.
+        # The eval clips' false hits were single frames (an earcup as "cell phone",
+        # hair as "hat") while out of view.
+        gap = (prev in ("searching", "lost", "idle") or self._last_seen is None
+               or t - self._last_seen > self.cfg.reacquire_gap_s)
+        need = max(getattr(self, "confirm", 1), self.cfg.confirm_hits)
+        if cands and gap and need > 1:
             self._hits += 1
-            if self._hits < getattr(self, "confirm", 1):
+            if self._hits < need:
                 cands = []                     # not confirmed yet: treat as nothing seen
         elif not cands:
             self._hits = 0
@@ -459,10 +481,34 @@ def expand_phrase(phrase: str, limit: int = 4) -> list:
 _FILLERS = {"the", "my", "a", "an", "some", "our", "your", "his", "her", "their", "me",
             "please", "now", "again", "for", "is", "are", "where", "where's", "wheres",
             "find", "look", "looking", "locate", "get", "can", "you", "help", "i", "to",
-            "it", "them", "here", "there", "of", "this", "that", "these", "those", "hey"}
-_TRIGGERS = ("where are my", "where is my", "where are the", "where is the", "where's my",
-             "where's the", "wheres my", "where are", "where is", "where's", "looking for",
-             "look for", "search for", "find", "locate", "where")
+            "it", "them", "here", "there", "of", "this", "that", "these", "those", "hey",
+            # spoken filler and verbs that leak in ("where did I put my X" -> X)
+            "um", "uh", "er", "erm", "hmm", "mm", "okay", "ok", "so", "like", "just",
+            "heck", "hell", "did", "put", "leave", "i'm", "im", "have", "has", "seen",
+            "lost", "need", "show", "take", "bring", "grab", "go", "at", "anywhere",
+            "somewhere", "where'd", "misplaced", "dropped", "see"}
+# Longest first where one contains another; the first one found in the text wins.
+_TRIGGERS = ("where did i put my", "where did i leave my", "where did i put", "where did i leave",
+             "where the heck is my", "where the heck are my", "where are my", "where is my",
+             "where are the", "where is the", "where's my", "where's the", "wheres my",
+             "have you seen my", "have you seen the", "have you seen", "show me my", "show me the",
+             "show me", "take me to my", "take me to the", "take me to", "get me my", "get my",
+             "bring me my", "bring me", "grab my", "i lost my", "lost my", "i can't find my",
+             "i cant find my", "i can't find", "i cant find", "i need my", "need my",
+             "where'd my", "where'd the", "where did my", "where did the", "misplaced my",
+             "dropped my", "do you see my", "do you see the", "can you see my", "can you see the",
+             "where'd",
+             "where are", "where is", "where's", "looking for", "look for", "search for",
+             "find", "locate", "where")
+# Things people ask for by name alone ("keys please", "hat"): accepted from speech
+# without a find/where word. Anything else needs a trigger, so "hello there" or
+# "what time is it" never becomes a target.
+KNOWN_OBJECTS = {"keys", "key", "wallet", "purse", "glasses", "sunglasses", "eyeglasses",
+                 "headphones", "headset", "earbuds", "airpods", "air pods", "charger",
+                 "phone charger", "hat", "cap", "baseball cap", "beanie", "watch", "pen",
+                 "pencil", "hearing aid", "id card", "card", "slippers", "shoes", "jacket",
+                 "coat", "fruit snacks", "snacks", "chips", "pill bottle", "medicine",
+                 "lip balm", "cane", "water bottle", "remote", "notebook", "earphones"}
 
 
 def clean_phrase(text: str, require_trigger: bool = False) -> Optional[str]:
@@ -471,17 +517,20 @@ def clean_phrase(text: str, require_trigger: bool = False) -> Optional[str]:
     find/where trigger if there is one (required for speech, where "hello there"
     isn't a request); fillers stripped; at most 4 words."""
     s = " ".join(re.sub(r"[^a-z' ]+", " ", (text or "").lower().replace("-", " ")).split())
+    triggered = False
     for trig in _TRIGGERS:
         k = s.find(trig)
-        if k >= 0 and (k == 0 or s[k - 1] == " "):
+        if k >= 0 and (k == 0 or s[k - 1] == " ") and \
+                (k + len(trig) == len(s) or s[k + len(trig)] == " "):
             s = s[k + len(trig):]
+            triggered = True
             break
-    else:
-        if require_trigger:
-            return None
     s = re.split(r"\b(?:and|or|so|because|but|then)\b", s)[0]
     words = [w for w in s.split() if w not in _FILLERS]
-    return " ".join(words[:4]) or None
+    phrase = " ".join(words[:4]) or None
+    if require_trigger and not triggered and phrase not in KNOWN_OBJECTS:
+        return None
+    return phrase
 
 
 def _models_cwd():
@@ -789,7 +838,7 @@ class Vision:
                     target = self.tracker.target
                 boxes = self.detector.detect(frame, target) if target else []
                 with self._lock:
-                    d = self.tracker.update(boxes, frame.shape[1], t, self.mirror)
+                    d = self.tracker.update(boxes, frame.shape[1], t, self.mirror, frame.shape[0])
                 self._frame = annotate(frame, d, self.tracker.cfg, self.mirror)
                 self._publish(d)
                 if log:
@@ -862,7 +911,8 @@ def _selftest() -> None:
     assert resolve_target("my phone") == "cell phone"
     assert resolve_target("unicorn") is None
 
-    tr = TargetTracker(TrackerConfig(smoothing=1.0, lost_after_s=0.8, min_dwell_s=0.0))
+    tr = TargetTracker(TrackerConfig(smoothing=1.0, lost_after_s=0.8, min_dwell_s=0.0,
+                                     dead_band=0.12, dead_band_exit=0.24))
     assert tr.update([box(100)], W, 0.0).state == "idle"
     tr.set_target("banana")
     d = tr.update([], W, 0.0)
