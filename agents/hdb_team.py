@@ -3,6 +3,7 @@
     uv run python hdb_team.py register   # once: create your agents on Band
     uv run python hdb_team.py run        # start your agents (Ctrl+C to stop)
     uv run python hdb_team.py roster     # show who owns what
+    uv run python hdb_team.py watch      # live feed of what your agents do (free)
 
 Each teammate runs this on their own laptop, logged in to their own Claude
 subscription (`claude auth login`), with their own Band user key.
@@ -196,12 +197,15 @@ def build_codex_adapter(spec: dict, team: dict, local: dict):
     repo = (HERE / local.get("repo_path", "..")).resolve()
     repo.mkdir(parents=True, exist_ok=True)
     # Edits and commands run inside Codex's workspace-write sandbox (the repo
-    # folder, no network). Anything that needs to leave the sandbox asks for
-    # approval; Codex approvals can't be limited to the owner, so they are
-    # auto-declined unless the owner opts in with `codex_approvals: manual`.
-    approvals = local.get("codex_approvals", "auto_decline")
-    if approvals not in ("auto_decline", "manual"):
-        sys.exit("codex_approvals in local.yaml must be auto_decline or manual.")
+    # folder, no network). Steps that leave the sandbox (git push, installing
+    # board cores/libraries, opening the USB port to flash) need an approval.
+    # Default: auto_accept, so the agent works on its own; the room rules and
+    # the firmware prompt still forbid force-push and deleting work. Set
+    # `codex_approvals: manual` in local.yaml to approve each one in the room
+    # (anyone in the room can approve; Codex can't limit it to the owner).
+    approvals = local.get("codex_approvals", "auto_accept")
+    if approvals not in ("auto_accept", "auto_decline", "manual"):
+        sys.exit("codex_approvals in local.yaml must be auto_accept, auto_decline or manual.")
     config = CodexAdapterConfig(
         workspace_for_room=lambda _room_id: str(repo),
         model=spec.get("model"),
@@ -212,6 +216,9 @@ def build_codex_adapter(spec: dict, team: dict, local: dict):
         sandbox="workspace-write",
         approval_policy="on-request",
         approval_mode=approvals,
+        # Only manual approvals are posted to the room; auto decisions show up
+        # in `uv run python hdb_team.py watch` instead of spamming the chat.
+        approval_text_notifications=(approvals == "manual"),
         approval_wait_timeout_s=300,
         turn_timeout_s=900,
     )
@@ -287,6 +294,8 @@ async def run() -> None:
     from band import Agent, configure_logging
 
     configure_logging(logging.INFO)
+    # Band logs a harmless warning every time someone's presence changes.
+    logging.getLogger("band.client.streaming.client").setLevel(logging.ERROR)
     load_dotenv(HERE / ".env")
     team, local = load_yaml(TEAM_FILE), load_local()
     agents = my_agents(team, local)
@@ -308,6 +317,119 @@ async def run() -> None:
         await asyncio.gather(*running)
 
 
+# --- watch: a live, plain-text feed of what your agents are doing ----------
+# Free (no model calls): it reads the room history each of your agents can see
+# and prints one line per action. Failed or denied steps are marked with ✗.
+
+SKIP_TOOLS = {"ToolSearch"}
+FAIL_WORDS = ("declined", "denied", "permission", "not allowed", "timed out",
+              "traceback", "error:", "fatal:", "rejected", "failed")
+RED, DIM, BOLD, RESET = "\033[31m", "\033[2m", "\033[1m", "\033[0m"
+
+
+def _one_line(text, limit: int = 140) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _describe_call(name: str, args: dict) -> str | None:
+    if name in SKIP_TOOLS:
+        return None
+    if name == "band_send_message":
+        return "💬 " + _one_line(args.get("content"), 160)
+    if name == "band_no_reply":
+        return DIM + "· stayed quiet" + RESET
+    if name == "Bash":
+        return "$ " + _one_line(args.get("description") or args.get("command"))
+    if name in ("Write", "Edit", "Read", "NotebookEdit"):
+        path = str(args.get("file_path", ""))
+        return f"{name.lower()} " + path.split("/hdb/", 1)[-1]
+    if name in ("Grep", "Glob"):
+        return f"{name.lower()} " + _one_line(args.get("pattern"))
+    return f"{name} " + _one_line(json.dumps(args), 100)
+
+
+def _format(item: dict, me: set[str]) -> str | None:
+    kind = item.get("message_type")
+    who = item.get("sender_name") or "?"
+    content = item.get("content") or ""
+    if kind == "tool_call":
+        try:
+            call = json.loads(content)
+        except ValueError:
+            return None
+        return _describe_call(call.get("name", ""), call.get("args") or {})
+    if kind == "tool_result":
+        try:
+            res = json.loads(content)
+        except ValueError:
+            res = {"output": content}
+        out = json.dumps(res.get("output", ""))
+        if res.get("is_error") or any(w in out.lower() for w in FAIL_WORDS):
+            return f"{RED}✗ {res.get('name', 'tool')} failed: {_one_line(out, 160)}{RESET}"
+        return None
+    if kind == "text" and who not in me:
+        return f"{BOLD}{who}{RESET}: " + _one_line(content, 200)
+    if kind == "task" and "error" in content.lower():
+        return f"{RED}✗ {_one_line(content)}{RESET}"
+    return None
+
+
+async def watch() -> None:
+    from band.client.rest import AsyncRestClient
+
+    team, local = load_yaml(TEAM_FILE), load_local()
+    agents = my_agents(team, local)
+    creds = load_yaml(CREDS_FILE)
+    clients = {spec["name"]: AsyncRestClient(api_key=creds[k]["api_key"])
+               for k, spec in agents.items() if creds.get(k, {}).get("api_key")}
+    me = set(clients)
+    backlog = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 25
+    seen: set[str] = set()
+    first = True
+    print(f"Watching {', '.join(sorted(me))}. Ctrl+C to stop.\n")
+    while True:
+        rows = []
+        for name, client in clients.items():
+            try:
+                chats = await client.agent_api_chats.list_agent_chats()
+                for chat in (getattr(chats, "data", None) or [])[:3]:
+                    page = 1
+                    while True:
+                        ctx = await client.agent_api_context.get_agent_chat_context(
+                            chat_id=chat.id, page=page, page_size=100)
+                        items = getattr(ctx, "data", None) or []
+                        for m in items:
+                            d = m.dict() if hasattr(m, "dict") else dict(m)
+                            mid = str(d.get("id") or hash(json.dumps(d, default=str)))
+                            if mid not in seen:
+                                seen.add(mid)
+                                rows.append(d)
+                        if len(items) < 100 or page >= 20:
+                            break
+                        page += 1
+            except Exception as exc:  # keep watching through network blips
+                print(f"{DIM}({name}: {exc.__class__.__name__}, retrying){RESET}")
+        rows.sort(key=lambda d: str(d.get("inserted_at") or d.get("created_at") or ""))
+        if first:
+            rows, first = rows[-backlog:], False
+        for d in rows:
+            line = _format(d, me)
+            if not line:
+                continue
+            ts = d.get("inserted_at") or d.get("created_at")
+            try:
+                from datetime import datetime
+                t = ts if hasattr(ts, "astimezone") else datetime.fromisoformat(str(ts))
+                stamp = t.astimezone().strftime("%H:%M:%S")
+            except (TypeError, ValueError):
+                stamp = "--:--:--"
+            who = d.get("sender_name") or "?"
+            label = f"{who:<15}" if d.get("message_type") != "text" or who in me else " " * 15
+            print(f"{DIM}{stamp}{RESET} {label} {line}", flush=True)
+        await asyncio.sleep(5)
+
+
 def show_roster() -> None:
     print(roster_text(load_yaml(TEAM_FILE)))
 
@@ -319,6 +441,9 @@ if __name__ == "__main__":
     elif command == "run":
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(run())
+    elif command == "watch":
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(watch())
     elif command == "roster":
         show_roster()
     else:

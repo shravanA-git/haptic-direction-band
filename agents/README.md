@@ -70,8 +70,13 @@ in with your own account.
   own repo folder without waiting for approval, and post a `[done]` line when
   finished. Claude agents block `rm -rf`, `sudo`, force-push, `git reset --hard`
   and reading `.env`/key files; set `autonomy: ask` in `local.yaml` to approve
-  every edit instead. HDB-Firmware (Codex) works inside its sandbox and hands
-  flashing, installs and network commands to its owner.
+  every edit instead. HDB-Firmware (Codex) edits inside its sandbox; push,
+  installs and flashing are approved automatically (`codex_approvals: manual`
+  in `local.yaml` to approve each one yourself).
+- **See what your agents are doing:** `uv run python hdb_team.py watch` prints
+  one line per action (commands, file edits, messages), marks failed or denied
+  steps with ✗, and costs nothing. For the team picture, ask
+  `@HDB-Gatekeeper status`.
 - **Protocol changes go through HDB-Protocol** and need a yes from a human on
   both the firmware and software side.
 - **HDB-Deep is for hard problems only**, after one real attempt. Give it

@@ -28,6 +28,6 @@ Steps:
    - join the shared HDB room and add HDB-Vision there with **+** in Participants,
    - after verification, commit ONLY my `team.yaml` owner change (`git add team.yaml && git commit -m "Claim vision agent" && git pull --rebase && git push`) so everyone's roster matches. Make sure `local.yaml` and `agent_config.yaml` are not staged.
 
-How my agent behaves (so I know what to expect): it runs on Claude Opus 5.5 and works autonomously in my repo: it edits, runs tests and commits without asking. A built-in block list still refuses `rm -rf`, `sudo`, force-push, `git reset --hard` and reading `.env` or key files. If I'd rather approve every edit myself, I set `autonomy: ask` in `local.yaml` and restart it.
+How my agent behaves (so I know what to expect): it runs on Claude Opus 5.5 and works autonomously in my repo: it edits, runs tests and commits without asking. A built-in block list still refuses `rm -rf`, `sudo`, force-push, `git reset --hard` and reading `.env` or key files. If I'd rather approve every edit myself, I set `autonomy: ask` in `local.yaml` and restart it. To see what it is doing at any time (one line per action, failures marked ✗, no model cost): `uv run python hdb_team.py watch`.
 
 Rules: never print, commit or share my Band key, `agent_config.yaml` or `local.yaml`. Don't touch other teammates' agents.

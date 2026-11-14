@@ -15,7 +15,7 @@ Steps:
 1. `git clone https://github.com/shravanA-git/haptic-direction-band` (or `git pull` if I already have it) and `cd haptic-direction-band/agents`. Read `../README.md`, `README.md`, `team.yaml`, `prompts/room_rules.md` and `hdb_team.py` before changing anything.
 2. Check prerequisites: `uv` and the `codex` CLI (`npm install -g @openai/codex` if it's missing; ask me before installing). Confirm I'm logged in to Codex with my ChatGPT account: run `codex login status`, then a one-line non-interactive test such as `codex exec "reply with just: pong"`. If either fails, stop and ask me to run `codex login`, then re-check. I don't need Claude Code for this.
 3. In `team.yaml`, change ONLY `owner: TBD` under the `firmware` agent to my first name. Leave `engine: codex` and everything else as is. Don't edit any other agent or `prompts/room_rules.md`; those are shared across the team.
-4. `cp local.example.yaml local.yaml` and set: `owner:` my first name, `run: [firmware]`, `repo_path: ..` (the repo root). Keep `codex_approvals` at its default, `auto_decline`. Then `cp .env.example .env`.
+4. `cp local.example.yaml local.yaml` and set: `owner:` my first name, `run: [firmware]`, `repo_path: ..` (the repo root). Leave `codex_approvals` commented out (default `auto_accept`, so the agent can push, install the ESP32 core and flash on its own). Then `cp .env.example .env`.
 5. `uv sync`, then register with my key passed only as an environment variable (never write it to a file):
    `BAND_USER_API_KEY=<key> uv run python hdb_team.py register`
    If Band returns 401/403, stop and ask me for a freshly generated key. Don't retry the same one. If the name is "already taken", stop and tell me; don't create a duplicate.
@@ -27,6 +27,6 @@ Steps:
    - join the shared HDB room and add HDB-Firmware there with **+** in Participants,
    - after verification, commit ONLY my `team.yaml` owner change (`git add team.yaml && git commit -m "Claim firmware agent" && git pull --rebase && git push`) so everyone's roster matches. Make sure `local.yaml` and `agent_config.yaml` are not staged.
 
-How my agent behaves (so I know what to expect): it can edit and run code inside my repo folder under Codex's sandbox. Flashing the ESP32, installs and anything needing network are declined automatically, and it tells me the exact command to run myself. Nobody else in the room can approve commands on my laptop.
+How my agent behaves (so I know what to expect): it can edit and run code inside my repo folder under Codex's sandbox. Steps outside the sandbox (git push, installing the ESP32 core or libraries, flashing over USB) are approved automatically, so it works on its own; it announces a flash first so I can close the Serial Monitor. To approve each one myself instead, I set `codex_approvals: manual` in `local.yaml` (any room member could then /approve). To see what it is doing at any time: `uv run python hdb_team.py watch`.
 
 Rules: never print, commit or share my Band key, `agent_config.yaml` or `local.yaml`. Don't touch other teammates' agents.

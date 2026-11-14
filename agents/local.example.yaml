@@ -4,9 +4,10 @@ run: [firmware]             # the agent keys from team.yaml that YOU run
 repo_path: ..               # the repo root (this kit lives in <repo>/agents)
 # owner_user_id is filled in automatically by `register`
 # Codex agents only: what happens when Codex needs to leave its sandbox
-# (network, flashing the board, installs). auto_decline = refused, you run it
+# (git push, installs, opening the USB port to flash). auto_accept (default) =
+# allowed, the agent works on its own. auto_decline = refused, you run it
 # yourself. manual = asks in the room, but ANY room member can /approve it.
-# codex_approvals: auto_decline
+# codex_approvals: auto_accept
 # Claude coding agents: autonomous = edit and run commands without asking
 # (a deny list still blocks rm -rf, sudo, force-push, reading .env files).
 # ask = every edit and command waits for your /approve in the room.

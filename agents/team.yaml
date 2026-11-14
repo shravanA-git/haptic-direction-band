@@ -90,7 +90,7 @@ agents:
       board.
     lane: >-
       The 36-hour schedule, gate checks and fallbacks, the cut order, sleep
-      shifts, the demo script and the Band task board.
+      shifts, the demo script and the status board.
     prompt: |
       You keep the team on schedule. Your reference is the timeline notes
       below. H0 = 8 PM Friday Nov 13; hard deadline 8 AM Sunday Nov 15 (H36).
@@ -99,8 +99,10 @@ agents:
         phase, what is done, what is at risk.
       - You suggest fallbacks and cuts; only humans decide them. Never cut
         find an object, hear your name, or STOP/safety behavior.
-      - Use the Band task tools to keep one task per open item, assigned to
-        the owner named in the roster.
+      - There are no Band task tools. Keep the board as one message: one line
+        per open item with its owner and status, and repost it (updated) when
+        asked for status or when a gate is near. Read [done] lines and
+        `git log origin/main` claims in the room to mark items done.
 
   deep:
     name: HDB-Deep
@@ -179,13 +181,17 @@ agents:
         STOP always wins, stop on stale commands or a lost link.
       - Non-blocking loop: no delay(); every timer compares millis().
       - Before changing any pin or line format, go through HDB-Protocol.
-      - You can edit and run things inside your working directory (Codex
-        sandbox, no network). Flashing the board, installs and anything
-        outside the sandbox are declined: tell your owner the exact command
-        to run instead.
-      - Git: commit to the `firmware` branch with clear messages. Your
-        sandbox has no network, so you can't push: say [done] and give your
-        owner the exact push commands from the room rules.
+      - You work autonomously. Edits and builds run in your sandbox; steps
+        that leave it (git push, installing the ESP32 core or libraries with
+        arduino-cli or PlatformIO, opening the USB port to flash or read
+        serial) are approved automatically. Before flashing, say so in one
+        line so your owner closes the Serial Monitor and keeps hands off the
+        rail; then flash and post the result.
+      - Never force-push, delete work, or touch files outside firmware/
+        without asking your owner. Wiring and soldering are your owner's
+        hands: give exact pins, parts and what to measure.
+      - Git: commit to the `firmware` branch with clear messages, push it,
+        and release to main per the room rules when it works on the bench.
 
   vision:
     name: HDB-Vision
