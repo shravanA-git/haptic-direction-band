@@ -7,6 +7,7 @@ run time. One instance lives on the App; cue paths read it on every cue.
   sound_alerts   on | off
   names          comma list               (who the name listener waits for)
   sound_threshold 0.5..0.95               (Teach a Sound match score)
+  caregiver_texts on | off                (text a caregiver about alerts; default off)
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ from typing import Callable, Optional
 
 INTENSITIES = ("low", "medium", "high")
 MUTABLE = {"name_alerts": "name", "find_cues": "find", "sound_alerts": "sound"}
-SETTINGS = ("intensity", *MUTABLE, "names", "sound_threshold")
+SETTINGS = ("intensity", *MUTABLE, "names", "sound_threshold", "caregiver_texts")
 _ON = {"on", "true", "yes", "1", "enable", "enabled", "unmute"}
 _OFF = {"off", "false", "no", "0", "disable", "disabled", "mute"}
 
@@ -26,6 +27,7 @@ class Settings:
         self.muted: set = set()             # sources: name | find | sound
         self.names: Optional[str] = None    # mirrored from the name listener
         self.sound_threshold: Optional[float] = None
+        self.caregiver_texts = False        # off until someone turns it on
         self._lock = threading.Lock()
         self._listeners: list[Callable[[str, object], None]] = []
 
@@ -39,7 +41,8 @@ class Settings:
     def snapshot(self) -> dict:
         with self._lock:
             d = {"intensity": self.intensity, "names": self.names,
-                 "sound_threshold": self.sound_threshold}
+                 "sound_threshold": self.sound_threshold,
+                 "caregiver_texts": "on" if self.caregiver_texts else "off"}
             d.update({k: ("off" if src in self.muted else "on") for k, src in MUTABLE.items()})
             return d
 
@@ -67,6 +70,14 @@ class Settings:
                 else:
                     raise ValueError(f"{setting} must be on or off")
                 out = f"{setting.replace('_', ' ')} {val}"
+            elif setting == "caregiver_texts":
+                if v.lower() in _ON:
+                    self.caregiver_texts, val = True, "on"
+                elif v.lower() in _OFF:
+                    self.caregiver_texts, val = False, "off"
+                else:
+                    raise ValueError("caregiver_texts must be on or off")
+                out = f"caregiver texts {val}"
             elif setting == "names":
                 names = [n.strip() for n in v.split(",") if n.strip()]
                 if not names:

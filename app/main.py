@@ -41,6 +41,8 @@ def main(argv=None) -> int:
     ap.add_argument("--name", help="listen for this name (comma-separated ok) and buzz its direction")
     ap.add_argument("--recall", choices=("auto", "claude", "offline"), default="auto",
                     help="Recall chatbot backend (auto: Claude if credentials exist, else offline)")
+    ap.add_argument("--dry-texts", action="store_true",
+                    help="caregiver texts are logged, never sent (even if Photon is configured)")
     ap.add_argument("--sound", action="store_true",
                     help="Teach a Sound: laptop mic; teach from the dashboard, then it buzzes its own pattern")
     a = ap.parse_args(argv)
@@ -112,6 +114,12 @@ def main(argv=None) -> int:
         except Exception as e:  # no numpy/sounddevice, or no mic permission
             sound = None
             print(f"[hdb] sound listener off: {e}")
+    from .notify import caregiver_from_env
+    caregiver = caregiver_from_env(app.settings, dry=a.dry_texts)
+    app.attach_caregiver(caregiver)
+    st = caregiver.status()
+    print(f"[hdb] caregiver texts: off until toggled on the dashboard; via {st['sender']}, "
+          f"to {st['to']}")
     print(f"[hdb] serial: {link.device}  dashboard: http://localhost:{a.http}")
     print(f"[hdb] alert log: {alert_path.relative_to(RECORDINGS.parent)}")
     try:
@@ -124,6 +132,7 @@ def main(argv=None) -> int:
         if vision:
             vision.stop()
             guide.close()
+        caregiver.close()
         link.close()  # sends STOP before releasing the port
     return 0
 

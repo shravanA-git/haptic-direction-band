@@ -48,7 +48,8 @@ agreement from 0 to 1; "truth" is a label a helper added afterwards, if any.
 Use change_setting when the wearer asks to change how the band behaves. Settings: \
 intensity (low, medium, high), name_alerts / find_cues / sound_alerts (on or off; off still \
 logs alerts but does not buzz), names (comma-separated names to listen for), \
-sound_threshold (0.5-0.95, higher means fewer taught-sound alerts). Confirm what you \
+sound_threshold (0.5-0.95, higher means fewer taught-sound alerts), caregiver_texts (on or \
+off: text the caregiver about name calls, found objects and taught sounds). Confirm what you \
 changed in one sentence. If a request is unclear, ask a short question instead of guessing. \
 The STOP control is not a setting: if the wearer wants the motors off right now, tell them \
 to press STOP or Escape on the dashboard."""
@@ -85,7 +86,7 @@ TOOLS = [
                 "setting": {"type": "string", "enum": list(SETTINGS)},
                 "value": {"type": "string",
                           "description": "low|medium|high for intensity; on|off for "
-                                         "name_alerts/find_cues/sound_alerts; comma list "
+                                         "name_alerts/find_cues/sound_alerts/caregiver_texts; comma list "
                                          "for names; 0.5-0.95 for sound_threshold."},
             },
             "required": ["setting", "value"],
@@ -201,6 +202,11 @@ def offline_answer(q: str, log: AlertLog, settings: Settings) -> Answer:
             lvl = INTENSITIES[max(0, min(2, cur + (1 if up else -1)))]
         res, err = do("change_setting", {"setting": "intensity", "value": lvl})
         return Answer(res[0].upper() + res[1:] + ("." if not err else ""), "offline", acts)
+    if re.search(r"\b(caregiver|carer|text|texts|texting|sms)\b", ql) and \
+            re.search(r"\b(on|off|stop|start|enable|disable|don't|dont|no more|resume)\b", ql):
+        val = "off" if re.search(r"\b(off|stop|disable|don't|dont|no more)\b", ql) else "on"
+        res, err = do("change_setting", {"setting": "caregiver_texts", "value": val})
+        return Answer(res[0].upper() + res[1:] + ".", "offline", acts)
     off = re.search(r"\b(mute|silence|turn off|disable|stop buzzing for|no more)\b", ql)
     on = re.search(r"\b(unmute|turn on|enable|resume)\b", ql)
     if (off or on) and not re.search(r"\b(all motors|right now)\b", ql):

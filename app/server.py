@@ -15,6 +15,7 @@ WebSocket, page -> server (JSON):
   {"cmd":"missed","truth":k}         (a call the band gave no cue for)
   {"cmd":"ask","text":"who called me?"}   (Recall chatbot; reply {"type":"recall",..})
   {"cmd":"setting","setting":"intensity","value":"high"}   {"cmd":"settings"}
+  {"cmd":"caregiver_test"}           (send a test text; caregiver_texts toggles via "setting")
   {"cmd":"teach","seconds":2.5}      (Teach a Sound: make the sound once)  {"cmd":"forget_sound"}
 server -> page:
   {"type":"mic","ms":..,"levels":[f,r,b,l],"replay":bool}
@@ -22,7 +23,7 @@ server -> page:
   {"type":"btn","name":"ACTION","down":bool}      {"type":"raw","text":..}
   {"type":"status",...}  {"type":"estimate",...}  {"type":"traces","items":[..]}
   {"type":"state","object":..,"name":..,"heard":..,"sound":..}  {"type":"log","text":..}
-  {"type":"settings",...Settings.snapshot()}  {"type":"recall","q":..,"a":..,"via":..,"actions":[..]}
+  {"type":"settings",...Settings.snapshot()}  {"type":"caregiver",...Caregiver.status()}  {"type":"recall","q":..,"a":..,"via":..,"actions":[..]}
   {"type":"alert",...AlertLog record}  {"type":"label",...}  {"type":"alerts","items":[..]}
 """
 from __future__ import annotations
@@ -60,6 +61,7 @@ class App:
                                settings=self.settings)
         self.recall_mode = recall_mode
         self._recall: Optional[RecallBot] = None
+        self.caregiver = None
         self.alerts.subscribe(self.emit)
         self.clients: set[web.WebSocketResponse] = set()
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -165,12 +167,36 @@ class App:
         if win and self.recorder.active:   # recorded traces get the alert window for replay
             self.recorder.mark_alert(*win)
 
+    # ------------------------------------------------------------ caregiver
+    def attach_caregiver(self, caregiver) -> None:
+        """caregiver: app.notify.Caregiver. Gets every AlertLog record; texts
+        only while settings.caregiver_texts is on."""
+        self.caregiver = caregiver
+        self.alerts.subscribe(caregiver)
+        caregiver.on_status(lambda st: self.emit({"type": "caregiver", **st}))
+
+    def caregiver_test(self) -> dict:
+        if not self.caregiver:
+            return {"type": "log", "text": "caregiver texting not set up"}
+
+        def run():
+            r = self.caregiver.send_test()
+            self.emit({"type": "log", "text": "caregiver test text "
+                       + ("sent" if r["ok"] else f"failed: {r['error']}")})
+        threading.Thread(target=run, name="caregiver-test", daemon=True).start()
+        return {"type": "log", "text": f"sending a test text via {self.caregiver.sender.name}..."}
+
     # ------------------------------------------------------------- settings
     def _on_setting(self, setting: str, value) -> None:
         if setting == "names" and self.names:
             self.names.set_names(value)
         elif setting == "sound_threshold" and self.sound:
             self.sound.threshold = float(value)
+        elif setting == "caregiver_texts" and self.caregiver:
+            self.emit({"type": "caregiver", **self.caregiver.status()})
+            if value == "on" and not self.caregiver.configured:
+                self.emit({"type": "log", "text": "caregiver texts on, but no phone is set "
+                                                   "(CAREGIVER_PHONE in .env)"})
         self.emit({"type": "settings", **self.settings.snapshot()})
 
     def play_cue(self, cue, source: str):
@@ -298,6 +324,8 @@ class App:
                 return {"type": "log", "text": f"setting: {e}"}
         elif cmd == "settings":
             return {"type": "settings", **self.settings.snapshot()}
+        elif cmd == "caregiver_test":
+            return self.caregiver_test()
         elif cmd == "teach":
             if not self.sound:
                 return {"type": "log", "text": "sound listener not running (start with --sound)"}
@@ -439,6 +467,8 @@ class App:
         await ws.send_str(json.dumps(self.traces_msg()))
         await ws.send_str(json.dumps({"type": "alerts", "items": self.alerts.recent(30)}))
         await ws.send_str(json.dumps({"type": "settings", **self.settings.snapshot()}))
+        if self.caregiver:
+            await ws.send_str(json.dumps({"type": "caregiver", **self.caregiver.status()}))
         async for msg in ws:
             if msg.type != WSMsgType.TEXT:
                 continue

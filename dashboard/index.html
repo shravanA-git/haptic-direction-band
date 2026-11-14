@@ -156,6 +156,12 @@
         <button id="askbtn">Ask</button>
       </div>
       <div id="settings" style="font-size:14px;color:var(--dim)"></div>
+      <div class="row" style="margin-top:10px">
+        <span style="color:var(--dim);font-size:15px">Caregiver texts:</span>
+        <button class="toggle" id="cgtoggle" title="text the caregiver about name calls, found objects, taught sounds">Off</button>
+        <button id="cgtest">Send test text</button>
+      </div>
+      <div id="cgstatus" style="font-size:14px;color:var(--dim)"></div>
     </section>
     <section>
       <h2>Log</h2>
@@ -245,6 +251,8 @@ function chat(who, text) {
 }
 $("askbtn").onclick = ask;
 $("askq").onkeydown = e => { if (e.key === "Enter") ask(); };
+$("cgtoggle").onclick = () => send({cmd: "setting", setting: "caregiver_texts", value: settings.caregiver_texts === "on" ? "off" : "on"});
+$("cgtest").onclick = () => send({cmd: "caregiver_test"});
 $("teach").onclick = () => send({cmd: "teach", seconds: 2.5});
 $("forget").onclick = () => send({cmd: "forget_sound"});
 $("talk").onpointerdown = () => { $("talk").classList.add("active"); send({cmd: "action", down: true}); };
@@ -326,8 +334,16 @@ function connect() {
         $("recallvia").textContent = `(${m.via})`;
         (m.actions || []).forEach(a => log(`recall used ${a.tool} ${JSON.stringify(a.input)}`));
         break;
+      case "caregiver": {
+        const last = m.last ? ` · last ${m.last.time} ${m.last.ok ? "sent" : "FAILED: " + m.last.error}` : "";
+        $("cgstatus").textContent = `${m.sender} → ${m.to}${m.configured ? "" : " (no phone set)"} · sent ${m.sent}`
+          + (m.suppressed ? ` · ${m.suppressed} over limit` : "") + ` · ${m.limit}` + last;
+        break;
+      }
       case "settings": {
         showSettings(m);
+        $("cgtoggle").textContent = m.caregiver_texts === "on" ? "On" : "Off";
+        $("cgtoggle").classList.toggle("sel", m.caregiver_texts === "on");
         const muted = ["name_alerts", "find_cues", "sound_alerts"].filter(k => m[k] === "off").map(k => k.replace("_", " "));
         $("settings").textContent = `intensity ${m.intensity}` + (muted.length ? ` · muted: ${muted.join(", ")}` : "")
           + (m.names ? ` · names: ${m.names}` : "");
