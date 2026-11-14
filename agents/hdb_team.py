@@ -443,7 +443,7 @@ async def watch(once: bool = False) -> None:
         await asyncio.sleep(5)
 
 
-# --- say: post in the room as HDB-Supervisor ---------------------------------
+# --- say: post as HDB-Supervisor (or the agent named by `say_as` in local.yaml)
 
 async def say(text: str) -> None:
     import re
@@ -452,16 +452,17 @@ async def say(text: str) -> None:
     from band_rest import ChatMessageRequest, ChatMessageRequestMentionsItem
 
     creds = load_yaml(CREDS_FILE)
-    if not creds.get("supervisor", {}).get("api_key"):
-        sys.exit("HDB-Supervisor isn't registered yet: add `supervisor` to `run` in "
-                 "local.yaml and run `register`.")
     local = load_local()
-    client = AsyncRestClient(api_key=creds["supervisor"]["api_key"])
+    as_key = local.get("say_as", "supervisor")  # e.g. vision_lead
+    if not creds.get(as_key, {}).get("api_key"):
+        sys.exit(f"`{as_key}` isn't registered yet: add it to `run` in "
+                 "local.yaml and run `register`.")
+    client = AsyncRestClient(api_key=creds[as_key]["api_key"])
     room = local.get("room_id")
     if not room:
         chats = getattr(await client.agent_api_chats.list_agent_chats(), "data", None) or []
         if len(chats) != 1:
-            sys.exit(f"HDB-Supervisor is in {len(chats)} rooms; set `room_id` in local.yaml.")
+            sys.exit(f"{as_key} is in {len(chats)} rooms; set `room_id` in local.yaml.")
         room = chats[0].id
     resp = await client.agent_api_participants.list_agent_chat_participants(chat_id=room)
     people = getattr(resp, "data", None) or []

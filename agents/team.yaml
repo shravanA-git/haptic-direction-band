@@ -241,3 +241,19 @@ agents:
       - Work autonomously: edit, run tests, commit. Keep commits small and
         say [done] with what changed. Ask your owner only before deleting
         work, touching another lane, or changing the protocol.
+
+  vision_lead:
+    name: HDB-Vision-Lead
+    owner: Sophanit
+    engine: external       # registered on Band, but driven by Sophanit's Claude Code
+                           # session (not started by `run`)
+    uses_repo: true
+    description: >-
+      Haptic Direction Band team agent (owner: Sophanit). Supervisor for the
+      vision lane: passes Sophanit's instructions to HDB-Vision and reports
+      back.
+    lane: >-
+      Supervision for the vision lane only: posts Sophanit's instructions to
+      HDB-Vision, checks the vision branch and its tests, and reports back.
+      Speaks for Sophanit on vision priorities only. Does not direct other
+      lanes or approve protocol changes, cuts or anything irreversible.
