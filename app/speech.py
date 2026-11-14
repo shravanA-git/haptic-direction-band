@@ -616,17 +616,18 @@ def _selftest_names(tr) -> None:
             pad = np.zeros(SAMPLE_RATE, np.float32)
             audio = np.concatenate([pad, speech, pad, pad])
             audio = audio + rng.normal(0, 0.001, len(audio)).astype(np.float32)
-            done = threading.Event()
             hits = []
-            nl = NameListener(names, on_hit=lambda h: (hits.append(h), done.set()),
-                              transcriber=tr)
+            nl = NameListener(names, on_hit=hits.append, transcriber=tr)
             seen = []
-            nl.on_text = lambda text, words: (seen.append(text), done.set())
+            nl.on_text = lambda text, words: seen.append(text)
             for i in range(0, len(audio), 1600):  # 100 ms blocks, stamped like the mic
                 nl.feed(audio[i:i + 1600], T0 + i / SAMPLE_RATE)
-            done.wait(30)
-            time.sleep(0.2)
+            # stop() queues a sentinel behind the utterance; joining the worker waits
+            # for the hotword *and* verify decodes (on_text fires before the verify).
+            worker = nl._worker
             nl.stop()
+            if worker is not None:
+                worker.join(60)
             got = hits[0] if hits else None
             print(f"  {phrase!r} names={names} heard={seen} -> "
                   + (f"{got.name} '{got.heard}' {got.start - T0:.2f}-{got.end - T0:.2f}s "
