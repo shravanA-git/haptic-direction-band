@@ -54,8 +54,8 @@ def test_guide_reports_every_cue_with_latency():
     got = []
     g = ObjectGuide(lambda cue: None, repeat_s=0.5, on_cue=lambda k, m, i: got.append((k, m, i)))
     g.on_decision(D(state="left", confidence=0.8, target="banana", t=10.0), now=10.05)
-    g.tick(now=10.6)
-    g.on_decision(D(state="centered", confidence=0.9, target="banana", t=11.0), now=11.02)
+    g.tick(now=11.4)                      # cold (no offset/size): next pulse after ~1.2 s
+    g.on_decision(D(state="centered", confidence=0.9, target="banana", t=11.5), now=11.52)
     g.on_decision(D(state="lost", confidence=0.0, target="banana", t=12.0), now=12.0)
     assert [(k, m, i["repeat"]) for k, m, i in got] == [
         ("directional", 6, False), ("directional", 6, True), ("centered", None, False), ("lost", None, False)]

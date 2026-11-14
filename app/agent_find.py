@@ -543,6 +543,7 @@ def main(argv=None) -> int:
     guide = ObjectGuide(lambda cue: haptics.play(cue, link.pulse)).start()
     vision = Vision(camera=a.source, mirror=a.mirror)
     vision.on_change(guide.on_decision)
+    vision.on_frame(guide.on_frame)
     vision.on_change(lambda d: print(f"[vision] {d.state} offset={d.offset}"))
     if not vision.start():
         link.close()

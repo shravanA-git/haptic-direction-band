@@ -26,6 +26,8 @@ Interface for app/main.py and app/haptics.py
     target      COCO class being tracked, e.g. "banana"
     t           time.monotonic() of the frame the decision came from
     changed     True when ``state`` differs from the previous decision
+    size        box size as a share of the frame (0..1), held through brief flicker;
+                ObjectGuide pulses faster as it grows (hot/cold)
 
 Callbacks fire only when ``state`` changes. Left/right are from the wearer's
 point of view for a forward-facing camera (no mirroring). For a laptop webcam
@@ -140,6 +142,7 @@ class VisionDecision:
     target: Optional[str]
     t: float
     changed: bool = False
+    size: float = 0.0     # tracked box: larger of width/height as a share of the frame (closeness)
 
 
 @dataclass
@@ -178,6 +181,7 @@ class TargetTracker:
 
     def _reset(self) -> None:
         self._hits = 0                       # consecutive frames with a box (acquisition)
+        self._size = 0.0
         self._offset: Optional[float] = None
         self._last_seen: Optional[float] = None
         self._ever_seen = False
@@ -272,8 +276,11 @@ class TargetTracker:
                     else:
                         self._cand = None
             self._state = new
+            x1, y1, x2, y2 = bbox
+            self._size = round(max((x2 - x1) / frame_width,
+                                   (y2 - y1) / frame_height if frame_height else 0.0), 3)
             return VisionDecision(self._state, round(o, 3), float(score), bbox,
-                                  self.target, t, self._state != prev)
+                                  self.target, t, self._state != prev, self._size)
 
         # Nothing this frame: hold the last state briefly (detector flicker), then lost.
         if self._ever_seen and self._last_seen is not None:
@@ -282,9 +289,11 @@ class TargetTracker:
                 self._offset = None
         else:
             self._state = "searching"
-        return VisionDecision(self._state, None if self._state in ("lost", "searching") else
+        held = self._state not in ("lost", "searching")
+        return VisionDecision(self._state, None if not held else
                               (round(self._offset, 3) if self._offset is not None else None),
-                              0.0, None, self.target, t, self._state != prev)
+                              0.0, None, self.target, t, self._state != prev,
+                              self._size if held else 0.0)
 
 
 # --------------------------------------------------------------------------
@@ -660,6 +669,7 @@ class Vision:
         self.tracker = TargetTracker(config)
         self._lock = threading.Lock()
         self._callbacks: list[Callable[[VisionDecision], None]] = []
+        self._frame_callbacks: list[Callable[[VisionDecision], None]] = []
         self._latest = VisionDecision("idle", None, 0.0, None, None, time.monotonic())
         self._frame = None
         self._raw = None
@@ -674,6 +684,11 @@ class Vision:
     # ---- public API ----
     def on_change(self, cb: Callable[[VisionDecision], None]) -> None:
         self._callbacks.append(cb)
+
+    def on_frame(self, cb: Callable[[VisionDecision], None]) -> None:
+        """cb(decision) on every processed frame (offset/size move between state
+        changes), from the vision thread. Keep it cheap."""
+        self._frame_callbacks.append(cb)
 
     def set_target(self, name: Optional[str]) -> Optional[str]:
         """Typed or spoken target -> what is being tracked now, or None.
@@ -795,6 +810,11 @@ class Vision:
     # ---- internals ----
     def _publish(self, d: VisionDecision) -> None:
         self._latest = d
+        for cb in list(self._frame_callbacks):
+            try:
+                cb(d)
+            except Exception as e:
+                print(f"[vision] frame callback error: {e}")
         if d.changed:
             for cb in list(self._callbacks):
                 try:

@@ -36,7 +36,8 @@ class Truth:
             return []
         if self.swap:
             cx = W - cx
-        return [(cx - 30, 100, cx + 30, 200, 0.9)]
+        half = 150 if not getattr(self, "small", False) else 30    # 47% of the frame vs 9%
+        return [(cx - half, 100, cx + half, 200, 0.9)]
 
 
 def write(tmp_path, data=LABELS):
@@ -98,3 +99,15 @@ def test_no_clips_skips_part_b(tmp_path, capsys):
     assert res["verdict"]["spoken_acc"] == "SKIP" and res["metrics"]["text_acc"] is not None
     assert "clips: SKIP" in ef.report(res)
     assert len(ef.TEMPLATES) >= 30 and len(ef.OBJECTS) >= 40
+
+
+def test_hot_cold_pulses_per_second_and_sides(tmp_path):
+    segs = ef.parse_labels(LABELS, tmp_path)[0]["segments"]
+    big = ef.score_clips(write(tmp_path), detector=Truth(segs), frames_for=frames_for)["all"]
+    small = Truth(segs)
+    small.small = True
+    cold = ef.score_clips(write(tmp_path), detector=small, frames_for=frames_for)["all"]
+    assert big["centered_pps"] >= 3.0 > cold["centered_pps"]       # bigger box = hotter
+    assert big["wrong_cue"] == 0.0 and big["off_side"] <= 15.0
+    assert ef.verdict(big)["centered_pps"] == "PASS" and ef.verdict(cold)["centered_pps"] == "FAIL"
+    assert ef.LEFT_MOTORS == {6, 7} and ef.RIGHT_MOTORS == {1, 2}

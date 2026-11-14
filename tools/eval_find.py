@@ -44,7 +44,10 @@ Metrics (in-view = left/center/right/sweep):
   flips_min     tracker state changes per minute while held still
   lost_s        median delay from the last box after leaving to "lost"
                 (never = end of segment)
-  wrong_cue     % of directional cues on the opposite motor while held left/right
+  wrong_cue     % of pulses on the opposite side while held left/right (motors 6,7
+                are left; 1,2 are right)
+  off_side      same, but front pulses (tracker still "centered") also count (info)
+  centered_pps  front pulses per second while held centered (hot signal, >=3)
 Part A also counts wrong_target: answers naming the wrong thing (a miss -> the
 "can't look for that" cue is acceptable, a wrong target is not), including any
 answer to a NEGATIVES phrase ("hello there").
@@ -83,6 +86,7 @@ TARGETS = {
     "seen_open": (">=", 60.0),
     "side_acc": (">=", 95.0),
     "wrong_cue": ("<=", 2.0),
+    "centered_pps": (">=", 3.0),      # hot/cold: pulses/s while held centered
     "cue_s": ("<=", 0.5),
     "lost_s": ("<=", 2.5),
     "flips_min": ("<=", 6.0),
@@ -334,36 +338,53 @@ def run_clip(frames: Iterable, fps: float, target: str, detect: Callable,
              config=None, mirror: bool = False) -> tuple:
     """frames: iterable of (index, width, frame). detect(frame, target) -> boxes.
     Returns (per-frame records, cues) on the clip's own timeline."""
+    from app import haptics
     from app.guide import ObjectGuide
     from app.vision import TargetTracker
     tracker = TargetTracker(config)
     tracker.set_target(target, getattr(detect, "min_score", None),
                        getattr(detect, "confirm", 1))
     cues, now = [], [0.0]
-    guide = ObjectGuide(play=lambda cue: None,
-                        on_cue=lambda kind, motor, info: cues.append((now[0], kind, motor)))
+
+    def play(cue):                  # every pulse the band would get, not the throttled log
+        if cue == haptics.centered():
+            cues.append((now[0], "centered", None))
+        elif cue == haptics.lost():
+            cues.append((now[0], "lost", None))
+        else:
+            cues.append((now[0], "directional", cue[0][1]))
+    guide = ObjectGuide(play=play)
     recs = []
+    prev_t = None
     for i, width, frame in frames:
         t = i / fps
+        if prev_t is not None:      # the live guide thread ticks every 20 ms between frames
+            k = prev_t + 0.02
+            while k < t:
+                now[0] = k
+                guide.tick(now=k)
+                k += 0.02
+        prev_t = t
         now[0] = t
         t_det = time.perf_counter()
         boxes = detect(frame, target)
         dt = time.perf_counter() - t_det
         shape = getattr(frame, "shape", None)
         d = tracker.update(boxes, width, t, mirror, shape[0] if shape else None)
-        if d.changed:
-            guide.on_decision(d, now=t)
+        guide.on_frame(d, now=t)    # live offset/size every frame; state changes inside
         guide.tick(now=t)
         recs.append({"i": i, "t": t, "state": d.state, "box": d.bbox is not None, "dt": dt})
     return recs, cues
 
 
+LEFT_MOTORS, RIGHT_MOTORS = {6, 7}, {1, 2}      # front-left/left, front-right/right
+
+
 def _cue_matches(label: str, kind: str, motor) -> bool:
-    from app.guide import LEFT_MOTOR, RIGHT_MOTOR
     if label == "center":
         return kind == "centered"
     if label in ("left", "right"):
-        return kind == "directional" and motor == (LEFT_MOTOR if label == "left" else RIGHT_MOTOR)
+        return kind == "directional" and motor in (LEFT_MOTORS if label == "left" else RIGHT_MOTORS)
     return kind in ("directional", "centered")      # sweep: any pointing cue
 
 
@@ -422,15 +443,24 @@ def score_clip(recs: list, cues: list, segments: list, fps: float,
             gone_at[a] = left_i / fps
             lost.append(((lost_r["i"] if lost_r else b + 1) - left_i) / fps)
 
-    dir_n = dir_bad = 0
-    from app.guide import LEFT_MOTOR, RIGHT_MOTOR
+    # hot signal: front pulses per second while the object is held centered
+    cen_p, cen_s = 0, 0.0
+    for label, a, b in segments:
+        if label == "center":
+            t0, t1 = a / fps + grace_s, (b + 1) / fps
+            if t1 > t0:
+                cen_s += t1 - t0
+                cen_p += sum(1 for t, kind, m in cues if kind == "directional" and m == 0 and t0 <= t < t1)
+    dir_n = dir_bad = dir_off = 0
     for t, kind, motor in cues:
         if kind != "directional":
             continue
         label, a = label_at(segments, int(round(t * fps)))
         if label in ("left", "right") and t - a / fps >= grace_s:
             dir_n += 1
-            dir_bad += motor != (LEFT_MOTOR if label == "left" else RIGHT_MOTOR)
+            own, other = (LEFT_MOTORS, RIGHT_MOTORS) if label == "left" else (RIGHT_MOTORS, LEFT_MOTORS)
+            dir_bad += motor in other          # pointing the opposite way
+            dir_off += motor not in own        # opposite OR front (tracker still "centered")
         elif label == "out" and t > gone_at.get(a, a / fps):
             stale += 1   # pulsing toward an object that has already left the view
     return {
@@ -442,12 +472,15 @@ def score_clip(recs: list, cues: list, segments: list, fps: float,
         "flips_min": round(flips / (held_s / 60), 2) if held_s else None,
         "lost_s": round(median(lost), 2) if lost else None,
         "wrong_cue": _pct(dir_bad, dir_n) if dir_n else None,
+        "off_side": _pct(dir_off, dir_n) if dir_n else None,
         "stale_cues": stale,
+        "centered_pps": round(cen_p / cen_s, 2) if cen_s else None,
         "det_fps": _fps(recs),
         "_counts": {"cue": cue_d, "cue_p": cue_p, "det_s": sum(r.get("dt", 0) for r in recs), "n": len(recs),"inview": len(inview), "seen": sum(r["box"] for r in inview),
                     "side_n": side_n, "side_ok": side_ok, "flips": flips, "held_s": held_s,
                     "out_n": out_n, "out_box": out_box, "detect": detect, "lost": lost,
-                    "dir_n": dir_n, "dir_bad": dir_bad, "stale": stale},
+                    "dir_n": dir_n, "dir_bad": dir_bad, "dir_off": dir_off, "stale": stale,
+                    "cen_p": cen_p, "cen_s": cen_s},
     }
 
 
@@ -468,6 +501,10 @@ def combine(per_clip: list, is_open: Optional[list] = None) -> dict:
     split["det_fps"] = round(sum(s["_counts"]["n"] for s in per_clip) / det_s, 1) if det_s else None
     cue = [x for s in per_clip for x in s["_counts"]["cue"]]
     split["cue_s"] = round(median(cue), 2) if cue else None
+    split["off_side"] = _pct(sum(s["_counts"].get("dir_off", 0) for s in per_clip),
+                             sum(s["_counts"]["dir_n"] for s in per_clip)) or 0.0
+    cen_s = sum(s["_counts"].get("cen_s", 0.0) for s in per_clip)
+    split["centered_pps"] = round(sum(s["_counts"].get("cen_p", 0) for s in per_clip) / cen_s, 2) if cen_s else None
     cue_p = [x for s in per_clip for x in s["_counts"].get("cue_p", [])]
     split["cue_prompt_s"] = round(median(cue_p), 2) if cue_p else None
     c = {k: 0 for k in ("inview", "seen", "side_n", "side_ok", "flips", "held_s", "out_n",
@@ -607,12 +644,12 @@ def verdict(metrics: dict, targets: dict = TARGETS) -> dict:
 
 
 UNITS = {"text_acc": "%", "spoken_acc": "%", "wrong_target": "", "seen_coco": "%",
-         "seen_open": "%", "side_acc": "%", "wrong_cue": "%", "cue_s": " s", "lost_s": " s",
+         "seen_open": "%", "side_acc": "%", "wrong_cue": "%", "centered_pps": "/s", "cue_s": " s", "lost_s": " s",
          "flips_min": "/min", "false_out": "%", "det_fps": " fps"}
 LABEL = {"text_acc": "A  text match_target", "spoken_acc": "A  spoken (say+whisper)",
          "wrong_target": "A  wrong targets (any)", "seen_coco": "B  seen, COCO (in-view)",
          "seen_open": "B  seen, open-vocab (in-view)", "side_acc": "B  side correct (held)",
-         "wrong_cue": "B  wrong-side cues", "cue_s": "B  first cue after entering",
+         "wrong_cue": "B  wrong-side pulses", "centered_pps": "B  pulses/s held centered", "cue_s": "B  first cue after entering",
          "lost_s": "B  lost cue after leaving", "flips_min": "B  flips/min (held still)",
          "false_out": "B  false detections (out)", "det_fps": "B  detector fps"}
 

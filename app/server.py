@@ -151,6 +151,8 @@ class App:
         pause/resume); guide: app.guide.ObjectGuide driving the band."""
         self.vision, self.guide = vision, guide
         vision.on_change(self._on_vision)
+        if hasattr(vision, "on_frame"):          # live offset/size for hot/cold pulses
+            vision.on_frame(guide.on_frame)
         if getattr(guide, "on_cue", ...) is None:   # log find cues the guide plays
             guide.on_cue = self._on_find_cue
 
