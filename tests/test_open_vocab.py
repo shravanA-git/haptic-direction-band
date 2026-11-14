@@ -143,3 +143,18 @@ def test_top_edge_sliver_is_not_a_target():
     assert tr.update(hair, 640, 0.0, frame_height=480).state == "searching"
     held = [(200, 0, 330, 200, 0.3)]                             # a real cap held high
     assert tr.update(held, 640, 0.1, frame_height=480).state != "searching"
+
+
+@pytest.mark.parametrize("text,want", [
+    ("door.", "door"), ("Door", "door"), ("human.", "person"), ("the stairs", "stairs"),
+    ("exit", "exit"), ("red door", "red door"), ("big blue water jug", "big blue water jug"),
+    ("hello there", None), ("what time is it", None), ("thank you", None), ("okay", None),
+    ("stop", None), ("never mind", None), ("left", None),
+])
+def test_hold_to_talk_bare_utterance_is_the_target(text, want):
+    from app.speech import match_target
+    assert match_target(text) == want
+
+
+def test_door_prompts_expand():
+    assert V.expand_phrase("door")[:2] == ["door", "doorway"]

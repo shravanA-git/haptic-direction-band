@@ -462,6 +462,9 @@ OPEN_SYNONYMS = {
     "hearing aid": ["earpiece"], "id card": ["card", "badge"], "card": ["id card", "credit card"],
     "slippers": ["slipper", "shoes"], "shoes": ["shoe", "sneakers"], "jacket": ["coat", "hoodie"],
     "water bottle": ["bottle"], "lip balm": ["chapstick"], "cane": ["walking stick"],
+    "door": ["doorway", "wooden door", "door handle"], "doorway": ["door", "open door"],
+    "exit": ["exit sign", "door"], "stairs": ["staircase", "steps"], "window": ["glass window"],
+    "elevator": ["elevator door", "elevator buttons"],
 }
 
 
@@ -508,14 +511,26 @@ KNOWN_OBJECTS = {"keys", "key", "wallet", "purse", "glasses", "sunglasses", "eye
                  "phone charger", "hat", "cap", "baseball cap", "beanie", "watch", "pen",
                  "pencil", "hearing aid", "id card", "card", "slippers", "shoes", "jacket",
                  "coat", "fruit snacks", "snacks", "chips", "pill bottle", "medicine",
-                 "lip balm", "cane", "water bottle", "remote", "notebook", "earphones"}
+                 "lip balm", "cane", "water bottle", "remote", "notebook", "earphones",
+                 "door", "doorway", "window", "stairs", "staircase", "elevator", "exit",
+                 "exit sign", "bathroom", "light switch"}
+# Hold-to-talk: a short utterance with no find/where word is still the target
+# ("door.") unless it is one of these (small talk, questions, commands).
+NOT_TARGETS = {"what", "who", "why", "how", "when", "which", "time", "hello", "hi", "hey",
+               "thanks", "thank", "okay", "ok", "yes", "yeah", "yep", "no", "nope", "stop",
+               "cancel", "never", "mind", "nevermind", "hear", "fine", "break", "sorry", "good",
+               "great", "cool", "bye", "goodbye", "wait", "test", "testing", "nothing", "done",
+               "again", "repeat", "help", "huh", "alright", "right", "left", "sure", "and"}
 
 
-def clean_phrase(text: str, require_trigger: bool = False) -> Optional[str]:
+def clean_phrase(text: str, require_trigger: bool = False, bare_words: int = 0) -> Optional[str]:
     """The object asked for, as a short noun phrase: "where are my headphones?" ->
     "headphones", "find the red umbrella please" -> "red umbrella". Words after a
     find/where trigger if there is one (required for speech, where "hello there"
-    isn't a request); fillers stripped; at most 4 words."""
+    isn't a request); fillers stripped; at most 4 words. bare_words: with
+    require_trigger, also accept an utterance of at most this many words (after
+    fillers) with no trigger, unless it has a NOT_TARGETS word (hold-to-talk:
+    "door." is a request, "what time is it" is not)."""
     s = " ".join(re.sub(r"[^a-z' ]+", " ", (text or "").lower().replace("-", " ")).split())
     triggered = False
     for trig in _TRIGGERS:
@@ -529,7 +544,9 @@ def clean_phrase(text: str, require_trigger: bool = False) -> Optional[str]:
     words = [w for w in s.split() if w not in _FILLERS]
     phrase = " ".join(words[:4]) or None
     if require_trigger and not triggered and phrase not in KNOWN_OBJECTS:
-        return None
+        if not (bare_words and phrase and len(words) <= bare_words
+                and not NOT_TARGETS.intersection(words)):
+            return None
     return phrase
 
 
