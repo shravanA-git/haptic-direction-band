@@ -45,7 +45,10 @@ Running it
         (also --dead-band, --dead-band-exit, --lost-after, --smoothing, --min-score)
     python -m app.vision --analyze recordings/banana.csv  # gaps, jitter, suggested settings
 
-Weights (yolov8n.pt, ~6 MB) download at runtime into models/ (gitignored).
+Weights (yolo11s.pt, ~18 MB; HDB_YOLO_WEIGHTS to override) download at runtime into
+models/ (gitignored). Tuned on Sophanit's live banana run (Nov 13): yolov8n@416 saw
+the moving banana in ~25% of frames, median score 0.41, so: bigger model, 640 px,
+lower score floors, longer lost timeout. Offset jitter was tiny (p95 0.012).
 """
 
 from __future__ import annotations
@@ -130,10 +133,10 @@ class VisionDecision:
 class TrackerConfig:
     dead_band: float = 0.12        # |offset| <= this enters "centered"
     dead_band_exit: float = 0.18   # |offset| > this leaves "centered"
-    lost_after_s: float = 0.8      # no detection this long -> "lost"
+    lost_after_s: float = 1.2      # no detection this long -> "lost" (bridges motion-blur misses)
     smoothing: float = 0.5         # EMA weight of the newest offset (1.0 = no smoothing)
     max_jump: float = 0.6          # prefer boxes within this offset distance of the last one
-    min_score: float = 0.35
+    min_score: float = 0.25
 
 
 class TargetTracker:
@@ -219,12 +222,18 @@ class TargetTracker:
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = REPO_ROOT / "models"
+DEFAULT_WEIGHTS = os.environ.get("HDB_YOLO_WEIGHTS", "yolo11s.pt")
+DEFAULT_IMGSZ = 640
+DETECT_CONF = 0.15  # detector floor; the tracker applies TrackerConfig.min_score
 
 
 class Detector:
-    def __init__(self, weights: str = "yolov8n.pt", imgsz: int = 416,
+    def __init__(self, weights: str = None, imgsz: int = None,
                  device: Optional[str] = None):
         from ultralytics import YOLO  # imported lazily so the tracker works without it
+
+        weights = weights or DEFAULT_WEIGHTS
+        imgsz = imgsz or DEFAULT_IMGSZ
 
         MODELS_DIR.mkdir(exist_ok=True)
         path = MODELS_DIR / weights
@@ -253,7 +262,7 @@ class Detector:
         cid = self.class_ids.get(target)
         if cid is None:
             return []
-        res = self.model.predict(frame, imgsz=self.imgsz, classes=[cid], conf=0.25,
+        res = self.model.predict(frame, imgsz=self.imgsz, classes=[cid], conf=DETECT_CONF,
                                  device=self.device, verbose=False)[0]
         out = []
         for xyxy, conf in zip(res.boxes.xyxy.tolist(), res.boxes.conf.tolist()):
@@ -266,11 +275,13 @@ class Detector:
 # --------------------------------------------------------------------------
 
 class Vision:
-    def __init__(self, camera=0, mirror: bool = False, weights: str = "yolov8n.pt",
-                 imgsz: int = 416, config: Optional[TrackerConfig] = None,
-                 max_fps: float = 15.0, log_path: Optional[str] = None):
+    def __init__(self, camera=0, mirror: bool = False, weights: str = None,
+                 imgsz: int = None, config: Optional[TrackerConfig] = None,
+                 max_fps: float = 15.0, log_path: Optional[str] = None,
+                 record_path: Optional[str] = None):
         self.camera = camera
         self.log_path = log_path  # per-frame CSV for tuning dead band / lost timing
+        self.record_path = record_path  # raw video, to replay with --source later
         self.mirror = mirror
         self.weights = weights
         self.imgsz = imgsz
@@ -389,6 +400,7 @@ class Vision:
         if self.log_path:
             Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
         log = open(self.log_path, "w") if self.log_path else None
+        rec = None
         if log:
             log.write("t,target,n_boxes,raw_offset,raw_score,offset,confidence,state\n")
         try:
@@ -407,6 +419,13 @@ class Vision:
                                               offset=None, bbox=None, confidence=0.0))
                     time.sleep(0.03)
                     continue
+                if self.record_path:
+                    if rec is None:
+                        import cv2
+                        Path(self.record_path).parent.mkdir(parents=True, exist_ok=True)
+                        rec = cv2.VideoWriter(self.record_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                              self.max_fps or 15, (frame.shape[1], frame.shape[0]))
+                    rec.write(frame)
                 with self._lock:
                     target = self.tracker.target
                 boxes = self.detector.detect(frame, target) if target else []
@@ -430,6 +449,8 @@ class Vision:
             cap.release()
             if log:
                 log.close()
+            if rec is not None:
+                rec.release()
             self._running = False
 
 
@@ -478,7 +499,7 @@ def _selftest() -> None:
     assert resolve_target("my phone") == "cell phone"
     assert resolve_target("unicorn") is None
 
-    tr = TargetTracker(TrackerConfig(smoothing=1.0))
+    tr = TargetTracker(TrackerConfig(smoothing=1.0, lost_after_s=0.8))
     assert tr.update([box(100)], W, 0.0).state == "idle"
     tr.set_target("banana")
     d = tr.update([], W, 0.0)
@@ -584,7 +605,7 @@ def check(camera=0) -> bool:
             line(False, f"import {mod}: {e}", pip)
     try:
         det = Detector()
-        line(True, f"detector yolov8n on {det.device}")
+        line(True, f"detector {DEFAULT_WEIGHTS}@{det.imgsz} on {det.device}")
     except Exception as e:
         line(False, f"detector: {e}", "be online once so weights download into models/")
     try:
@@ -630,7 +651,9 @@ def main(argv=None) -> None:
     p.add_argument("--source", default="0", help="camera index or video file")
     p.add_argument("--mirror", action="store_true", help="laptop webcam facing you")
     p.add_argument("--show", action="store_true", help="show an annotated window")
-    p.add_argument("--imgsz", type=int, default=416)
+    p.add_argument("--imgsz", type=int, default=None, help=f"default {DEFAULT_IMGSZ}")
+    p.add_argument("--weights", default=None, help=f"default {DEFAULT_WEIGHTS}")
+    p.add_argument("--record", help="also save the raw camera video here (.mp4) for offline tuning")
     p.add_argument("--seconds", type=float, default=0, help="stop after N seconds (0 = forever)")
     p.add_argument("--log", help="write a per-frame CSV here (for tuning)")
     d = TrackerConfig()
@@ -657,7 +680,8 @@ def main(argv=None) -> None:
     cfg = TrackerConfig(dead_band=a.dead_band, dead_band_exit=a.dead_band_exit,
                         lost_after_s=a.lost_after, smoothing=a.smoothing,
                         min_score=a.min_score)
-    v = Vision(camera=a.source, mirror=a.mirror, imgsz=a.imgsz, config=cfg, log_path=a.log)
+    v = Vision(camera=a.source, mirror=a.mirror, imgsz=a.imgsz, weights=a.weights,
+               config=cfg, log_path=a.log, record_path=a.record)
     v.on_change(lambda d: print(f"{d.t:10.3f}  {d.state:9s} offset={d.offset} "
                                 f"conf={d.confidence:.2f}"))
     try:
