@@ -263,6 +263,7 @@ class Detector:
             finally:
                 os.chdir(cwd)
         self.model = YOLO(str(path))
+        self._lock = threading.Lock()
         self.imgsz = imgsz
         if device is None:
             try:
@@ -275,12 +276,23 @@ class Detector:
         names = self.model.names
         self.class_ids = {(n.replace("_", " ")): i for i, n in names.items()}
 
+    def detect_all(self, frame, min_score: float = 0.3) -> list:
+        """Every COCO object in the frame: [(class, x1, y1, x2, y2, score)], best first."""
+        with self._lock:  # shared by the vision thread and agent tools
+            res = self.model.predict(frame, imgsz=self.imgsz, conf=min_score,
+                                     device=self.device, verbose=False)[0]
+        names = self.model.names
+        out = [(names[int(c)].replace("_", " "), *xyxy, float(s)) for xyxy, c, s in
+               zip(res.boxes.xyxy.tolist(), res.boxes.cls.tolist(), res.boxes.conf.tolist())]
+        return sorted(out, key=lambda o: -o[5])
+
     def detect(self, frame, target: str) -> list:
         cid = self.class_ids.get(target)
         if cid is None:
             return []
-        res = self.model.predict(frame, imgsz=self.imgsz, classes=[cid], conf=DETECT_CONF,
-                                 device=self.device, verbose=False)[0]
+        with self._lock:
+            res = self.model.predict(frame, imgsz=self.imgsz, classes=[cid], conf=DETECT_CONF,
+                                     device=self.device, verbose=False)[0]
         out = []
         for xyxy, conf in zip(res.boxes.xyxy.tolist(), res.boxes.conf.tolist()):
             out.append((*xyxy, float(conf)))
@@ -308,6 +320,7 @@ class Vision:
         self._callbacks: list[Callable[[VisionDecision], None]] = []
         self._latest = VisionDecision("idle", None, 0.0, None, None, time.monotonic())
         self._frame = None
+        self._raw = None
         self._paused = False
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -337,6 +350,10 @@ class Vision:
     def latest_frame(self):
         """Last annotated BGR frame (for the dashboard), or None."""
         return self._frame
+
+    def latest_raw(self):
+        """Last unannotated BGR frame (for scene queries such as the find agent), or None."""
+        return self._raw
 
     def pause(self) -> None:
         self._paused = True
@@ -429,6 +446,7 @@ class Vision:
                         break
                     time.sleep(0.02)
                     continue
+                self._raw = frame
                 if self._paused:
                     self._frame = frame
                     if self._latest.state != "idle":
