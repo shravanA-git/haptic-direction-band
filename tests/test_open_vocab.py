@@ -90,3 +90,31 @@ def test_dashboard_open_lookup_does_not_block_and_buzzes_ack():
     time.sleep(1.0)
     link.close()
     assert [a["cue"] for a in app.alerts.recent()] == ["ack"]
+
+
+def test_expand_phrase_adds_working_prompts():
+    assert V.expand_phrase("cap")[:2] == ["cap", "hat"]          # "cap" alone ~never fires
+    assert "snack pack" in V.expand_phrase("fruit snacks")
+    assert V.expand_phrase("Headphones") == ["headphones", "headset", "headphone"]
+    assert V.expand_phrase("umbrella stand") == ["umbrella stand", "umbrella stands"]
+    assert V.expand_phrase("glass") == ["glass"]                 # not "glasses" (eyewear)
+    assert len(V.expand_phrase("charger")) <= 4
+
+
+def test_resume_keeps_open_floor_and_confirm(monkeypatch):
+    v = make_vision(monkeypatch)
+    monkeypatch.setattr(V, "OPEN_CONFIRM", 2)
+    v.set_target("headphones")
+    v.pause()
+    v.resume()                                                   # Action released
+    assert v.tracker.min_score == V.OPEN_MIN_SCORE and v.tracker.confirm == 2
+
+
+def test_confirm_needs_hits_in_a_row():
+    tr = V.TargetTracker()
+    tr.set_target("cap", 0.1, confirm=2)
+    box = [(300, 100, 340, 200, 0.5)]
+    assert tr.update(box, 640, 0.0).state == "searching"        # one frame: not yet
+    assert tr.update([], 640, 0.1).state == "searching"         # streak broken
+    assert tr.update(box, 640, 0.2).state == "searching"
+    assert tr.update(box, 640, 0.3).state == "centered"         # two in a row

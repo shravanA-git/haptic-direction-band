@@ -41,7 +41,7 @@ Running it
     python -m app.vision --target banana --source clip.mp4
     python -m app.vision --check                         # is this computer ready? camera, mic, weights
     python -m app.vision --fetch                         # download all models now (before the demo)
-    python -m app.vision --target "my headphones" --show # not a COCO class: YOLO-World (open vocabulary)
+    python -m app.vision --target "my headphones" --show # not a COCO class: YOLOE (open vocabulary)
     python -m app.vision --selftest                      # tracker logic, no camera/weights
     python -m app.vision --target banana --show --log recordings/banana.csv   # tuning run
         (also --dead-band, --dead-band-exit, --lost-after, --smoothing, --min-score)
@@ -166,6 +166,7 @@ class TargetTracker:
         self._reset()
 
     def _reset(self) -> None:
+        self._hits = 0                       # consecutive frames with a box (acquisition)
         self._offset: Optional[float] = None
         self._last_seen: Optional[float] = None
         self._ever_seen = False
@@ -173,11 +174,15 @@ class TargetTracker:
         self._cand_since = 0.0
         self._state = "idle" if self.target is None else "searching"
 
-    def set_target(self, target: Optional[str], min_score: Optional[float] = None) -> None:
+    def set_target(self, target: Optional[str], min_score: Optional[float] = None,
+                   confirm: int = 1) -> None:
         """min_score: per-target score floor (open-vocabulary phrases score lower
-        than COCO classes); None = TrackerConfig.min_score."""
+        than COCO classes); None = TrackerConfig.min_score. confirm: frames in a
+        row with a box before the target counts as found (from searching/lost);
+        open phrases use OPEN_CONFIRM so a one-frame "hat" on hair doesn't buzz."""
         self.target = target
         self.min_score = min_score
+        self.confirm = max(1, confirm)
         self._reset()
 
     @property
@@ -201,6 +206,13 @@ class TargetTracker:
             if mirror:
                 off = -off
             cands.append((off, score, (x1, y1, x2, y2)))
+
+        if cands and prev in ("searching", "lost", "idle"):
+            self._hits += 1
+            if self._hits < getattr(self, "confirm", 1):
+                cands = []                     # not confirmed yet: treat as nothing seen
+        elif not cands:
+            self._hits = 0
 
         best = None
         if cands:
@@ -395,9 +407,54 @@ class Detector:
 # Open vocabulary: YOLO-World for anything that isn't a COCO class
 # --------------------------------------------------------------------------
 
-OPEN_WEIGHTS = os.environ.get("HDB_OPEN_WEIGHTS", "yolov8s-worldv2.pt")
+# YOLOE (text prompts via MobileCLIP) first: on Shravan's clips it saw worn
+# headphones in 60% of frames at score >= 0.10 where YOLO-World saw them in 0-1%,
+# and matched YOLO-World on banana / phone (98% / 95% seen, 0% / 4% false while
+# out). YOLO-World is the fallback if YOLOE can't load (offline first run).
+OPEN_WEIGHTS = os.environ.get("HDB_OPEN_WEIGHTS", "yoloe-11s-seg.pt")
+OPEN_FALLBACK = "yolov8s-worldv2.pt"
 OPEN_CONF = 0.05        # detector floor
-OPEN_MIN_SCORE = 0.15   # tracker floor for open phrases (YOLO-World scores run lower)
+# Floor swept on the 4 eval clips through YOLOE: 0.10 -> 84% seen / 15% false while
+# out; 0.12 -> 82% / 5%; 0.15 -> 79% / 4% (cap 45%). Confirm 2 didn't cut false hits
+# and added flips, so off by default.
+OPEN_MIN_SCORE = float(os.environ.get("HDB_OPEN_MIN_SCORE", 0.12))  # tracker floor
+OPEN_CONFIRM = int(os.environ.get("HDB_OPEN_CONFIRM", 1))  # hits in a row to acquire
+
+# Extra prompts per phrase; a box for any of them counts as the target. Wording
+# matters a lot ("headphones" alone 32% of frames, + "headset" 60%).
+OPEN_SYNONYMS = {
+    # cap clip (Nov 14): "cap" alone ~never fires; "hat" + "sports cap" carry it
+    "cap": ["hat", "sports cap", "baseball hat"], "hat": ["cap", "sports cap", "baseball hat"],
+    "baseball cap": ["hat", "sports cap", "cap"], "beanie": ["hat", "knit cap"],
+    "headphones": ["headset"], "headphone": ["headphones", "headset"],
+    "headset": ["headphones"], "earbuds": ["earphones", "airpods"],
+    "airpods": ["earbuds", "earphones"], "air pods": ["airpods", "earbuds"],
+    "keys": ["key", "keychain"], "key": ["keys", "keychain"],
+    "wallet": ["purse", "billfold"], "glasses": ["eyeglasses", "spectacles"],
+    "sunglasses": ["glasses", "shades"], "charger": ["phone charger", "power adapter", "charging cable"],
+    # "fruit snacks" alone never fires; "snack pack" / "candy packet" do
+    "fruit snacks": ["snack pack", "candy packet", "snack bag"],
+    "snacks": ["snack bag", "chips bag"], "chips": ["chips bag", "snack bag"],
+    "pen": ["pencil", "marker"], "watch": ["wristwatch", "smartwatch"],
+    "pill bottle": ["medicine bottle", "bottle"], "medicine": ["pill bottle", "medicine bottle"],
+    "hearing aid": ["earpiece"], "id card": ["card", "badge"], "card": ["id card", "credit card"],
+    "slippers": ["slipper", "shoes"], "shoes": ["shoe", "sneakers"], "jacket": ["coat", "hoodie"],
+    "water bottle": ["bottle"], "lip balm": ["chapstick"], "cane": ["walking stick"],
+}
+
+
+def expand_phrase(phrase: str, limit: int = 4) -> list:
+    """The prompts to look for: the phrase, its synonyms, then its singular/plural."""
+    p = " ".join(phrase.lower().split())
+    out = [p] + OPEN_SYNONYMS.get(p, [])
+    if not p.endswith("ss"):   # no "glasss", and not "glasses" (eyewear) for "glass"
+        out.append(p[:-1] if p.endswith("s") else p + "s")
+    seen, uniq = set(), []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq[:limit]
 
 _FILLERS = {"the", "my", "a", "an", "some", "our", "your", "his", "her", "their", "me",
             "please", "now", "again", "for", "is", "are", "where", "where's", "wheres",
@@ -467,25 +524,48 @@ def open_vocab_ready() -> Optional[str]:
 
 
 class OpenVocab:
-    """YOLO-World with one phrase at a time. set_phrase() costs ~2-3 s (CLIP text
-    encoding; ~10 s on first use while it loads), detect() ~35 ms/frame on MPS."""
+    """YOLOE (or YOLO-World) with one phrase at a time, expanded to a few prompts
+    (expand_phrase). set_phrase() costs ~0.5-4 s (text encoding; longer on first
+    use while the text encoder loads), detect() ~35-70 ms/frame on MPS."""
 
     def __init__(self, device: str, imgsz: int = DEFAULT_IMGSZ, lock=None):
         from ultralytics import YOLO
         _https_certs()
+        t = time.monotonic()
+        self.weights = OPEN_WEIGHTS
         with _models_cwd():
-            self.model = YOLO(OPEN_WEIGHTS)
+            try:
+                self.model = YOLO(self.weights)
+                if "yoloe" in self.weights:   # the text encoder (MobileCLIP, ~570 MB once)
+                    self.model.set_classes(["object"], self.model.get_text_pe(["object"]))
+            except Exception as e:
+                if self.weights == OPEN_FALLBACK:
+                    raise
+                print(f"[vision] open vocab {self.weights} failed ({type(e).__name__}: {e}); "
+                      f"falling back to {OPEN_FALLBACK}")
+                self.weights = OPEN_FALLBACK
+                self.model = YOLO(self.weights)
         self.device, self.imgsz = device, imgsz
         self.phrase: Optional[str] = None
+        self.prompts: list = []
         self._lock = lock or threading.Lock()
+        print(f"[vision] open vocab loaded: {self.weights} on {device} "
+              f"({time.monotonic() - t:.1f} s)")
 
     def set_phrase(self, phrase: str) -> None:
         if phrase == self.phrase:
             return
         _https_certs()
+        prompts = expand_phrase(phrase)
+        t = time.monotonic()
         with self._lock, _models_cwd():
-            self.model.set_classes([phrase])
-        self.phrase = phrase
+            if "yoloe" in self.weights:
+                self.model.set_classes(prompts, self.model.get_text_pe(prompts))
+            else:
+                self.model.set_classes(prompts)
+        self.phrase, self.prompts = phrase, prompts
+        print(f"[vision] open vocab phrase={phrase!r} prompts={prompts} floor={OPEN_MIN_SCORE} "
+              f"({self.weights}, {time.monotonic() - t:.1f} s)")
 
     def detect(self, frame) -> list:
         with self._lock:
@@ -536,14 +616,14 @@ class Vision:
         YOLO-World (first use loads it: several seconds). Returns None, and
         tracks nothing, for an empty phrase or when open vocabulary is
         unavailable (see open_vocab_ready())."""
-        target, floor = None, None
+        target, floor, confirm = None, None, 1
         if name:
             target = resolve_target(name)
             if target is None:
                 target = self._open_phrase(name)
-                floor = OPEN_MIN_SCORE
+                floor, confirm = OPEN_MIN_SCORE, OPEN_CONFIRM
         with self._lock:
-            self.tracker.set_target(target, floor)
+            self.tracker.set_target(target, floor, confirm)
         self._publish(VisionDecision(self.tracker.state, None, 0.0, None, target,
                                      time.monotonic(), True))
         return target
@@ -595,7 +675,8 @@ class Vision:
 
     def resume(self) -> None:
         with self._lock:
-            self.tracker.set_target(self.tracker.target)  # fresh start, no stale direction
+            tr = self.tracker   # fresh start, no stale direction; same floor/confirm
+            tr.set_target(tr.target, tr.min_score, getattr(tr, "confirm", 1))
         self._paused = False
 
     def start(self, strict: bool = False) -> bool:
@@ -940,7 +1021,7 @@ def check(camera=0) -> bool:
             except Exception:
                 pass
             n = len(ov.detect(img))
-            line(True, f"open vocabulary {OPEN_WEIGHTS}: 'person' x{n} "
+            line(True, f"open vocabulary {ov.weights}: 'person' x{n} "
                        f"({time.monotonic() - t:.1f}s incl. text encoding)")
         except Exception as e:
             line(False, f"open vocabulary: {e}", "python -m app.vision --fetch (needs internet once)")
@@ -1001,7 +1082,7 @@ def main(argv=None) -> None:
     p.add_argument("--selftest", action="store_true")
     p.add_argument("--analyze", metavar="CSV", help="summarize a --log file and exit")
     p.add_argument("--fetch", action="store_true",
-                   help="download every model into models/ now (COCO, YOLO-World, CLIP text encoder)")
+                   help="download every model into models/ now (COCO, YOLOE + MobileCLIP text encoder)")
     p.add_argument("--check", action="store_true",
                    help="is this computer ready? (imports, weights, camera, mic, port)")
     a = p.parse_args(argv)
@@ -1010,9 +1091,10 @@ def main(argv=None) -> None:
         why = open_vocab_ready()
         if why:
             raise SystemExit(f"[vision] open vocabulary: {why}")
-        OpenVocab("cpu").set_phrase("object")
-        print(f"[vision] models ready in {MODELS_DIR}: {DEFAULT_WEIGHTS}, {OPEN_WEIGHTS}, "
-              "CLIP ViT-B/32 (weights/clip)")
+        ov = OpenVocab("cpu")
+        ov.set_phrase("object")
+        print(f"[vision] models ready in {MODELS_DIR}: {DEFAULT_WEIGHTS}, {ov.weights}"
+              + (", MobileCLIP text encoder" if "yoloe" in ov.weights else ", CLIP ViT-B/32"))
         return
     if a.check:
         raise SystemExit(0 if check(int(a.source) if a.source.isdigit() else a.source) else 1)

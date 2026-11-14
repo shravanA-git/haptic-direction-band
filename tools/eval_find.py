@@ -334,7 +334,8 @@ def run_clip(frames: Iterable, fps: float, target: str, detect: Callable,
     from app.guide import ObjectGuide
     from app.vision import TargetTracker
     tracker = TargetTracker(config)
-    tracker.set_target(target, getattr(detect, "min_score", None))
+    tracker.set_target(target, getattr(detect, "min_score", None),
+                       getattr(detect, "confirm", 1))
     cues, now = [], [0.0]
     guide = ObjectGuide(play=lambda cue: None,
                         on_cue=lambda kind, motor, info: cues.append((now[0], kind, motor)))
@@ -496,16 +497,22 @@ def _video_frames(path: Path, stride: Optional[int] = None):
 class _VisionDetect:
     """Vision's own target resolution (COCO class or YOLO-World phrase) and detector."""
 
-    def __init__(self):
-        from app.vision import Vision
+    def __init__(self, force_open: bool = False):
+        from app.vision import Detector, Vision
         self.vision = Vision(camera=None)
-        from app.vision import Detector
         self.vision.detector = Detector()
         self.min_score = None
+        self.force_open = force_open   # every clip through the open-vocabulary model
 
     def target(self, obj: str) -> Optional[str]:
-        t = self.vision.set_target(obj)
+        if self.force_open:
+            from app import vision as V
+            t = self.vision._open_phrase(obj)
+            self.vision.tracker.set_target(t, V.OPEN_MIN_SCORE, V.OPEN_CONFIRM)
+        else:
+            t = self.vision.set_target(obj)
         self.min_score = self.vision.tracker.min_score
+        self.confirm = getattr(self.vision.tracker, "confirm", 1)
         return t
 
     def __call__(self, frame, target):
@@ -513,7 +520,7 @@ class _VisionDetect:
 
 
 def score_clips(labels: Path = LABELS, mirror: Optional[bool] = None, detector=None,
-                frames_for=None, grace_s: float = GRACE_S) -> dict:
+                frames_for=None, grace_s: float = GRACE_S, force_open: bool = False) -> dict:
     if not labels.exists():
         return {"skip": f"no clips yet ({labels.relative_to(ROOT) if labels.is_relative_to(ROOT) else labels} missing)"}
     clips = parse_labels(json.loads(labels.read_text()), labels.parent)
@@ -522,7 +529,7 @@ def score_clips(labels: Path = LABELS, mirror: Optional[bool] = None, detector=N
         return {"skip": f"no labelled clips in {labels.name}"}
     frames_for = frames_for or _video_frames
     try:
-        detector = detector or _VisionDetect()
+        detector = detector or _VisionDetect(force_open)
     except Exception as e:
         return {"skip": f"detector unavailable ({type(e).__name__}: {e})"}
     from app.vision import COCO_CLASSES, TrackerConfig
@@ -544,7 +551,7 @@ def score_clips(labels: Path = LABELS, mirror: Optional[bool] = None, detector=N
         recs, cues = run_clip(frames, fps, target, detector, cfg, m)
         s = score_clip(recs, cues, c["segments"], fps, grace_s)
         per.append(s)
-        opens.append(target not in COCO_CLASSES)
+        opens.append(force_open or target not in COCO_CLASSES)
         rows.append({"object": c["object"], "target": target,
                      **{k: v for k, v in s.items() if not k.startswith("_")}})
     out = {"clips": rows}
@@ -649,14 +656,20 @@ def main(argv=None) -> int:
                     help="clips from a webcam facing you (default: labels.json 'mirror')")
     ap.add_argument("--grace", type=float, default=GRACE_S,
                     help="seconds excused at each segment start")
+    ap.add_argument("--open", action="store_true",
+                    help="run every clip through the open-vocabulary model (scores seen_open)")
     ap.add_argument("--targets", type=Path, help="JSON {metric: [op, threshold]}")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     targets = dict(TARGETS)
     if a.targets:
         targets.update({k: tuple(v) for k, v in json.loads(a.targets.read_text()).items()})
-    res = evaluate(0 if a.no_spoken else a.spoken, a.labels, a.mirror, targets,
-                   grace_s=a.grace)
+    import contextlib
+    # --json: keep stdout pure JSON ([vision] load logs go to stderr)
+    quiet = contextlib.redirect_stdout(sys.stderr) if a.json else contextlib.nullcontext()
+    with quiet:
+        res = evaluate(0 if a.no_spoken else a.spoken, a.labels, a.mirror, targets,
+                       grace_s=a.grace, force_open=a.open)
     if a.json:
         print(json.dumps(res, indent=1, default=str))
     else:
