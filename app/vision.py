@@ -459,10 +459,34 @@ def expand_phrase(phrase: str, limit: int = 4) -> list:
 _FILLERS = {"the", "my", "a", "an", "some", "our", "your", "his", "her", "their", "me",
             "please", "now", "again", "for", "is", "are", "where", "where's", "wheres",
             "find", "look", "looking", "locate", "get", "can", "you", "help", "i", "to",
-            "it", "them", "here", "there", "of", "this", "that", "these", "those", "hey"}
-_TRIGGERS = ("where are my", "where is my", "where are the", "where is the", "where's my",
-             "where's the", "wheres my", "where are", "where is", "where's", "looking for",
-             "look for", "search for", "find", "locate", "where")
+            "it", "them", "here", "there", "of", "this", "that", "these", "those", "hey",
+            # spoken filler and verbs that leak in ("where did I put my X" -> X)
+            "um", "uh", "er", "erm", "hmm", "mm", "okay", "ok", "so", "like", "just",
+            "heck", "hell", "did", "put", "leave", "i'm", "im", "have", "has", "seen",
+            "lost", "need", "show", "take", "bring", "grab", "go", "at", "anywhere",
+            "somewhere", "where'd", "misplaced", "dropped", "see"}
+# Longest first where one contains another; the first one found in the text wins.
+_TRIGGERS = ("where did i put my", "where did i leave my", "where did i put", "where did i leave",
+             "where the heck is my", "where the heck are my", "where are my", "where is my",
+             "where are the", "where is the", "where's my", "where's the", "wheres my",
+             "have you seen my", "have you seen the", "have you seen", "show me my", "show me the",
+             "show me", "take me to my", "take me to the", "take me to", "get me my", "get my",
+             "bring me my", "bring me", "grab my", "i lost my", "lost my", "i can't find my",
+             "i cant find my", "i can't find", "i cant find", "i need my", "need my",
+             "where'd my", "where'd the", "where did my", "where did the", "misplaced my",
+             "dropped my", "do you see my", "do you see the", "can you see my", "can you see the",
+             "where'd",
+             "where are", "where is", "where's", "looking for", "look for", "search for",
+             "find", "locate", "where")
+# Things people ask for by name alone ("keys please", "hat"): accepted from speech
+# without a find/where word. Anything else needs a trigger, so "hello there" or
+# "what time is it" never becomes a target.
+KNOWN_OBJECTS = {"keys", "key", "wallet", "purse", "glasses", "sunglasses", "eyeglasses",
+                 "headphones", "headset", "earbuds", "airpods", "air pods", "charger",
+                 "phone charger", "hat", "cap", "baseball cap", "beanie", "watch", "pen",
+                 "pencil", "hearing aid", "id card", "card", "slippers", "shoes", "jacket",
+                 "coat", "fruit snacks", "snacks", "chips", "pill bottle", "medicine",
+                 "lip balm", "cane", "water bottle", "remote", "notebook", "earphones"}
 
 
 def clean_phrase(text: str, require_trigger: bool = False) -> Optional[str]:
@@ -471,17 +495,20 @@ def clean_phrase(text: str, require_trigger: bool = False) -> Optional[str]:
     find/where trigger if there is one (required for speech, where "hello there"
     isn't a request); fillers stripped; at most 4 words."""
     s = " ".join(re.sub(r"[^a-z' ]+", " ", (text or "").lower().replace("-", " ")).split())
+    triggered = False
     for trig in _TRIGGERS:
         k = s.find(trig)
-        if k >= 0 and (k == 0 or s[k - 1] == " "):
+        if k >= 0 and (k == 0 or s[k - 1] == " ") and \
+                (k + len(trig) == len(s) or s[k + len(trig)] == " "):
             s = s[k + len(trig):]
+            triggered = True
             break
-    else:
-        if require_trigger:
-            return None
     s = re.split(r"\b(?:and|or|so|because|but|then)\b", s)[0]
     words = [w for w in s.split() if w not in _FILLERS]
-    return " ".join(words[:4]) or None
+    phrase = " ".join(words[:4]) or None
+    if require_trigger and not triggered and phrase not in KNOWN_OBJECTS:
+        return None
+    return phrase
 
 
 def _models_cwd():
