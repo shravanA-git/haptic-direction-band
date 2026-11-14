@@ -156,10 +156,10 @@ def main(argv=None) -> int:
             sound = None
             print(f"[hdb] sound listener off: {e}")
     if a.nav or a.nav_file:
-        try:
-            from tools.costar_nav import NavError, build_twin, load_model
-            from .nav import NavGuide
-            twin = build_twin(load_model(a.nav, a.nav_file, False))
+        from tools.costar_nav import NavError, build_twin, load_model
+        from .nav import NavGuide
+
+        def start_nav(twin):
             nav = NavGuide(twin, play=lambda cue: app.play_cue(cue, "nav"),
                            yaw_sign=a.nav_yaw_sign).start()
             app.attach_nav(nav, {"model": a.nav})
@@ -173,8 +173,14 @@ def main(argv=None) -> int:
                     print("[hdb] hold-to-talk on Action: \"take me to the kitchen\"")
                 except Exception as e:
                     print(f"[hdb] speech off ({e}); type the room on /nav")
+        app.nav_factory = start_nav
+        try:
+            start_nav(build_twin(load_model(a.nav, a.nav_file, False)))
         except (NavError, OSError, ValueError, KeyError) as e:
-            print(f"[hdb] nav off: {e}")
+            print(f"[hdb] nav: model not loaded ({e})")
+            if a.nav:   # the tour may still be public: export its sweep graph from /nav
+                app.nav_info = {"model": a.nav, "export_only": True, "error": str(e)}
+                print(f"[hdb] nav: open http://localhost:{a.http}/nav and press 'Export tour graph'")
     from .notify import caregiver_from_env
     caregiver = caregiver_from_env(app.settings, dry=a.dry_texts)
     app.attach_caregiver(caregiver)

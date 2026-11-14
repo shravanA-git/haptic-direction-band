@@ -152,6 +152,54 @@ def fetch_model(model_id: str) -> dict:
     return model
 
 
+def model_from_showcase(raw: dict) -> dict:
+    """A model dict for build_twin from what the /nav page reads through the
+    Showcase SDK, for tours the Model API can't give us (not in the key's org).
+
+    raw: {"model", "name", "sweeps": [{sid, position{x,y,z}, neighbors[], floor,
+    room}], "floors": [{id, name}], "rooms": [{id, floor, label}], "labels":
+    {room id or sweep sid: name typed on the page}}.
+    The tour is y-up; the model frame here is z-up: (x, y, z) -> (x, -z, y),
+    the same mapping app/nav.py uses for live poses. No walls come through the
+    SDK, so routes follow the tour's own neighbour graph (which can see through
+    glass: check routes on the tour before trusting them).
+    """
+    labels = {str(k): str(v).strip() for k, v in (raw.get("labels") or {}).items() if str(v).strip()}
+    rooms: dict[str, dict] = {}
+    for r in raw.get("rooms") or []:
+        rid = str(r.get("id") or "")
+        if not rid:
+            continue
+        label = labels.get(rid) or str(r.get("label") or "").strip()
+        if label:
+            rooms[rid] = {"id": rid, "floor": None if r.get("floor") is None else {"id": str(r["floor"])},
+                          "classifications": [{"label": label, "confidence": 1.0}], "boundary": {"edges": []}}
+    panos, locs = [], []
+    for i, sw in enumerate(raw.get("sweeps") or []):
+        sid = str(sw.get("sid") or sw.get("id") or "")
+        pos = sw.get("position") or {}
+        if not sid or not all(k in pos for k in ("x", "y", "z")):
+            continue
+        panos.append({"id": sid, "label": str(i), "position": {
+            "x": float(pos["x"]), "y": -float(pos["z"]), "z": float(pos["y"])}})
+        rid = str(sw.get("room") or "")
+        if sid in labels:                      # a named spot with no room of its own
+            rid = f"spot:{sid}"
+            rooms[rid] = {"id": rid, "floor": None, "boundary": {"edges": []},
+                          "classifications": [{"label": labels[sid], "confidence": 1.0}]}
+        floor = sw.get("floor")
+        locs.append({"id": sid, "neighbors": [str(n) for n in sw.get("neighbors") or []],
+                     "floor": {"id": str(floor)} if floor not in (None, "") else None,
+                     "room": {"id": rid} if rid in rooms else None, "pano": {"id": sid}})
+    floors = [{"id": str(f.get("id")), "label": str(f.get("name") or f.get("id")),
+               "vertices": [], "edges": []} for f in raw.get("floors") or [] if f.get("id") is not None]
+    if not panos:
+        raise NavError("the tour export has no sweeps with positions")
+    return {"id": raw.get("model"), "name": raw.get("name") or raw.get("model") or "tour",
+            "source": "showcase-sdk", "floors": floors, "rooms": list(rooms.values()),
+            "panoLocations": panos, "locations": locs}
+
+
 def load_model(model_id: str | None, file: str | None, refresh: bool) -> dict:
     if file:
         data = json.loads(Path(file).read_text())

@@ -37,6 +37,18 @@
     <button id="stop">Stop</button>
   </div>
   <div class="row" id="rooms"></div>
+  <div id="exportbox" style="margin-top:12px">
+    <h1>Tour graph</h1>
+    <div class="dim" id="exportnote">Reads the tour's own scan points and links through the
+      Showcase SDK (for tours the Model API can't load). Name rooms as you walk, then export.</div>
+    <div class="row">
+      <input id="roomname" placeholder="name this room (e.g. kitchen)">
+      <button id="nameroom">Name</button>
+    </div>
+    <div class="row"><button id="export">Export tour graph</button>
+      <button id="download">Download JSON</button></div>
+    <div class="dim" id="named"></div>
+  </div>
   <div class="dim">Or hold Action on the band and say "take me to the kitchen".
     The band buzzes toward the next scan point; walk the tour by clicking it.</div>
   <h1 style="margin-top:14px">Log</h1>
@@ -49,6 +61,8 @@ const KEY = new URLSearchParams(location.search).get("k");
 const withKey = (u, sep) => KEY ? `${u}${sep}k=${encodeURIComponent(KEY)}` : u;
 const NAMES = ["front", "front-right", "right", "back-right", "back", "back-left", "left", "front-left"];
 let ws, lastSent = {sweep: null, yaw: null, t: 0};
+let cfg = {}, sdkRef = null, sweeps = {}, floors = {}, rooms = {}, currentSweep = null, labels = {};
+const labelKey = () => `hdb-nav-labels-${cfg.model}`;
 
 function log(t) { const d = $("log"); d.textContent = `${new Date().toLocaleTimeString()} ${t}\n` + d.textContent; }
 function send(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
@@ -90,8 +104,54 @@ function connectWs() {
   ws.onclose = () => setTimeout(connectWs, 1000);
 }
 
+function showNamed() {
+  const n = Object.entries(labels).map(([k, v]) => v).join(", ");
+  $("named").textContent = `${Object.keys(sweeps).length} scan points read` + (n ? ` · named: ${n}` : "");
+}
+
+function tourGraph() {
+  const sw = Object.values(sweeps).map(s => ({
+    sid: s.sid, position: s.position, neighbors: s.neighbors || [],
+    floor: s.floorInfo ? (s.floorInfo.id ?? s.floorInfo.sequence) : null,
+    room: s.roomInfo ? s.roomInfo.id : null}));
+  return {model: cfg.model, name: cfg.name || cfg.model, sweeps: sw,
+          floors: Object.values(floors).map(f => ({id: f.id ?? f.sequence, name: f.name})),
+          rooms: Object.values(rooms).map(r => ({id: r.id, floor: r.floorInfo ? r.floorInfo.id : null,
+                                                 label: r.label || r.name || ""})),
+          labels};
+}
+
+$("nameroom").onclick = () => {
+  const name = $("roomname").value.trim();
+  const s = sweeps[currentSweep];
+  if (!name || !currentSweep) { log("name: stand in the room in the tour and type its name"); return; }
+  const key = s && s.roomInfo && s.roomInfo.id ? s.roomInfo.id : currentSweep;
+  labels[key] = name; localStorage.setItem(labelKey(), JSON.stringify(labels));
+  log(`named ${key === currentSweep ? "this spot" : "this room"}: ${name}`); $("roomname").value = ""; showNamed();
+};
+$("export").onclick = async () => {
+  if (!Object.keys(sweeps).length) { log("export: the tour hasn't sent its scan points yet (SDK key?)"); return; }
+  const r = await fetch(withKey("/nav/export", "?"), {method: "POST", headers: {"Content-Type": "application/json"},
+                                                      body: JSON.stringify(tourGraph())});
+  const out = await r.json();
+  if (out.error) { log("export: " + out.error); return; }
+  log(`saved ${out.saved}: ${out.sweeps} scan points, ${out.links} links, rooms ${out.rooms.join(", ") || "none"}` +
+      (out.started ? " · guidance on" : ""));
+  if (out.started) setTimeout(() => location.reload(), 800);
+};
+$("download").onclick = () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(tourGraph(), null, 1)], {type: "application/json"}));
+  a.download = `${cfg.model || "tour"}-showcase.json`; a.click();
+};
+
 async function main() {
-  const cfg = await (await fetch(withKey("/nav/config", "?"))).json();
+  cfg = await (await fetch(withKey("/nav/config", "?"))).json();
+  try { labels = JSON.parse(localStorage.getItem(labelKey()) || "{}"); } catch (e) { labels = {}; }
+  if (cfg.export_only) {
+    $("where").innerHTML = '<span class="warn">The Model API can\'t load this tour' +
+      (cfg.error ? ` (${cfg.error})` : "") + '. Walk it, name the rooms, then Export tour graph.</span>';
+  }
   $("name").textContent = cfg.name || "Visit before you go";
   for (const r of cfg.rooms || []) {
     const b = document.createElement("button"); b.textContent = r;
@@ -109,11 +169,19 @@ async function main() {
   if (!cfg.sdk_key || !window.MP_SDK) return;
   tour.addEventListener("load", async () => {
     try {
-      const sdk = await window.MP_SDK.connect(tour, cfg.sdk_key, "");
+      const sdk = sdkRef = await window.MP_SDK.connect(tour, cfg.sdk_key, "");
       log("tour connected");
+      const watch = (coll, set) => {
+        try { coll.data.subscribe({onCollectionUpdated: c => { set(c); showNamed(); }}); }
+        catch (e) { log("tour SDK: " + e); }
+      };
+      watch(sdk.Sweep, c => { sweeps = c; });
+      if (sdk.Floor) watch(sdk.Floor, c => { floors = c; });
+      if (sdk.Room) watch(sdk.Room, c => { rooms = c; });
       sdk.Camera.pose.subscribe(pose => {
         // Send when the scan point changes, the view turns >= 10 deg, or every 2 s.
         const yaw = pose.rotation.y, now = Date.now();
+        currentSweep = pose.sweep;
         const turned = lastSent.yaw == null || Math.abs(((yaw - lastSent.yaw + 540) % 360) - 180) >= 10;
         if (pose.sweep !== lastSent.sweep || turned || now - lastSent.t > 2000) {
           lastSent = {sweep: pose.sweep, yaw, t: now};

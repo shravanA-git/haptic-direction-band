@@ -179,3 +179,90 @@ def test_action_held_pauses_guidance():
     app._action(False)
     assert not nav.paused
     link.close()
+
+
+# ---------------------------------------------------------- Showcase SDK export
+def showcase_raw():
+    """What the /nav page reads from the tour (y-up): three sweeps in a row, the
+    third in a room the SDK labels "Kitchen"; the first room only gets a name
+    typed on the page."""
+    return {"model": "2K7G7cdukZV", "name": "Rabinowitz Hall",
+            "sweeps": [
+                {"sid": "s1", "position": {"x": 0, "y": 1.5, "z": 0}, "neighbors": ["s2"],
+                 "floor": 0, "room": "r1"},
+                {"sid": "s2", "position": {"x": 0, "y": 1.5, "z": -3}, "neighbors": ["s1", "s3"],
+                 "floor": 0, "room": None},
+                {"sid": "s3", "position": {"x": 3, "y": 1.5, "z": -3}, "neighbors": ["s2"],
+                 "floor": 0, "room": "r2"},
+                {"sid": "bad", "position": {"x": 1}},          # no full position: skipped
+            ],
+            "floors": [{"id": 0, "name": "Ground"}],
+            "rooms": [{"id": "r1", "floor": 0, "label": ""}, {"id": "r2", "floor": 0, "label": "Kitchen"}],
+            "labels": {"r1": "Lobby", "s2": "Hallway"}}
+
+
+def test_showcase_export_becomes_a_routable_model():
+    from tools.costar_nav import NavError, model_from_showcase
+    m = model_from_showcase(showcase_raw())
+    t = build_twin(m)
+    assert set(t.panos) == {"s1", "s2", "s3"}
+    s2 = t.panos["s2"]
+    assert (s2.x, s2.y, s2.z) == (0, 3, 1.5)                  # tour (x, y, z) -> model (x, -z, y)
+    assert {t.rooms[p.room].label for p in t.panos.values()} == {"Lobby", "Hallway", "Kitchen"}
+    from tools.costar_nav import goal_panos, shortest_path
+    assert shortest_path(t, "s1", goal_panos(t, "kitchen")) == ["s1", "s2", "s3"]
+    # facing tour -z (model +y, heading 0): s1 -> s2 is straight ahead, s2 -> s3 is right
+    nav = NavGuide(t, play=lambda c: None)
+    nav.set_goal("kitchen", now=0.0)
+    nav.update_pose("s1", yaw=0, now=5.0)
+    assert nav.next_step()["motor"] == 0
+    nav.update_pose("s2", yaw=0, now=6.0)
+    assert nav.next_step()["motor"] == 2
+    with pytest.raises(NavError):
+        model_from_showcase({"sweeps": []})
+
+
+def test_export_saves_the_cache_and_starts_guidance(tmp_path, monkeypatch):
+    from tools import costar_nav
+    monkeypatch.setattr(costar_nav, "CACHE_DIR", tmp_path)
+    app, _, port, link = make_app(nav_on=False)
+    app.nav_info = {"model": "2K7G7cdukZV", "export_only": True}
+    app.nav_factory = lambda twin: app.attach_nav(NavGuide(twin, play=lambda c: None), {"model": "2K7G7cdukZV"})
+    out = app.save_nav_export(showcase_raw())
+    assert out["sweeps"] == 3 and out["links"] == 2 and out["started"]
+    assert set(out["rooms"]) == {"Lobby", "Hallway", "Kitchen"}
+    cached = costar_nav.load_model("2K7G7cdukZV", None, False)    # what --nav loads next time
+    assert len(cached["locations"]) == 3 and cached["source"] == "showcase-sdk"
+    assert app.nav is not None and app.nav.set_goal("kitchen")[0]
+    raw = showcase_raw()
+    raw["labels"]["s3"] = "Pantry"                                  # re-export: swapped in
+    app.save_nav_export(raw)
+    assert app.nav.set_goal("pantry")[0]
+    with pytest.raises(ValueError):
+        app.save_nav_export(dict(showcase_raw(), model="../../etc"))
+    link.close()
+
+
+def test_nav_page_and_export_over_http(tmp_path, monkeypatch):
+    import asyncio
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from tools import costar_nav
+    monkeypatch.setattr(costar_nav, "CACHE_DIR", tmp_path)
+
+    async def run():
+        app, _, port, link = make_app(nav_on=False)
+        async with TestClient(TestServer(app.make_app())) as client:
+            assert (await client.get("/nav")).status == 404           # no --nav: as before
+            app.nav_info = {"model": "2K7G7cdukZV", "export_only": True, "error": "not.found"}
+            r = await client.get("/nav")
+            assert r.status == 200 and "Export tour graph" in await r.text()
+            cfg = await (await client.get("/nav/config")).json()
+            assert cfg["export_only"] and cfg["model"] == "2K7G7cdukZV"
+            r = await client.post("/nav/export", json=showcase_raw())
+            assert r.status == 200 and (await r.json())["sweeps"] == 3
+            r = await client.post("/nav/export", json={"model": "2K7G7cdukZV", "sweeps": []})
+            assert r.status == 400
+        link.close()
+    asyncio.run(run())

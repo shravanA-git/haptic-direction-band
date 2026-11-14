@@ -127,6 +127,7 @@ class App:
         self.speech = None
         self.nav = None                  # app.nav.NavGuide with --nav (CoStar track)
         self.nav_info: dict = {}
+        self.nav_factory = None          # main: twin -> start a NavGuide (after a tour export)
         link.subscribe(self._on_event)
         link.subscribe(self.live)
         link.subscribe(self.recorder)
@@ -792,20 +793,63 @@ class App:
         return web.FileResponse(DASH / "index.html")
 
     async def nav_page(self, request):
-        if self.nav is None:
+        if self.nav is None and not self.nav_info.get("model"):
             return web.Response(status=404, text="navigation is off (start with --nav <model id>)")
         return web.FileResponse(DASH / "nav.html")
 
     async def nav_config(self, request):
         """Model id, rooms and the Showcase SDK key (MATTERPORT_SDK_KEY, a browser
-        key) for the /nav page."""
-        if self.nav is None:
+        key) for the /nav page. export_only: the Model API couldn't give us the
+        model, so the page offers to export the tour's sweep graph instead."""
+        if self.nav is None and not self.nav_info.get("model"):
             return web.json_response({"error": "navigation is off"}, status=404)
         import os
-        rooms = sorted({r.label for r in self.nav.twin.rooms.values() if r.label != "Void"})
-        return web.json_response({"model": self.nav_info.get("model"), "name": self.nav.twin.name,
-                                  "rooms": rooms, "sdk_key": os.environ.get("MATTERPORT_SDK_KEY", ""),
-                                  "yaw_sign": self.nav.yaw_sign})
+        twin = self.nav.twin if self.nav is not None else None
+        rooms = sorted({r.label for r in twin.rooms.values() if r.label != "Void"}) if twin else []
+        return web.json_response({
+            "model": self.nav_info.get("model"), "name": twin.name if twin else None,
+            "rooms": rooms, "sdk_key": os.environ.get("MATTERPORT_SDK_KEY", ""),
+            "yaw_sign": self.nav.yaw_sign if self.nav is not None else None,
+            "export_only": self.nav is None, "error": self.nav_info.get("error")})
+
+    def save_nav_export(self, raw: dict) -> dict:
+        """The /nav page's Showcase SDK read-out -> mp_cache/<model>.json (what
+        --nav <model> loads next time) and, if navigation isn't running yet,
+        start it now on that graph."""
+        import re
+        from tools import costar_nav
+        model_id = str(raw.get("model") or self.nav_info.get("model") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", model_id):
+            raise ValueError("export needs the tour's model id")
+        model = costar_nav.model_from_showcase(dict(raw, model=model_id))
+        twin = costar_nav.build_twin(model)
+        costar_nav.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = costar_nav.CACHE_DIR / f"{model_id}.json"
+        path.write_text(json.dumps(model))
+        links = sum(len(v) for v in twin.links.values()) // 2
+        labelled = sorted({r.label for r in twin.rooms.values()})
+        started = False
+        if self.nav is None and self.nav_factory is not None:
+            self.nav_factory(twin)
+            started = self.nav is not None
+        elif self.nav is not None:          # re-export (more rooms named): use it now
+            self.nav.twin = twin
+            self.nav.cancel("tour graph updated")
+            started = True
+        shown = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+        return {"saved": str(shown), "sweeps": len(twin.panos), "links": links,
+                "rooms": labelled, "started": started}
+
+    async def nav_export(self, request):
+        try:
+            raw = await request.json()
+            out = self.save_nav_export(raw if isinstance(raw, dict) else {})
+        except Exception as e:   # bad JSON, no sweeps, bad id
+            return web.json_response({"error": str(e)}, status=400)
+        self.emit({"type": "log", "text": f"nav: tour graph saved to {out['saved']} "
+                                          f"({out['sweeps']} sweeps, {out['links']} links, "
+                                          f"rooms: {', '.join(out['rooms']) or 'none named'})"})
+        return web.json_response(out)
 
     VIDEO_FPS = 12          # preview cap; the detector runs at ~10 fps anyway
     VIDEO_QUALITY = 70
@@ -928,6 +972,7 @@ class App:
         app.router.add_get("/video", self.video)
         app.router.add_get("/nav", self.nav_page)
         app.router.add_get("/nav/config", self.nav_config)
+        app.router.add_post("/nav/export", self.nav_export)
 
         async def on_startup(_):
             self.loop = asyncio.get_running_loop()
