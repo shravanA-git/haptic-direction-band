@@ -137,6 +137,7 @@ class TrackerConfig:
     smoothing: float = 0.5         # EMA weight of the newest offset (1.0 = no smoothing)
     max_jump: float = 0.6          # prefer boxes within this offset distance of the last one
     min_score: float = 0.25
+    min_dwell_s: float = 0.3       # a new side must hold this long before it's reported
 
 
 class TargetTracker:
@@ -151,6 +152,8 @@ class TargetTracker:
         self._offset: Optional[float] = None
         self._last_seen: Optional[float] = None
         self._ever_seen = False
+        self._cand: Optional[str] = None     # pending side change (dwell)
+        self._cand_since = 0.0
         self._state = "idle" if self.target is None else "searching"
 
     def set_target(self, target: Optional[str]) -> None:
@@ -200,7 +203,21 @@ class TargetTracker:
                 centered = abs(o) <= self.cfg.dead_band_exit
             else:
                 centered = abs(o) <= self.cfg.dead_band
-            self._state = "centered" if centered else ("left" if o < 0 else "right")
+            new = "centered" if centered else ("left" if o < 0 else "right")
+            # Dwell: a side change must hold min_dwell_s before it is reported, so a
+            # target swept through the middle doesn't fire left/centered/right cues
+            # 0.2 s apart. First acquisition (from searching/lost) is immediate.
+            if prev in ("left", "right", "centered"):
+                if new == prev:
+                    self._cand = None              # a blip back cancels the pending change
+                else:
+                    if self._cand != new:
+                        self._cand, self._cand_since = new, t
+                    if t - self._cand_since < self.cfg.min_dwell_s:
+                        new = prev
+                    else:
+                        self._cand = None
+            self._state = new
             return VisionDecision(self._state, round(o, 3), float(score), bbox,
                                   self.target, t, self._state != prev)
 
@@ -499,7 +516,7 @@ def _selftest() -> None:
     assert resolve_target("my phone") == "cell phone"
     assert resolve_target("unicorn") is None
 
-    tr = TargetTracker(TrackerConfig(smoothing=1.0, lost_after_s=0.8))
+    tr = TargetTracker(TrackerConfig(smoothing=1.0, lost_after_s=0.8, min_dwell_s=0.0))
     assert tr.update([box(100)], W, 0.0).state == "idle"
     tr.set_target("banana")
     d = tr.update([], W, 0.0)
@@ -534,6 +551,20 @@ def _selftest() -> None:
     # mirror flips sides
     d = tr.update([box(100)], W, 3.1, mirror=True)
     assert d.state == "right", d
+    # dwell: a quick sweep through the middle does not flip states
+    tr = TargetTracker(TrackerConfig(smoothing=1.0, min_dwell_s=0.3))
+    tr.set_target("banana")
+    assert tr.update([box(100)], W, 0.0).state == "left"          # first sight: immediate
+    assert tr.update([box(320)], W, 0.1).state == "left"          # centered for 0.1 s: held
+    assert tr.update([box(540)], W, 0.2).state == "left"          # right just started
+    assert tr.update([box(540)], W, 0.4).state == "left"          # right for 0.2 s
+    d = tr.update([box(540)], W, 0.55)
+    assert d.state == "right" and d.changed, d                     # right held 0.35 s
+    assert tr.update([box(320)], W, 0.6).state == "right"
+    assert tr.update([box(540)], W, 0.7).state == "right"         # blip cleared the candidate
+    assert tr.update([box(320)], W, 0.8).state == "right"
+    assert tr.update([box(320)], W, 1.0).state == "right"         # 0.2 s since 0.8, not 0.6
+    assert tr.update([box(320)], W, 1.15).state == "centered"
     print("vision selftest: OK")
 
 
