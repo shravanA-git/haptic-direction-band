@@ -409,3 +409,74 @@ def test_yamnet_default_is_doorbell_only_with_its_pattern(tmp_path, monkeypatch,
     assert [(h.label, h.category) for h in hits] == want
     if want:
         assert haptics.taught_sound(hits[0].category) == haptics.SOUND_PATTERNS["two-tone"]
+
+
+# ---------------------------------------------------------- one doorbell, many rings
+def chime(amp=0.15, hi=728.0, lo=561.0, cents=0.0, gap=0.32):
+    """Sophanit's doorbell: short 728 Hz ding, then a long-ringing 561 Hz dong."""
+    f = 2 ** (cents / 1200)
+    out = bell(hi * f, 1.6, amp)
+    b = bell(lo * f, 1.3, amp, 0.6)
+    k = int(gap * SR)
+    out[k:k + len(b)] += b[:len(out) - k]
+    return out
+
+
+class Clock:
+    """Feeds with a steady audio clock (tests run faster than real time)."""
+    def __init__(self, sl, t0=1000.0):
+        self.sl, self.t = sl, t0
+
+    def feed(self, x):
+        self.sl.feed(x, t_first=self.t)
+        self.t += len(x) / SR
+
+
+RINGS = [(0.15, 0), (0.05, 15), (0.3, -15), (0.08, -20), (0.2, 20), (0.03, 5)]   # (level, cents)
+
+
+@pytest.mark.parametrize("with_yamnet", [False, True])
+def test_doorbell_rung_six_times_gives_six_alerts_and_no_duplicates(tmp_path, with_yamnet):
+    """One example taught at one level; rings at 0.2x-2x the level and +-20 cents.
+    Before the fix the short ding was dropped as a 'fragment' on some rings
+    (score 0.67) and YAMNet caught them instead. YAMNet here hears every event
+    as a doorbell, so any double alert for one ring would show."""
+    y = ScriptedYamNet([("Doorbell", 0.95)]) if with_yamnet else False
+    sl = listen.SoundListener(template_file=tmp_path / "t.json", yamnet=y)
+    hits, scores = [], []
+    sl.on_classified = lambda sig, label, s: scores.append(round(s, 2))
+    c = Clock(sl)
+    c.feed(room(1.0))
+    sl.teach(3.0, "doorbell")
+    c.feed(in_room(chime(), 0.3, 2.0))
+    assert sl.sounds["doorbell"][0].category == "two-tone"
+    sl.on_detect = hits.append
+    scores.clear()
+    for amp, cents_ in RINGS:
+        c.feed(in_room(chime(amp, cents=cents_), 1.0, 2.0))
+    if with_yamnet:
+        assert wait_for(lambda: sl._yq.empty(), 3.0)
+        wait_for(lambda: len(hits) > 6, 0.5)
+    assert [h.label for h in hits] == ["doorbell"] * 6, (scores, [h.label for h in hits])
+    assert min(scores) >= sl.threshold, scores
+    starts = [h.start for h in hits]
+    assert all(b - a > 3.0 for a, b in zip(starts, starts[1:]))       # one alert per ring
+
+
+def test_yamnet_backs_up_an_untaught_ring_once(tmp_path):
+    """A chime the taught template doesn't match: YAMNet alerts once for it,
+    after the ring is over, even if the ring is split into two events."""
+    y = ScriptedYamNet([("Doorbell", 0.9)])
+    sl = listen.SoundListener(template_file=tmp_path / "t.json", yamnet=y)
+    hits = []
+    c = Clock(sl)
+    c.feed(room(1.0))
+    sl.teach(3.0, "doorbell")
+    c.feed(in_room(chime(), 0.3, 2.0))
+    sl.on_detect = hits.append
+    other = chime(0.15, hi=440.0, lo=880.0)                       # rising, other notes
+    c.feed(np.concatenate([room(1.0), room(0.6) + other[:int(0.6 * SR)], room(0.3),
+                           room(1.0) + other[int(0.6 * SR):int(1.6 * SR)], room(2.0)]))
+    assert wait_for(lambda: hits, 3.0)
+    wait_for(lambda: len(hits) > 1, 0.5)
+    assert [(h.label, h.category) for h in hits] == [("Doorbell", "two-tone")]

@@ -85,7 +85,10 @@ ONSET_JUMP = 1.8               # level jump over the recent minimum that marks a
 NOISE_SUB = 2.0                # subtract this x the room spectrum before pitch picking
 NOISE_ALPHA = 0.05             # room-spectrum update rate (quiet frames)
 PITCH_RMS_RATIO = 2.5          # only frames this far above the floor get a pitch
-NOTE_MIN_SHARE = 0.3           # notes shorter than this x the longest note are dropped
+NOTE_MIN_SHARE = 0.3           # notes shorter than this x the longest note are dropped,
+NOTE_KEEP_S = 0.2              # unless at least this long: a doorbell's short "ding"
+                               # (~0.3 s) next to its long-ringing "dong" (~1.2 s) sat
+                               # right at 0.3x and vanished on some rings (score 0.67)
 ONSET_MIN_PEAK = 0.25          # onsets need this x the event's peak level
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -300,7 +303,7 @@ def describe_frames(rms: list, pitches: list, on: list) -> Signature:
     close(cur)
     if notes:   # drop fragments (background talk, room) next to the sound's main notes
         longest = max(d for _, _, d in notes)
-        notes = [n for n in notes if n[2] >= NOTE_MIN_SHARE * longest]
+        notes = [n for n in notes if n[2] >= NOTE_MIN_SHARE * longest or n[2] >= NOTE_KEEP_S]
     sig = Signature(dur, tonal, notes, onsets)
     sig.category, sig.description = categorize(sig)
     return sig
@@ -325,10 +328,12 @@ def pitch_score(t: Signature, e: Signature) -> float:
 
 
 def pattern_score(t: Signature, e: Signature) -> float:
-    """Same number of strikes, at similar spacing."""
-    nt, ne = len(t.onsets), len(e.onsets)
+    """Same number of strikes, at similar spacing. A new note counts as a strike
+    too: a doorbell's dong often starts while the ding still rings, so its onset
+    (a level jump) is missed on some rings but not others."""
+    nt, ne = max(len(t.onsets), len(t.notes)), max(len(e.onsets), len(e.notes))
     s = min(nt, ne) / max(nt, ne)
-    if nt >= 2 and ne >= 2:
+    if len(t.onsets) >= 2 and len(e.onsets) >= 2:
         gt, ge = float(np.median(np.diff(t.onsets))), float(np.median(np.diff(e.onsets)))
         s *= _dur_factor(gt, ge) ** 0.5
     return s
@@ -351,6 +356,10 @@ YAMNET_WATCH = ("Doorbell", "Ding-dong")
 # "Alarm clock", "Siren", "Buzzer", "Telephone bell ringing", "Ringtone",
 # "Baby cry, infant cry", "Bark", "Microwave oven", "Beep, bleep", "Shatter"
 YAMNET_MIN = 0.50              # class score that buzzes (HDB_YAMNET_MIN)
+# One alert per ring: events closer than this belong to the same ring. YAMNet
+# (the backup) decides only after the ring is over, and stays quiet if a taught
+# sound already fired for it; it also never fires twice for one ring.
+RING_GAP_S = 0.6
 # Haptic pattern category (haptics.SOUND_PATTERNS) per class; others use "yamnet"
 # (no pattern of its own: the shared sweep).
 YAMNET_CATEGORY = {"Doorbell": "two-tone", "Ding-dong": "two-tone", "Knock": "percussive",
@@ -533,6 +542,7 @@ class SoundListener:
         self.yamnet_min = float(os.environ.get("HDB_YAMNET_MIN", YAMNET_MIN))
         self.on_heard: Optional[Callable[[str], None]] = None   # "YAMNet: Knock 0.41, ..."
         self.last_yamnet: list = []
+        self._hits: deque = deque(maxlen=8)   # (start, end) of recent alerts, any source
         self._yq = None
         if self.yamnet is not None:
             import queue
@@ -773,6 +783,7 @@ class SoundListener:
             self._to_yamnet(ev, sig, end_n)
         if best >= self.threshold and end_t - self._last_hit >= self.cooldown_s:
             self._last_hit = end_t
+            self._hits.append((self._t(ev.start_n), end_t))
             hit = SoundHit(round(best, 3), self._t(ev.start_n), end_t, ev.peak,
                            best_label, sig.category, sig.pitch_hz)
             self.last = hit
@@ -816,10 +827,13 @@ class SoundListener:
             if not watch:
                 continue
             name, score = max(watch, key=lambda x: x[1])
+            self._wait_ring_over(end_t)
             with self._lock:
-                if self.paused or end_t - self._last_hit < self.cooldown_s:
+                if self.paused or end_t - self._last_hit < self.cooldown_s \
+                        or self._same_ring(start_t, end_t):
                     continue
                 self._last_hit = end_t
+                self._hits.append((start_t, end_t))
             hit = SoundHit(round(score, 3), start_t, end_t, peak, name,
                            YAMNET_CATEGORY.get(name, "yamnet"), sig.pitch_hz)
             self.last = hit
@@ -828,6 +842,22 @@ class SoundListener:
                     self.on_detect(hit)
                 except Exception as e:
                     print(f"[listen] on_detect error: {e}")
+
+    def _same_ring(self, start_t: float, end_t: float) -> bool:
+        return any(s - RING_GAP_S <= end_t and start_t <= e + RING_GAP_S for s, e in self._hits)
+
+    def _wait_ring_over(self, end_t: float, timeout: float = 3.0) -> None:
+        """Until the mic has run RING_GAP_S past end_t with no event still open from
+        the same ring, so a taught match of a later part of the ring wins."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                now = self._t(self._n)
+                ev = self._ev
+                if now >= end_t + RING_GAP_S and \
+                        (ev is None or self._t(ev.start_n) > end_t + RING_GAP_S):
+                    return
+            time.sleep(0.02)
 
     def _finish_teach(self) -> None:
         events, self._teach_events, self._teach_until = self._teach_events, [], None
