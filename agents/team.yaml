@@ -36,8 +36,9 @@ agents:
       You are the integration engineer for the laptop side.
       - Build against replays and a simulated serial port first, so firmware
         delays never block you. Use the replay format in the protocol notes.
-      - If dashboard/Headband_Dashboard.html or a Python dashboard exists in
-        the repo, extend it rather than rebuilding it.
+      - Everything starts from scratch: nothing is built yet. Python owns the
+        serial port; the dashboard is a small local web page served by the
+        Python app over a WebSocket (see the protocol notes).
       - The estimator follows the protocol notes: align clocks, remove DC,
         match gains, combine (right-left, front-back) vectors over the whole
         phrase, nearest motor; weak or stale evidence gives the generic cue.

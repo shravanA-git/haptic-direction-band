@@ -4,6 +4,11 @@ Source of truth: the team handoff of Nov 13, 2026. It replaces the Nov 9 build
 plan's protocol and pin map. Agree in the room before changing pins or message
 formats (see HDB-Protocol).
 
+**Starting from scratch:** nothing is built yet. Ignore the handoff PDF's
+build-status column ("HTML tool built", "replay passed", "works in replay");
+those refer to someone else's earlier work, not this repo.
+
+
 ## System split
 
 - **Laptop:** video (USB webcam), speech (hold-to-talk, name recognition), the
@@ -99,7 +104,11 @@ the first demo.
    vectors across the phrase; pick the nearest motor direction. Weak,
    conflicting or stale evidence → generic attention pulse.
 
-## Replay format (HTML dashboard)
+## Recording and replay format (to build)
+
+Nothing is built yet; this is the target format. Record `MIC` frames plus the
+alert windows to a file so the estimator can be developed and tested without
+hardware:
 
 ```json
 {"frames":[{"ms":0,"levels":[20,18,90,101]},
@@ -107,7 +116,14 @@ the first demo.
  "alerts":[{"startMs":0,"endMs":100}]}
 ```
 
-Levels are front/right/back/left. The back-left sample should light motor 5;
-the unclear sample should give the generic attention cue. The HTML dashboard's
-integration point is `headband.alert(startMs, endMs)`. The optional Python
-dashboard replays JSONL rows with `t_ms` and `levels`.
+Levels are front/right/back/left. Make two reference traces as test fixtures:
+a back-left call (expected: motor 5) and an unclear one (expected: generic
+attention cue). Replay never drives the physical motors.
+
+## Dashboard (to build)
+
+Python owns the serial port (vision and speech must drive the same motors),
+and serves one local web page over a WebSocket: the 8-motor ring showing each
+commanded pulse, live mic levels, test-pulse buttons per motor, a STOP button,
+record-trace and replay controls, and the current object/name state. Keep it
+simple and readable on a projector for judges.

@@ -6,6 +6,11 @@ order and demo follow the Nov 13 team handoff; it replaces the Nov 9 plan
 where they differ. Each phase ends in a gate; if it fails, take the fallback
 and move on.
 
+**Starting from scratch:** nothing is built yet. Ignore the handoff PDF's
+build-status column ("HTML tool built", "replay passed", "works in replay");
+those refer to someone else's earlier work, not this repo.
+
+
 ## Feature priorities
 
 1. **Find an object** (first live demo). Hold Action, say "find the banana",
@@ -31,7 +36,8 @@ and move on.
 1. **H0–H3 (Fri 8–11 PM), bring-up.** Hardware: motor 0 on GPIO 18 wired and
    checked. Firmware: finite `PULSE` and `STOP` bench-tested at 115200. Vision
    and speech: webcam + detector with a typed target. Software: serial link,
-   motor ring dashboard, replay of the two built-in traces.
+   serial link with a simulated port, motor-ring dashboard (built from
+   scratch), trace recording and replay.
    **Gate H3:** the laptop pulses motor 0 on command and `STOP` works.
 2. **H3–H9 (Fri 11 PM–Sat 5 AM), full band and inputs.** Hardware: label
    channels, test cardinal positions, expand to 8 motors. Firmware: stream

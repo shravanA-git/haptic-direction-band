@@ -23,7 +23,7 @@ Stay in your lane's folders; ask the owner before touching someone else's.
 ```
 app/        laptop side: serial link, direction estimator, haptic cues,
             vision, speech, heading lock and Teach a Sound (later), recall (backlog)
-dashboard/  motor ring, replay and USB bench (HTML dashboard, optional Python one)
+dashboard/  motor ring, live mic levels, test pulses, STOP, replay (to build)
 firmware/   ESP32 sketch (115200 serial: PULSE/STOP in, MIC/BTN out)
 tools/      calibrate.py (claps at 8 positions)
 tests/      tests and fixtures (short recordings with known directions)
