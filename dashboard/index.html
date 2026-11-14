@@ -3,215 +3,401 @@
 <head>
 <meta charset="utf-8">
 <title>Haptic Direction Band</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#121110">
 <style>
-  :root { --bg:#0f1115; --panel:#181b22; --ink:#e8eaf0; --dim:#8a90a0; --on:#ffb020; --dry:#4aa8ff; --ok:#3ccf7a; --bad:#ff4d4d; }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink); font:18px/1.4 system-ui, sans-serif; }
-  header { display:flex; align-items:center; gap:24px; padding:12px 24px; background:var(--panel); }
-  header h1 { font-size:22px; margin:0; flex:1; }
-  .dot { display:inline-block; width:14px; height:14px; border-radius:50%; background:var(--bad); margin-right:6px; vertical-align:-1px; }
-  .dot.ok { background:var(--ok); }
-  .dot.warn { background:var(--on); }
-  #health { font-size:15px; color:var(--dim); }
-  .seg button { border-radius:0; margin-left:-1px; }
-  .seg button:first-of-type { border-radius:8px 0 0 8px; }
-  .seg button:last-of-type { border-radius:0 8px 8px 0; }
-  .seg button.sel, button.toggle.sel { background:var(--ok); color:#0f1115; border-color:var(--ok); font-weight:700; }
-  button.toggle.off { background:#3a2a2a; color:var(--dim); text-decoration:line-through; }
-  #ihdr { font-size:15px; color:var(--dim); }
-  main { display:grid; grid-template-columns: minmax(420px, 1.2fr) 1fr; gap:20px; padding:20px 24px; }
-  section { background:var(--panel); border-radius:12px; padding:16px 20px; }
-  h2 { font-size:16px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin:0 0 12px; }
-  #ring { width:100%; max-width:520px; display:block; margin:auto; }
-  .motor circle { fill:#2a2f3a; stroke:#454c5c; stroke-width:3; cursor:pointer; transition:fill .08s; }
-  .motor.on circle { fill:var(--on); stroke:#fff; }
-  .motor.dry circle { fill:var(--dry); stroke:#fff; }
-  .motor text { fill:var(--ink); font-size:22px; font-weight:700; text-anchor:middle; dominant-baseline:central; pointer-events:none; }
-  .motor .lbl { font-size:12px; font-weight:400; fill:var(--dim); }
-  button { font:inherit; color:var(--ink); background:#2a2f3a; border:1px solid #454c5c; border-radius:8px; padding:8px 14px; cursor:pointer; }
-  button:hover { background:#353b48; }
-  button.active { background:var(--bad); }
-  #stop { display:block; width:100%; margin-top:12px; padding:18px; font-size:28px; font-weight:800; background:var(--bad); border:none; color:#fff; letter-spacing:.1em; }
-  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px; }
-  .bars { display:grid; grid-template-columns: 70px 1fr 56px; gap:8px 12px; align-items:center; }
-  .bar { height:26px; background:#2a2f3a; border-radius:6px; overflow:hidden; }
-  .bar > div { height:100%; width:0; background:var(--ok); transition:width .05s; }
-  .bars.replay .bar > div { background:var(--dry); }
-  .num { text-align:right; font-variant-numeric:tabular-nums; color:var(--dim); }
-  select { font:inherit; background:#2a2f3a; color:var(--ink); border:1px solid #454c5c; border-radius:8px; padding:7px; max-width:100%; }
-  #est { font-size:22px; font-weight:700; min-height:32px; }
-  #log { font:13px/1.5 ui-monospace, monospace; color:var(--dim); height:150px; overflow:auto; white-space:pre-wrap; }
-  .kv { display:grid; grid-template-columns:110px 1fr; gap:4px 12px; }
-  .kv b { font-size:22px; }
-  #alerts { width:100%; border-collapse:collapse; font-size:15px; font-variant-numeric:tabular-nums; }
-  #alerts td, #alerts th { padding:3px 6px; text-align:left; border-bottom:1px solid #2a2f3a; }
-  #alerts th { color:var(--dim); font-weight:400; font-size:13px; }
-  #alerts tr.dry td { color:var(--dim); }
-  #alerts .ok { color:var(--ok); } #alerts .bad { color:var(--bad); }
-  .alertbox { max-height:260px; overflow:auto; }
-  .legend span { margin-right:14px; font-size:14px; color:var(--dim); }
-  .legend i { display:inline-block; width:12px; height:12px; border-radius:50%; margin-right:5px; vertical-align:-1px; }
+  /* One accent (amber) on a warm neutral. Red is reserved for STOP and faults,
+     which always carry words too. */
+  :root {
+    --bg: #121110; --bg-2: #1b1a18; --line: #2e2c29; --line-2: #45423d;
+    --ink: #f2efe9; --ink-2: #b9b3a9; --ink-3: #8e887e;
+    --accent: #f0a830; --accent-ink: #1a1206;
+    --bad: #cf3a3f; --bad-ink: #fff; --ok: #6cc08b;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --tap: 48px;
+  }
+  :root[data-theme="light"] {
+    --bg: #f7f4ef; --bg-2: #efebe4; --line: #ddd7cd; --line-2: #c3bcb0;
+    --ink: #1b1916; --ink-2: #4f4a43; --ink-3: #6b655c;
+    --accent: #9a5800; --accent-ink: #fff;
+    --bad: #c4282d; --bad-ink: #fff; --ok: #2f7a4b;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f7f4ef; --bg-2: #efebe4; --line: #ddd7cd; --line-2: #c3bcb0;
+      --ink: #1b1916; --ink-2: #4f4a43; --ink-3: #6b655c;
+      --accent: #9a5800; --accent-ink: #fff;
+      --bad: #c4282d; --bad-ink: #fff; --ok: #2f7a4b;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); }
+  body { font: 17px/1.45 var(--sans); padding-bottom: calc(76px + env(safe-area-inset-bottom)); }
+  :focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .mono, .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .dim { color: var(--ink-3); }
+  h2 { font-size: 13px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+       color: var(--ink-3); margin: 0 0 10px; }
+  h2 .sub { text-transform: none; letter-spacing: 0; font-weight: 400; }
+
+  button, select, input { font: inherit; color: var(--ink); }
+  button { min-height: var(--tap); padding: 0 16px; background: var(--bg-2); border: 1px solid var(--line-2);
+           border-radius: 6px; cursor: pointer; touch-action: manipulation; }
+  button:hover { border-color: var(--ink-3); }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  button.active { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  input, select { min-height: var(--tap); padding: 0 12px; background: var(--bg); border: 1px solid var(--line-2);
+                  border-radius: 6px; min-width: 0; }
+  input { flex: 1; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 10px; }
+  .note { font-size: 14px; color: var(--ink-3); margin: 0 0 10px; }
+
+  /* ---------- top bar ---------- */
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 18px; padding: 10px 16px;
+           border-bottom: 1px solid var(--line); }
+  header .brand { font-weight: 700; font-size: 17px; margin-right: auto; }
+  .link { display: flex; align-items: center; gap: 8px; font-size: 15px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--bad); flex: none; }
+  .dot.ok { background: var(--ok); }
+  .dot.warn { background: var(--accent); }
+  .readouts { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13px; color: var(--ink-3); width: 100%; }
+  #stop { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; border-radius: 0;
+          min-height: calc(64px + env(safe-area-inset-bottom)); padding-bottom: env(safe-area-inset-bottom);
+          background: var(--bad); color: var(--bad-ink); border: 0; font-size: 22px; font-weight: 800; letter-spacing: .12em; }
+  #stop:hover { filter: brightness(1.08); }
+
+  #faults { display: none; background: var(--bad); color: var(--bad-ink); font-weight: 600; padding: 12px 16px; }
+
+  /* ---------- layout ---------- */
+  main { display: grid; gap: 0; grid-template-columns: minmax(0, 1fr); }
+  main > * { min-width: 0; }
+  .block { padding: 16px; border-bottom: 1px solid var(--line); }
+
+  /* hero: camera + what it means */
+  #camwrap { position: relative; background: #000; aspect-ratio: 4 / 3; overflow: hidden; }
+  #cam { display: block; width: 100%; height: 100%; object-fit: contain; }
+  #camoff { display: none; position: absolute; inset: 0; align-items: center; justify-content: center;
+            color: #b9b3a9; font-size: 18px; text-align: center; padding: 20px; }
+  #camnote { color: var(--bad); font-size: 14px; }
+  .readout { padding: 14px 16px 4px; }
+  #herot { font-size: 44px; line-height: 1.05; font-weight: 700; letter-spacing: -.02em; margin: 0; }
+  #heros { font-size: 22px; line-height: 1.25; margin: 4px 0 0; color: var(--ink-2); }
+  #heros b { color: var(--accent); font-weight: 700; }
+  #heardline { font-size: 15px; color: var(--ink-3); margin: 8px 0 0; min-height: 1.4em; }
+
+  .talkrow { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 12px 16px 16px; }
+  #talk { min-height: 72px; font-size: 20px; font-weight: 700; background: var(--accent); color: var(--accent-ink);
+          border-color: var(--accent); user-select: none; -webkit-user-select: none; }
+  #talk.active { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+
+  /* belt diagram */
+  #ring { display: block; width: 100%; max-width: 380px; margin: 0 auto; }
+  #ring .waist { fill: none; stroke: var(--line-2); stroke-width: 16; }
+  #ring .body { fill: var(--bg-2); }
+  #ring .front { fill: var(--ink-3); }
+  #ring text { fill: var(--ink-3); font-family: var(--sans); font-size: 13px; text-anchor: middle; dominant-baseline: central; }
+  #ring .ftext { font-size: 13px; font-weight: 700; letter-spacing: .12em; fill: var(--ink-2); }
+  .motor { cursor: pointer; }
+  .motor rect { fill: var(--bg); stroke: var(--line-2); stroke-width: 2; transition: fill .08s; }
+  .motor .n { fill: var(--ink); font-family: var(--mono); font-size: 16px; font-weight: 700; pointer-events: none; }
+  .motor .lbl { font-size: 12px; pointer-events: none; }
+  .motor.on rect { fill: var(--accent); stroke: var(--accent); }
+  .motor.on .n { fill: var(--accent-ink); }
+  .motor.dry rect { fill: var(--bg); stroke: var(--accent); stroke-dasharray: 4 3; stroke-width: 3; }
+  .motor:focus-visible rect { stroke: var(--accent); stroke-width: 4; }
+  #motorread { font-size: 15px; color: var(--ink-2); text-align: center; margin: 6px 0 0; min-height: 1.4em; }
+
+  /* alert log */
+  #alerts { width: 100%; border-collapse: collapse; font-size: 15px; font-variant-numeric: tabular-nums; }
+  #alerts td, #alerts th { padding: 7px 6px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+  #alerts th { color: var(--ink-3); font-weight: 400; font-size: 13px; }
+  #alerts tr.dry td { color: var(--ink-3); }
+  #alerts .ok { color: var(--ok); } #alerts .bad { color: var(--bad); }
+  .alertbox { max-height: 320px; overflow: auto; max-width: 100%; }
+  #alerts th:nth-child(1), #alerts td:nth-child(1) { display: none; }   /* id: kept for labels */
+  @media (max-width: 700px) {   /* phone: drop #, conf, latency */
+    #alerts th:nth-child(6), #alerts td:nth-child(6),
+    #alerts th:nth-child(7), #alerts td:nth-child(7) { display: none; }
+  }
+
+  /* now / details */
+  .kv { display: grid; grid-template-columns: 76px 1fr; gap: 6px 12px; margin: 0; font-size: 16px; }
+  .kv dt { color: var(--ink-3); } .kv dd { margin: 0; overflow-wrap: anywhere; }
+
+  /* secondary tools fold away */
+  details { border-bottom: 1px solid var(--line); }
+  summary { min-height: var(--tap); display: flex; align-items: center; padding: 0 16px; cursor: pointer;
+            font-weight: 600; list-style: none; }
+  summary::-webkit-details-marker { display: none; }
+  summary::after { content: "+"; margin-left: auto; font-family: var(--mono); color: var(--ink-3); font-size: 20px; }
+  details[open] summary::after { content: "\2212"; }
+  summary .sub { font-weight: 400; color: var(--ink-3); margin-left: 10px; font-size: 14px; }
+  .fold { padding: 4px 16px 16px; }
+
+  .seg { display: inline-flex; }
+  .seg button { border-radius: 0; margin-left: -1px; }
+  .seg button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
+  .seg button:last-child { border-radius: 0 6px 6px 0; }
+  .seg button.sel, button.toggle.sel { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  button.toggle.off { color: var(--ink-3); text-decoration: line-through; }
+
+  .bars { display: grid; grid-template-columns: 56px 1fr 52px; gap: 8px 12px; align-items: center; font-size: 15px; }
+  .bar { height: 14px; background: var(--bg-2); border: 1px solid var(--line); }
+  .bar > div { height: 100%; width: 0; background: var(--ink-2); }
+  .bars.replay .bar > div { background: repeating-linear-gradient(90deg, var(--ink-3) 0 6px, transparent 6px 9px); }
+  #log { font: 13px/1.5 var(--mono); color: var(--ink-3); height: 160px; overflow: auto; white-space: pre-wrap; margin: 0; }
+  #est { font-size: 18px; font-weight: 600; min-height: 1.4em; }
+  #chat { font-size: 16px; max-height: 200px; overflow: auto; margin-bottom: 8px; }
+  #chat b { font-weight: 600; color: var(--ink-3); margin-right: 6px; }
+
+  /* ---------- projector / wide ---------- */
+  @media (min-width: 1100px) {
+    body { font-size: 18px; padding-bottom: 0; }
+    header { padding: 12px 28px; flex-wrap: nowrap; }
+    .readouts { width: auto; font-size: 14px; }
+    #stop { position: static; min-height: 56px; padding: 0 34px; border-radius: 6px; font-size: 20px; }
+    main { grid-template-columns: minmax(0, 1.55fr) minmax(380px, 1fr); grid-template-areas:
+             "hero side" "more more"; }
+    .hero { grid-area: hero; border-right: 1px solid var(--line); }
+    .side { grid-area: side; }
+    .more { grid-area: more; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: 1px solid var(--line); }
+    .more details { border-right: 1px solid var(--line); }
+    #camwrap { aspect-ratio: auto; height: 56vh; }      /* readout + talk stay above the fold */
+    .readout { padding: 18px 28px 4px; }
+    #herot { font-size: 76px; }
+    #heros { font-size: 30px; }
+    .talkrow { grid-template-columns: minmax(260px, 1fr) minmax(0, 1.4fr); align-items: center; padding: 14px 28px 22px; }
+    .block { padding: 18px 24px; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
 <body>
 <header>
-  <h1>Haptic Direction Band</h1>
-  <div><span id="conn" class="dot"></span><span id="dev">–</span></div>
-  <div id="health" title="link state · MIC interval · lines received">–</div>
-  <div><span id="frames">0</span> frames</div>
-  <div id="ihdr">intensity –</div>
-  <div id="btn">Action: up</div>
+  <div class="brand">Haptic Direction Band</div>
+  <div class="link" title="band connection"><span id="conn" class="dot" aria-hidden="true"></span><span id="dev">connecting</span></div>
+  <div class="readouts mono">
+    <span id="health" title="link state, MIC interval, lines received">–</span>
+    <span><span id="frames">0</span> frames</span>
+    <span id="ihdr">intensity –</span>
+    <span id="btn">Action: up</span>
+  </div>
+  <button id="stop" type="button" title="Esc" aria-label="Stop: all motors off now">STOP</button>
 </header>
-<div id="faults" style="display:none;background:var(--bad);color:#fff;font-size:20px;font-weight:700;padding:10px 24px"></div>
+<div id="faults" role="alert"></div>
+
 <main>
-  <section>
-    <h2>Motor ring (click = 150 ms test pulse)</h2>
-    <svg id="ring" viewBox="-260 -260 520 520"></svg>
-    <div class="legend"><span><i style="background:var(--on)"></i>sent to band</span><span><i style="background:var(--dry)"></i>replay (dry run)</span></div>
-    <div class="row" style="margin-top:10px">
-      <button data-cue="generic">Generic (300 ms front)</button>
-      <button data-cue="centered">Centered (2× front)</button>
-      <button data-cue="lost">Lost</button>
-      <button data-cue="sound">Taught sound</button>
-      <button data-cue="ack" title="hold-to-talk: target set">Got it</button>
-      <button data-cue="unknown" title="hold-to-talk: didn't understand">Can't</button>
+  <!-- the hero: what the camera sees and what it means -->
+  <section class="hero" aria-label="Find an object">
+    <div id="camwrap">
+      <img id="cam" alt="Live camera with the tracked object boxed">
+      <div id="camoff">Camera off. Start the app with --vision.</div>
     </div>
-    <div class="row">
-      <span style="color:var(--dim);font-size:15px">Bench:</span>
-      <button data-bench="gate" title="H3: short buzz, long buzz cut by STOP, then a buzz that must end by itself">H3 gate (motor 0)</button>
-      <button data-bench="walk" title="H9: each motor in order; it should buzz where the ring lights">Walk ring 0→7</button>
-      <button data-bench="cardinals" title="fallback: front, right, back, left">Cardinals</button>
+    <div class="readout" aria-live="polite">
+      <p id="herot">Nothing to find</p>
+      <p id="heros">Hold to talk and say what to look for.</p>
+      <p id="heardline"></p>
+      <span id="camnote"></span>
     </div>
-    <div class="row">
-      <span style="color:var(--dim);font-size:15px">Intensity:</span>
-      <span class="seg"><button data-int="low">Low</button><button data-int="medium">Med</button><button data-int="high">High</button></span>
-      <span style="color:var(--dim);font-size:15px;margin-left:10px">Buzz for:</span>
-      <button class="toggle" data-mute="name_alerts">Names</button>
-      <button class="toggle" data-mute="find_cues">Find</button>
-      <button class="toggle" data-mute="sound_alerts">Sound</button>
+    <div class="talkrow">
+      <button id="talk" type="button" aria-pressed="false" title="same as holding the band's Action button">Hold to talk</button>
+      <div class="row" style="margin:0">
+        <label for="tgt" class="dim" style="font-size:14px;width:100%">Or type it</label>
+        <input id="tgt" placeholder="banana, keys, the door" autocomplete="off">
+        <button id="find" type="button" class="primary">Find</button>
+      </div>
     </div>
-    <div style="font-size:13px;color:var(--dim)">Intensity scales cue pulse length (low ×0.6, high ×1.5, max 1000 ms). Test pulses and STOP are never affected.</div>
-    <button id="stop" title="Esc">STOP</button>
   </section>
-  <div style="display:grid; gap:20px; align-content:start">
-    <section>
-      <h2>Camera <span id="camnote" style="text-transform:none;letter-spacing:0"></span></h2>
-      <div id="camwrap" style="position:relative;background:#000;border-radius:8px;aspect-ratio:4/3;overflow:hidden">
-        <img id="cam" alt="" style="display:block;width:100%;height:100%;object-fit:contain">
-        <div id="camoff" style="display:none;position:absolute;inset:0;align-items:center;justify-content:center;color:var(--dim);font-size:20px">camera off</div>
-      </div>
-    </section>
-    <section>
-      <h2>Mic levels <span id="micsrc"></span></h2>
-      <div class="bars" id="bars"></div>
-    </section>
-    <section>
-      <h2>Now</h2>
-      <div class="kv">
-        <span>Object</span><b id="obj">–</b>
-        <span>Name</span><b id="name">–</b>
-        <span>Heard</span><b id="heard" style="font-size:18px">–</b>
-        <span>Sound</span><b id="sound" style="font-size:18px">–</b>
-        <span>Path</span><b id="path" style="font-size:18px">–</b>
-      </div>
-      <div class="row" style="margin-top:10px">
-        <input id="tgt" placeholder="target, e.g. banana" style="font:inherit;background:#2a2f3a;color:var(--ink);border:1px solid #454c5c;border-radius:8px;padding:7px;flex:1">
-        <button id="find">Find</button>
-      </div>
-      <div class="row">
-        <div class="row">
-          <button id="talk" title="same as holding the band's Action button">Hold to talk</button>
-        </div>
-        <input id="nm" placeholder="name to listen for" style="font:inherit;background:#2a2f3a;color:var(--ink);border:1px solid #454c5c;border-radius:8px;padding:7px;flex:1">
-        <button id="setnm">Listen</button>
-      </div>
-      <div class="row">
-        <input id="sndname" placeholder="sound name, e.g. doorbell" style="font:inherit;background:#2a2f3a;color:var(--ink);border:1px solid #454c5c;border-radius:8px;padding:7px;flex:1">
-        <button id="teach" title="Teach a Sound: make the sound once within 2.5 s (same name again replaces it)">Teach a sound</button>
-        <button id="addex" title="make the sound again: adds another example to this name">Add example</button>
-        <button id="forget" title="forget every taught sound">Forget all</button>
-      </div>
-      <div id="sounds" style="font-size:15px;margin-top:6px"></div>
-    </section>
-    <section>
-      <h2>Record &amp; replay</h2>
-      <div class="row">
-        <button id="rec">● Record</button>
-        <button id="mark" title="hold while the name is spoken">Hold = alert window</button>
-      </div>
-      <div class="row">
-        <select id="traces"></select>
-        <button id="play">▶ Replay</button>
-        <button id="halt">■</button>
-      </div>
-      <div id="est"></div>
-    </section>
-    <section>
-      <h2>Alert log <span style="text-transform:none;letter-spacing:0" id="acount"></span></h2>
+
+  <!-- the belt and what it has done -->
+  <section class="side" aria-label="Belt and alerts">
+    <div class="block">
+      <h2>Motor ring <span class="sub">top view, tap a motor to test it (150 ms)</span></h2>
+      <svg id="ring" viewBox="-200 -180 400 335" role="group" aria-label="Belt with 8 motors, motor 0 at the front, numbered clockwise"></svg>
+      <p id="motorread" aria-live="polite"></p>
+    </div>
+    <div class="block">
+      <h2>Alert log <span class="sub" id="acount"></span></h2>
       <div class="alertbox"><table id="alerts"><thead><tr><th>#</th><th>time</th><th>source</th><th>cue</th><th>direction</th><th>conf</th><th>latency</th><th>truth</th></tr></thead><tbody></tbody></table></div>
-      <div class="row" style="margin-top:10px">
-        <span style="color:var(--dim);font-size:15px">Caller was at</span>
+      <div class="row" style="margin-top:12px">
+        <label for="truth" class="dim" style="font-size:14px">Caller was at</label>
         <select id="truth">
           <option value="0">front</option><option value="1">front-right</option><option value="2">right</option>
           <option value="3">back-right</option><option value="4">back</option><option value="5">back-left</option>
           <option value="6">left</option><option value="7">front-left</option>
           <option value="none">no clear direction</option><option value="false">nobody (false alert)</option>
         </select>
-        <button id="labelbtn" title="label the newest unlabelled alert">Label latest</button>
-        <button id="missedbtn" title="a call that got no cue">Missed call</button>
+        <button id="labelbtn" type="button" title="label the newest unlabelled alert">Label latest</button>
+        <button id="missedbtn" type="button" title="a call that got no cue">Missed call</button>
       </div>
-    </section>
-    <section>
-      <h2>Ask Recall <span id="recallvia" style="text-transform:none;letter-spacing:0"></span></h2>
-      <div id="chat" style="font-size:16px;max-height:180px;overflow:auto;margin-bottom:8px"></div>
-      <div class="row">
-        <input id="askq" placeholder="who called me? · mute name alerts · stronger" style="font:inherit;background:#2a2f3a;color:var(--ink);border:1px solid #454c5c;border-radius:8px;padding:7px;flex:1">
-        <button id="askbtn">Ask</button>
+    </div>
+    <div class="block">
+      <h2>Now</h2>
+      <dl class="kv">
+        <dt>Object</dt><dd id="obj">–</dd>
+        <dt>Name</dt><dd id="name">–</dd>
+        <dt>Heard</dt><dd id="heard">–</dd>
+        <dt>Sound</dt><dd id="sound">–</dd>
+        <dt>Path</dt><dd id="path">–</dd>
+      </dl>
+    </div>
+  </section>
+
+  <!-- everything else, folded -->
+  <div class="more">
+    <details>
+      <summary>Settings <span class="sub" id="settings"></span></summary>
+      <div class="fold">
+        <div class="row"><span class="dim">Strength</span>
+          <span class="seg"><button type="button" data-int="low">Low</button><button type="button" data-int="medium">Medium</button><button type="button" data-int="high">High</button></span></div>
+        <p class="note">Scales cue length (low 0.6x, high 1.5x). Test pulses and STOP are not affected.</p>
+        <div class="row"><span class="dim">Buzz for</span>
+          <button type="button" class="toggle" data-mute="name_alerts">Names</button>
+          <button type="button" class="toggle" data-mute="find_cues">Find</button>
+          <button type="button" class="toggle" data-mute="sound_alerts">Sounds</button></div>
+        <div class="row"><span class="dim">Look</span>
+          <button id="theme" type="button" aria-label="Switch light or dark theme">Theme: auto</button></div>
+        <div class="row"><input id="nm" placeholder="name to listen for" aria-label="Name to listen for"><button id="setnm" type="button">Listen</button></div>
+        <div class="row"><span class="dim">Caregiver texts</span>
+          <button type="button" class="toggle" id="cgtoggle" title="text the caregiver about name calls, found objects, taught sounds">Off</button>
+          <button type="button" id="cgtest">Send test text</button></div>
+        <p class="note" id="cgstatus"></p>
       </div>
-      <div id="settings" style="font-size:14px;color:var(--dim)"></div>
-      <div class="row" style="margin-top:10px">
-        <span style="color:var(--dim);font-size:15px">Caregiver texts:</span>
-        <button class="toggle" id="cgtoggle" title="text the caregiver about name calls, found objects, taught sounds">Off</button>
-        <button id="cgtest">Send test text</button>
+    </details>
+    <details>
+      <summary>Taught sounds</summary>
+      <div class="fold">
+        <div class="row"><input id="sndname" placeholder="sound name, e.g. doorbell" aria-label="Sound name">
+          <button id="teach" type="button" title="make the sound once within 2.5 s (same name again replaces it)">Teach</button>
+          <button id="addex" type="button" title="make the sound again: adds another example to this name">Add example</button>
+          <button id="forget" type="button" title="forget every taught sound">Forget all</button></div>
+        <div id="sounds"></div>
       </div>
-      <div id="cgstatus" style="font-size:14px;color:var(--dim)"></div>
-    </section>
-    <section>
-      <h2>Log</h2>
-      <div id="log"></div>
-    </section>
+    </details>
+    <details>
+      <summary>Ask Recall <span class="sub" id="recallvia"></span></summary>
+      <div class="fold">
+        <div id="chat"></div>
+        <div class="row"><input id="askq" placeholder="who called me? / mute name alerts / stronger" aria-label="Ask Recall"><button id="askbtn" type="button">Ask</button></div>
+      </div>
+    </details>
+    <details>
+      <summary>Test cues and bench</summary>
+      <div class="fold">
+        <div class="row">
+          <button type="button" data-cue="generic">Attention (300 ms front)</button>
+          <button type="button" data-cue="centered">Centered (2x front)</button>
+          <button type="button" data-cue="lost">Lost</button>
+          <button type="button" data-cue="sound">Taught sound</button>
+          <button type="button" data-cue="ack" title="hold-to-talk: target set">Got it</button>
+          <button type="button" data-cue="unknown" title="hold-to-talk: didn't understand">Can't</button>
+        </div>
+        <div class="row">
+          <button type="button" data-bench="gate" title="H3: short buzz, long buzz cut by STOP, then a buzz that must end by itself">H3 gate (motor 0)</button>
+          <button type="button" data-bench="walk" title="H9: each motor in order; it should buzz where the ring lights">Walk ring 0 to 7</button>
+          <button type="button" data-bench="cardinals" title="fallback: front, right, back, left">Cardinals</button>
+        </div>
+      </div>
+    </details>
+    <details>
+      <summary>Mic levels <span class="sub" id="micsrc"></span></summary>
+      <div class="fold"><div class="bars" id="bars"></div></div>
+    </details>
+    <details>
+      <summary>Record and replay</summary>
+      <div class="fold">
+        <div class="row"><button id="rec" type="button">Record</button>
+          <button id="mark" type="button" title="hold while the name is spoken">Hold = alert window</button></div>
+        <div class="row"><select id="traces" aria-label="Recorded traces"></select>
+          <button id="play" type="button">Replay</button><button id="halt" type="button">Stop replay</button></div>
+        <div id="est"></div>
+      </div>
+    </details>
+    <details>
+      <summary>Log</summary>
+      <div class="fold"><pre id="log"></pre></div>
+    </details>
   </div>
 </main>
+
 <script>
 const NAMES = ["Front","Front-right","Right","Back-right","Back","Back-left","Left","Front-left"];
+const SHORT = ["F","FR","R","BR","B","BL","L","FL"];
 const MICS = ["Front","Right","Back","Left"];
 const $ = id => document.getElementById(id);
 let ws, recording = false;
 
-// ---- ring
+// ---- theme: auto (system) / light / dark, remembered on this device
+(function theme() {
+  const order = ["auto", "light", "dark"];
+  const q = new URLSearchParams(location.search).get("theme");   // e.g. /?theme=light on the projector
+  let t = order.includes(q) ? q : (localStorage.getItem("hdb-theme") || "auto");
+  function apply() {
+    if (t === "auto") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", t);
+    $("theme").textContent = "Theme: " + t;
+  }
+  $("theme").onclick = () => { t = order[(order.indexOf(t) + 1) % 3]; localStorage.setItem("hdb-theme", t); apply(); };
+  apply();
+})();
+
+// ---- belt diagram: waist seen from above, motor 0 at the front, clockwise
 const svg = $("ring"), NS = "http://www.w3.org/2000/svg";
-svg.innerHTML = `<ellipse rx="95" ry="115" fill="#20242d" stroke="#454c5c" stroke-width="3"/>
-  <polygon points="0,-150 -16,-118 16,-118" fill="#454c5c"/>
-  <text y="6" text-anchor="middle" fill="#8a90a0" font-size="16">head (top view)</text>`;
+const RX = 138, RY = 112;
+svg.innerHTML = `<ellipse class="body" rx="${RX - 10}" ry="${RY - 10}"/>
+  <ellipse class="waist" rx="${RX}" ry="${RY}"/>
+  <polygon class="front" points="0,${-RY - 30} -10,${-RY - 14} 10,${-RY - 14}"/>
+  <text class="ftext" y="${-RY - 44}">FRONT</text>
+  <text y="-8">you</text><text y="12" style="font-size:12px">(top view)</text>`;
 const motors = NAMES.map((n, k) => {
-  const a = k * Math.PI / 4, x = 200 * Math.sin(a), y = -200 * Math.cos(a);
+  const a = k * Math.PI / 4, x = RX * Math.sin(a), y = -RY * Math.cos(a);
+  const lx = (RX + 40) * Math.sin(a), ly = -(RY + 34) * Math.cos(a);
   const g = document.createElementNS(NS, "g");
   g.setAttribute("class", "motor");
-  g.innerHTML = `<circle cx="${x}" cy="${y}" r="42"/><text x="${x}" y="${y - 6}">${k}</text>
-                 <text class="lbl" x="${x}" y="${y + 18}">${n}</text>`;
-  g.onclick = () => send({cmd: "pulse", motor: k, ms: 150});
+  g.setAttribute("tabindex", "0");
+  g.setAttribute("role", "button");
+  g.setAttribute("aria-label", `Motor ${k}, ${n.toLowerCase()}: test pulse`);
+  g.innerHTML = `<rect x="${x - 19}" y="${y - 19}" width="38" height="38" rx="5"/>
+    <text class="n" x="${x}" y="${y}">${k}</text>` + (k === 0 ? "" : `<text class="lbl" x="${lx}" y="${ly}">${SHORT[k]}</text>`);
+  const test = () => send({cmd: "pulse", motor: k, ms: 150});
+  g.onclick = test;
+  g.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); test(); } };
   svg.appendChild(g);
   return {g, timer: null};
 });
+let readTimer = null;
 function light(k, ms, dry) {
   const m = motors[k];
   clearTimeout(m.timer);
   m.g.classList.remove("on", "dry");
   m.g.classList.add(dry ? "dry" : "on");
   m.timer = setTimeout(() => m.g.classList.remove("on", "dry"), Math.max(ms, 120));
+  $("motorread").textContent = `${dry ? "Replay (not sent): " : ""}motor ${k}, ${NAMES[k].toLowerCase()}, ${ms} ms`;
+  clearTimeout(readTimer);
+  readTimer = setTimeout(() => { $("motorread").textContent = ""; }, Math.max(ms, 120) + 1500);
 }
-function allOff() { motors.forEach(m => { clearTimeout(m.timer); m.g.classList.remove("on", "dry"); }); }
+function allOff() {
+  motors.forEach(m => { clearTimeout(m.timer); m.g.classList.remove("on", "dry"); });
+  $("motorread").textContent = "Stopped. All motors off.";
+}
+
+// ---- hero readout from the vision state ("cap: right")
+function cap(s) { return s ? s[0].toUpperCase() + s.slice(1) : s; }
+function hero(object) {
+  const m = /^(.*): (\w+)$/.exec(object || "");
+  const target = m && m[1] !== "–" ? m[1] : null, st = m ? m[2] : "idle";
+  if (!target || st === "idle") {
+    $("herot").textContent = "Nothing to find";
+    $("heros").textContent = "Hold to talk and say what to look for.";
+    return;
+  }
+  $("herot").textContent = cap(target);
+  const side = {left: ["is on your ", "left"], right: ["is on your ", "right"], centered: ["is ", "straight ahead"]}[st];
+  if (side) { $("heros").innerHTML = ""; $("heros").append(side[0]); const b = document.createElement("b"); b.textContent = side[1]; $("heros").append(b); }
+  else $("heros").textContent = {searching: "Looking for it. Turn slowly.", lost: "Lost it. Turn slowly to find it again."}[st] || st;
+}
 
 // ---- mic bars (auto-scaled)
 let peak = 100;
@@ -221,7 +407,7 @@ function mic(levels, replay) {
   peak = Math.max(peak * 0.999, ...levels, 1);
   levels.forEach((v, i) => { $("b" + i).style.width = (100 * v / peak) + "%"; $("v" + i).textContent = Math.round(v); });
   $("bars").classList.toggle("replay", replay);
-  $("micsrc").textContent = replay ? "(replay)" : "(live)";
+  $("micsrc").textContent = replay ? "replay" : "live";
 }
 
 function log(t) {
@@ -240,10 +426,11 @@ document.querySelectorAll("[data-mute]").forEach(b => b.onclick = () =>
   send({cmd: "setting", setting: b.dataset.mute, value: settings[b.dataset.mute] === "off" ? "on" : "off"}));
 function showSettings(m) {
   settings = m;
-  document.querySelectorAll("[data-int]").forEach(b => b.classList.toggle("sel", b.dataset.int === m.intensity));
+  document.querySelectorAll("[data-int]").forEach(b => {
+    b.classList.toggle("sel", b.dataset.int === m.intensity); b.setAttribute("aria-pressed", b.dataset.int === m.intensity); });
   document.querySelectorAll("[data-mute]").forEach(b => {
     const off = m[b.dataset.mute] === "off";
-    b.classList.toggle("sel", !off); b.classList.toggle("off", off);
+    b.classList.toggle("sel", !off); b.classList.toggle("off", off); b.setAttribute("aria-pressed", !off);
     b.title = off ? "muted: logged, no buzz (click to unmute)" : "click to mute";
   });
   $("ihdr").textContent = `intensity ${m.intensity}`;
@@ -251,16 +438,16 @@ function showSettings(m) {
 document.querySelectorAll("[data-bench]").forEach(b => b.onclick = () => send({cmd: "bench", name: b.dataset.bench}));
 document.querySelectorAll("[data-cue]").forEach(b => b.onclick = () => send({cmd: "cue", name: b.dataset.cue}));
 $("rec").onclick = () => send({cmd: recording ? "record_stop" : "record_start"});
-$("mark").onmousedown = () => send({cmd: "alert_down"});
-$("mark").onmouseup = () => send({cmd: "alert_up"});
+$("mark").onpointerdown = () => send({cmd: "alert_down"});
+$("mark").onpointerup = () => send({cmd: "alert_up"});
 $("play").onclick = () => { $("est").textContent = ""; send({cmd: "replay", name: $("traces").value}); };
 $("find").onclick = () => send({cmd: "target", name: $("tgt").value});
 $("tgt").onkeydown = e => { if (e.key === "Enter") $("find").onclick(); };
 function ask() { const q = $("askq").value.trim(); if (!q) return; chat("you", q); $("askq").value = ""; send({cmd: "ask", text: q}); }
 function chat(who, text) {
   const d = document.createElement("div");
-  d.innerHTML = `<b style="color:${who === "you" ? "var(--dim)" : "var(--ok)"}">${who}</b> `;
-  d.appendChild(document.createTextNode(text));
+  const b = document.createElement("b"); b.textContent = who;
+  d.append(b, document.createTextNode(text));
   $("chat").appendChild(d); $("chat").scrollTop = $("chat").scrollHeight;
 }
 $("askbtn").onclick = ask;
@@ -276,23 +463,38 @@ $("addex").onclick = () => {
 $("forget").onclick = () => send({cmd: "forget_sound"});
 function showSounds(items) {
   const box = $("sounds"); box.textContent = "";
-  if (!items.length) { box.textContent = "no sounds taught"; return; }
+  if (!items.length) { box.textContent = "No sounds taught yet."; return; }
   for (const it of items) {
     const row = document.createElement("div"); row.className = "row";
-    const t = document.createElement("span"); t.style.flex = "1";
-    t.textContent = `${it.label} [${it.category}] ${it.description}` +
-                    (it.examples > 1 ? ` (${it.examples} examples)` : " (1 example)");
-    t.title = "click to put this name in the box (then Add example)";
+    const t = document.createElement("button"); t.type = "button"; t.style.flex = "1"; t.style.textAlign = "left";
+    t.textContent = `${it.label} (${it.category}), ${it.examples} example${it.examples === 1 ? "" : "s"}`;
+    t.title = "put this name in the box (then Add example)";
     t.onclick = () => { $("sndname").value = it.label; };
-    const b = document.createElement("button"); b.textContent = "Forget";
+    const b = document.createElement("button"); b.type = "button"; b.textContent = "Forget";
+    b.setAttribute("aria-label", `Forget ${it.label}`);
     b.onclick = () => send({cmd: "forget_sound", label: it.label});
     row.append(t, b); box.appendChild(row);
   }
 }
-$("talk").onpointerdown = () => { $("talk").classList.add("active"); send({cmd: "action", down: true}); };
-$("talk").onpointerup = $("talk").onpointerleave = () => {
-  if ($("talk").classList.contains("active")) { $("talk").classList.remove("active"); send({cmd: "action", down: false}); }
-};
+
+// hold to talk: pointer, or Space/Enter held while focused
+const talk = $("talk");
+function talkDown() {
+  if (talk.classList.contains("active")) return;
+  talk.classList.add("active"); talk.setAttribute("aria-pressed", "true");
+  talk.textContent = "Listening. Let go when done."; send({cmd: "action", down: true});
+}
+function talkUp() {
+  if (!talk.classList.contains("active")) return;
+  talk.classList.remove("active"); talk.setAttribute("aria-pressed", "false");
+  talk.textContent = "Hold to talk"; send({cmd: "action", down: false});
+}
+talk.onpointerdown = e => { talk.setPointerCapture?.(e.pointerId); talkDown(); };
+talk.onpointerup = talk.onpointercancel = talk.onpointerleave = talkUp;
+talk.onkeydown = e => { if ((e.key === " " || e.key === "Enter") && !e.repeat) { e.preventDefault(); talkDown(); } };
+talk.onkeyup = e => { if (e.key === " " || e.key === "Enter") talkUp(); };
+talk.oncontextmenu = e => e.preventDefault();
+
 $("setnm").onclick = () => send({cmd: "name", name: $("nm").value});
 $("nm").onkeydown = e => { if (e.key === "Enter") $("setnm").onclick(); };
 $("labelbtn").onclick = () => send({cmd: "label", truth: $("truth").value});
@@ -313,26 +515,29 @@ function addAlert(a) {
   if (!tr) { tr = tb.insertRow(0); alertRows.set(a.id, tr); while (tb.rows.length > 30) { alertRows.delete(+tb.rows[tb.rows.length - 1].dataset.id); tb.deleteRow(-1); } }
   tr.dataset.id = a.id; tr.className = a.dry ? "dry" : "";
   tr._a = a;
-  const cells = [a.id, a.time, a.source + (a.dry ? " (dry)" : "") + (a.repeat ? " ↻" : "") + (a.muted ? " (muted)" : ""), a.cue,
-    a.direction ?? "–", a.confidence ?? "–", a.latency_ms != null ? a.latency_ms + " ms" : "–", truthText(a.truth)];
-  tr.innerHTML = cells.map(c => `<td>${c}</td>`).join("");
-  tr.cells[7].className = verdict(a);
-  $("acount").textContent = `(${alertRows.size} shown)`;
+  const v = verdict(a);
+  const cells = [a.id, a.time, a.source + (a.dry ? " (dry)" : "") + (a.muted ? " (muted)" : ""), a.repeat ? "repeat" : a.cue,
+    a.direction ?? "–", a.confidence ?? "–", a.latency_ms != null ? a.latency_ms + " ms" : "–",
+    truthText(a.truth) + (v === "ok" ? ", right" : v === "bad" ? ", wrong" : a.truth !== undefined ? ", near" : "")];
+  tr.textContent = "";
+  cells.forEach(c => { const td = tr.insertCell(-1); td.textContent = c; });
+  tr.cells[7].className = v;
+  $("acount").textContent = `${alertRows.size} shown`;
 }
 $("halt").onclick = () => send({cmd: "replay_stop"});
 
 // ---- websocket
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = () => log("dashboard connected");
-  ws.onclose = () => { $("conn").className = "dot"; $("dev").textContent = "app offline"; setTimeout(connect, 1000); };
+  ws.onopen = () => { log("dashboard connected"); send({cmd: "state"}); };  // current object/name/sound
+  ws.onclose = () => { $("conn").className = "dot"; $("dev").textContent = "App offline, reconnecting"; setTimeout(connect, 1000); };
   ws.onmessage = e => {
     const m = JSON.parse(e.data);
     switch (m.type) {
       case "mic": mic(m.levels, m.replay); break;
       case "pulse": light(m.motor, m.ms, m.dry); log(`${m.dry ? "(dry) " : ""}PULSE ${m.motor} ${m.ms}`); break;
       case "stop": allOff(); log("STOP"); break;
-      case "btn": $("btn").textContent = `${m.name[0] + m.name.slice(1).toLowerCase()}: ${m.down ? "DOWN" : "up"}`; break;
+      case "btn": $("btn").textContent = `${m.name[0] + m.name.slice(1).toLowerCase()}: ${m.down ? "down" : "up"}`; break;
       case "raw": log("< " + m.text); break;
       case "status":
         {
@@ -341,51 +546,56 @@ function connect() {
           const txt = {streaming: "streaming", lines: "lines, no MIC", silent: "port open, silent", error: "error"}[st] || st;
           $("health").textContent = txt + (h.mic_gap_ms ? ` · MIC ${h.mic_gap_ms} ms` : "")
             + ` · ${h.lines ?? 0} lines` + (h.mapped ? " · remapped" : "");
-          $("health").title = h.last_raw ? "last non-protocol line: " + h.last_raw : "link state · MIC interval · lines received";
+          $("health").title = h.last_raw ? "last non-protocol line: " + h.last_raw : "link state, MIC interval, lines received";
+          $("dev").textContent = (m.connected ? "Band on " : "Band not connected: ") + m.device + (m.error ? ", " + m.error : "");
         }
-        $("dev").textContent = m.device + (m.error ? " — " + m.error : "");
         $("frames").textContent = m.frames;
         {
           const fl = Object.values(m.faults || {});
           $("faults").style.display = fl.length ? "block" : "none";
-          $("faults").textContent = fl.length ? "⚠ " + fl.join("  ·  ") : "";
-          $("camnote").textContent = (m.faults || {}).camera ? "⚠ camera fault: preview may be frozen" : "";
-          $("camnote").style.color = "var(--bad)";
+          $("faults").textContent = fl.length ? "Problem: " + fl.join(" · ") : "";
+          $("camnote").textContent = (m.faults || {}).camera ? "Camera fault: the picture may be frozen." : "";
         }
         recording = m.recording;
-        $("rec").textContent = recording ? "■ Stop & save" : "● Record";
+        $("rec").textContent = recording ? "Stop and save" : "Record";
         $("rec").classList.toggle("active", recording);
         break;
       case "traces": {
         const cur = $("traces").value;
-        $("traces").innerHTML = m.items.map(t => `<option>${t}</option>`).join("");
+        $("traces").textContent = "";
+        m.items.forEach(t => { const o = document.createElement("option"); o.textContent = t; $("traces").appendChild(o); });
         if (m.items.includes(cur)) $("traces").value = cur;
         break;
       }
       case "estimate":
         $("est").textContent = m.motor === null
-          ? `→ generic attention (${m.reason})`
-          : `→ motor ${m.motor} ${NAMES[m.motor]} (${Math.round(m.angle)}°, agreement ${m.consistency})`;
+          ? `Generic attention (${m.reason})`
+          : `Motor ${m.motor}, ${NAMES[m.motor].toLowerCase()} (${Math.round(m.angle)} deg, agreement ${m.consistency})`;
         log(`estimate ${m.trace}: ${$("est").textContent}`);
         break;
       case "avoid": {
-        const bars = (m.sectors || []).map(s => s[1] === "blocked" ? "■" : s[1] === "near" ? "▪" : "·").join(" ");
+        const bars = (m.sectors || []).map(s => s[1] === "blocked" ? "X" : s[1] === "near" ? "o" : ".").join(" ");
         const what = {clear: "clear", steer: m.motor === 7 ? "veer left" : "veer right",
-                      turn: m.motor === 6 ? "turn left" : "turn right", stop: "STOP"}[m.action] || m.action;
-        $("path").textContent = `${what}  ${bars}` + (m.nearest ? `  (${m.nearest.cls} ${m.nearest.m} m)` : "");
+                      turn: m.motor === 6 ? "turn left" : "turn right", stop: "STOP, obstacle ahead"}[m.action] || m.action;
+        $("path").textContent = `${what}  [${bars}]` + (m.nearest ? `  ${m.nearest.cls} ${m.nearest.m} m` : "");
         $("path").style.color = m.action === "stop" ? "var(--bad)" : "";
         break; }
-      case "state": $("obj").textContent = m.object ?? "–"; $("name").textContent = m.name ?? "–"; $("heard").textContent = m.heard ?? "–"; $("sound").textContent = m.sound ?? "–"; break;
+      case "state":
+        $("obj").textContent = m.object ?? "–"; $("name").textContent = m.name ?? "–";
+        $("heard").textContent = m.heard ?? "–"; $("sound").textContent = m.sound ?? "–";
+        hero(m.object);
+        $("heardline").textContent = m.heard && m.heard !== "–" ? `Heard: "${m.heard}"` : "";
+        break;
       case "log": log(m.text); break;
       case "sounds": showSounds(m.items || []); break;
       case "recall":
         chat("recall", m.a);
-        $("recallvia").textContent = `(${m.via})`;
+        $("recallvia").textContent = m.via ? `via ${m.via}` : "";
         (m.actions || []).forEach(a => log(`recall used ${a.tool} ${JSON.stringify(a.input)}`));
         break;
       case "caregiver": {
         const last = m.last ? ` · last ${m.last.time} ${m.last.ok ? "sent" : "FAILED: " + m.last.error}` : "";
-        $("cgstatus").textContent = `${m.sender} → ${m.to}${m.configured ? "" : " (no phone set)"} · sent ${m.sent}`
+        $("cgstatus").textContent = `${m.sender} to ${m.to}${m.configured ? "" : " (no phone set)"} · sent ${m.sent}`
           + (m.suppressed ? ` · ${m.suppressed} over limit` : "") + ` · ${m.limit}` + last;
         break;
       }
@@ -393,12 +603,13 @@ function connect() {
         showSettings(m);
         $("cgtoggle").textContent = m.caregiver_texts === "on" ? "On" : "Off";
         $("cgtoggle").classList.toggle("sel", m.caregiver_texts === "on");
+        $("cgtoggle").setAttribute("aria-pressed", m.caregiver_texts === "on");
         const muted = ["name_alerts", "find_cues", "sound_alerts"].filter(k => m[k] === "off").map(k => k.replace("_", " "));
-        $("settings").textContent = `intensity ${m.intensity}` + (muted.length ? ` · muted: ${muted.join(", ")}` : "")
+        $("settings").textContent = `strength ${m.intensity}` + (muted.length ? ` · muted: ${muted.join(", ")}` : "")
           + (m.names ? ` · names: ${m.names}` : "");
         break;
       }
-      case "alerts": $("alerts").tBodies[0].innerHTML = ""; alertRows.clear(); m.items.forEach(addAlert); break;
+      case "alerts": $("alerts").tBodies[0].textContent = ""; alertRows.clear(); m.items.forEach(addAlert); break;
       case "alert": addAlert(m); break;
       case "label": { const tr = alertRows.get(m.ref); if (tr) addAlert({...tr._a, truth: m.truth}); break; }
     }
@@ -407,7 +618,7 @@ function connect() {
 connect();
 
 // Camera preview: MJPEG from /video (annotated: tracked box + "target: STATE").
-// Vision off or camera dropped -> "camera off", retry every 3 s.
+// Vision off or camera dropped -> "Camera off", retry every 3 s.
 (function camera() {
   const img = $("cam"), off = $("camoff");
   let retry = null;
