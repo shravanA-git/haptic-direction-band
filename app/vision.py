@@ -367,6 +367,8 @@ class Vision:
         period = 1.0 / self.max_fps if self.max_fps else 0
         last = time.monotonic()
         is_file = isinstance(self.camera, str) and not self.camera.isdigit()
+        if self.log_path:
+            Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
         log = open(self.log_path, "w") if self.log_path else None
         if log:
             log.write("t,target,n_boxes,raw_offset,raw_score,offset,confidence,state\n")
