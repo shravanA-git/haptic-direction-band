@@ -125,6 +125,8 @@ class App:
         self.vision = None
         self.guide = None
         self.speech = None
+        self.nav = None                  # app.nav.NavGuide with --nav (CoStar track)
+        self.nav_info: dict = {}
         link.subscribe(self._on_event)
         link.subscribe(self.live)
         link.subscribe(self.recorder)
@@ -201,6 +203,14 @@ class App:
         self.faults.pop("speech", None)
         self.state["heard"] = r.text or "–"
         self.emit({"type": "state", **self.state})
+        if self.nav is not None:             # --nav only: "take me to X" is a route
+            from .nav import route_request
+            place = route_request(r.text or "")
+            if place:
+                self.emit(self.nav_goal(place, heard=r.text))
+                return
+            if r.target:                     # "find my X" stays the webcam find
+                self.nav.cancel("find started")
         if not r.target:
             self.emit({"type": "log", "text": f"heard \"{r.text}\": no known object; type it in Find"})
             self.notify.cue("find", "unknown", heard=r.text, reason="no known object")
@@ -211,6 +221,37 @@ class App:
         else:
             self.emit({"type": "log", "text": f"heard target {r.target}, but vision isn't running"})
             self.notify.cue("find", "unknown", heard=r.text, reason="vision not running")
+
+    # ------------------------------------------------------------ nav (CoStar)
+    def attach_nav(self, nav, info: Optional[dict] = None) -> None:
+        """nav: app.nav.NavGuide. Name and sound alerts always win: guidance holds
+        while an alert pattern plays, then gives the current step again."""
+        self.nav, self.nav_info = nav, dict(info or {})
+        nav.on_status = lambda st: self.emit({"type": "nav", **st})
+        self.alerts.subscribe(self._nav_alert_hold)
+
+    def _nav_alert_hold(self, rec: dict) -> None:
+        if self.nav is None or rec.get("type") != "alert" or rec.get("source") not in ("name", "sound") \
+                or rec.get("dry") or rec.get("muted"):
+            return
+        from .notify import pattern
+        try:
+            steps = pattern(rec["cue"], rec.get("motor"), rec.get("category"))
+        except (KeyError, ValueError):
+            steps = []
+        f = haptics.INTENSITY.get(self.settings.intensity, 1.0)
+        span_ms = max((off + ms for off, _, ms in steps), default=300) * f
+        self.nav.hold(span_ms / 1000 + 0.4)
+
+    def nav_goal(self, place: str, **detail) -> dict:
+        if self.nav is None:
+            return {"type": "log", "text": "navigation is off (start with --nav <model id>)"}
+        if self.vision is not None:
+            self.vision.set_target(None)     # one guidance at a time
+        ok, msg = self.nav.set_goal(place)
+        heard = detail.get("heard")
+        text = (f"heard \"{heard}\" -> " if heard else "") + f"nav: {msg}"
+        return {"type": "log", "text": text}
 
     def _set_open_target(self, typed: str) -> None:
         cls = self.vision.set_target(typed)
@@ -392,6 +433,8 @@ class App:
         if self.vision:
             for obj in (self.vision, self.guide):
                 (obj.pause if down else obj.resume)()
+        if self.nav is not None:
+            (self.nav.pause if down else self.nav.resume)()
         for lst in (self.names, self.sound):  # hold-to-talk owns the mic while held
             if lst:
                 (lst.pause if down else lst.resume)()
@@ -532,6 +575,12 @@ class App:
             if typed:
                 self._target_feedback(cls, typed=typed)
             return {"type": "log", "text": f"target: {cls or 'none (not a known class)'}"}
+        elif cmd == "nav_pose" and self.nav is not None:   # the /nav page's tour camera
+            self.nav.update_pose(m.get("sweep"), m.get("position"), m.get("yaw"))
+        elif cmd == "nav_goal":
+            return self.nav_goal(str(m.get("to") or "").strip())
+        elif cmd == "nav_stop" and self.nav is not None:
+            self.nav.cancel("stopped")
         elif cmd == "state":  # vision/speech status from other code paths
             self.state.update({k: m[k] for k in ("object", "name", "heard", "sound") if k in m})
             self.emit({"type": "state", **self.state})
@@ -742,6 +791,22 @@ class App:
     async def index(self, request):
         return web.FileResponse(DASH / "index.html")
 
+    async def nav_page(self, request):
+        if self.nav is None:
+            return web.Response(status=404, text="navigation is off (start with --nav <model id>)")
+        return web.FileResponse(DASH / "nav.html")
+
+    async def nav_config(self, request):
+        """Model id, rooms and the Showcase SDK key (MATTERPORT_SDK_KEY, a browser
+        key) for the /nav page."""
+        if self.nav is None:
+            return web.json_response({"error": "navigation is off"}, status=404)
+        import os
+        rooms = sorted({r.label for r in self.nav.twin.rooms.values() if r.label != "Void"})
+        return web.json_response({"model": self.nav_info.get("model"), "name": self.nav.twin.name,
+                                  "rooms": rooms, "sdk_key": os.environ.get("MATTERPORT_SDK_KEY", ""),
+                                  "yaw_sign": self.nav.yaw_sign})
+
     VIDEO_FPS = 12          # preview cap; the detector runs at ~10 fps anyway
     VIDEO_QUALITY = 70
 
@@ -861,6 +926,8 @@ class App:
         app.router.add_get("/icon-512.png", self.icon_png)
         app.router.add_get("/ws", self.ws_handler)
         app.router.add_get("/video", self.video)
+        app.router.add_get("/nav", self.nav_page)
+        app.router.add_get("/nav/config", self.nav_config)
 
         async def on_startup(_):
             self.loop = asyncio.get_running_loop()

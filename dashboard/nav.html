@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HDB · Visit before you go</title>
+<style>
+  :root { --bg:#14171d; --panel:#1d222b; --ink:#e8ecf3; --dim:#97a1b3; --ok:#5fd38d; --bad:#ff6b6b; --acc:#ffb547; }
+  body { margin:0; font:18px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--ink);
+         display:grid; grid-template-columns: 1fr 340px; height:100vh; }
+  #tour { width:100%; height:100%; border:0; background:#000; }
+  aside { padding:16px; background:var(--panel); overflow:auto; }
+  h1 { font-size:20px; margin:0 0 8px; }
+  .big { font-size:28px; font-weight:700; margin:8px 0; }
+  .dim { color:var(--dim); font-size:15px; }
+  .row { display:flex; gap:8px; margin:8px 0; flex-wrap:wrap; }
+  input, button { font:inherit; background:#2a2f3a; color:var(--ink); border:1px solid #454c5c;
+                  border-radius:8px; padding:7px 10px; }
+  input { flex:1; min-width:0; }
+  button:hover { border-color:var(--acc); }
+  #ring { display:block; margin:8px auto; }
+  #log { font-size:14px; color:var(--dim); max-height:30vh; overflow:auto; white-space:pre-wrap; }
+  .warn { color:var(--bad); }
+</style>
+</head>
+<body>
+<iframe id="tour" allow="xr-spatial-tracking; fullscreen"></iframe>
+<aside>
+  <h1 id="name">Visit before you go</h1>
+  <div class="dim" id="where">connecting…</div>
+  <div class="big" id="step">–</div>
+  <svg id="ring" width="180" height="180" viewBox="-90 -90 180 180"></svg>
+  <div class="dim" id="facing">heading –</div>
+  <div class="row">
+    <input id="to" placeholder="take me to… (e.g. kitchen)">
+    <button id="go">Go</button>
+    <button id="stop">Stop</button>
+  </div>
+  <div class="row" id="rooms"></div>
+  <div class="dim">Or hold Action on the band and say "take me to the kitchen".
+    The band buzzes toward the next scan point; walk the tour by clicking it.</div>
+  <h1 style="margin-top:14px">Log</h1>
+  <div id="log"></div>
+</aside>
+<script src="https://static.matterport.com/showcase-sdk/latest.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const KEY = new URLSearchParams(location.search).get("k");
+const withKey = (u, sep) => KEY ? `${u}${sep}k=${encodeURIComponent(KEY)}` : u;
+const NAMES = ["front", "front-right", "right", "back-right", "back", "back-left", "left", "front-left"];
+let ws, lastSent = {sweep: null, yaw: null, t: 0};
+
+function log(t) { const d = $("log"); d.textContent = `${new Date().toLocaleTimeString()} ${t}\n` + d.textContent; }
+function send(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
+
+function drawRing(active) {
+  const svg = $("ring"); svg.innerHTML = "";
+  for (let k = 0; k < 8; k++) {
+    const a = k * Math.PI / 4, x = 62 * Math.sin(a), y = -62 * Math.cos(a);
+    const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    c.setAttribute("cx", x); c.setAttribute("cy", y); c.setAttribute("r", k === active ? 17 : 12);
+    c.setAttribute("fill", k === active ? "#ffb547" : "#2a2f3a");
+    c.setAttribute("stroke", "#454c5c"); svg.appendChild(c);
+  }
+  const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+  t.setAttribute("x", 0); t.setAttribute("y", 6); t.setAttribute("text-anchor", "middle");
+  t.setAttribute("fill", "#97a1b3"); t.setAttribute("font-size", "14"); t.textContent = "ahead ↑";
+  svg.appendChild(t);
+}
+drawRing(null);
+
+function connectWs() {
+  ws = new WebSocket(withKey(`ws://${location.host}/ws`, "?"));
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.type === "nav") {
+      $("where").textContent = `here: ${m.room || "?"}` + (m.goal ? ` → ${m.goal}` : "");
+      if (m.heading != null) $("facing").textContent = `tour heading ${m.heading}° (model)`;
+      if (m.info) { $("step").textContent = m.info; drawRing(m.info === "arrived" ? 0 : null); log(m.info); }
+      else if (m.motor != null) {
+        $("step").textContent = `${m.direction} · ${m.metres} m`;
+        drawRing(m.motor);
+      } else if (!m.goal) { $("step").textContent = "–"; drawRing(null); }
+    } else if (m.type === "log" && /^((heard .*)?nav:)/.test(m.text)) {
+      log(m.text);
+    } else if (m.type === "pulse") {
+      drawRing(m.motor);
+    }
+  };
+  ws.onclose = () => setTimeout(connectWs, 1000);
+}
+
+async function main() {
+  const cfg = await (await fetch(withKey("/nav/config", "?"))).json();
+  $("name").textContent = cfg.name || "Visit before you go";
+  for (const r of cfg.rooms || []) {
+    const b = document.createElement("button"); b.textContent = r;
+    b.onclick = () => send({cmd: "nav_goal", to: r}); $("rooms").appendChild(b);
+  }
+  connectWs();
+  if (!cfg.model) { log("no model id"); return; }
+  if (!cfg.sdk_key) {
+    $("where").innerHTML = '<span class="warn">MATTERPORT_SDK_KEY is not set: the tour shows, ' +
+      'but its position can\'t reach the band.</span>';
+  }
+  const tour = $("tour");
+  tour.src = `https://my.matterport.com/show?m=${encodeURIComponent(cfg.model)}&play=1&qs=1` +
+             (cfg.sdk_key ? `&applicationKey=${encodeURIComponent(cfg.sdk_key)}` : "");
+  if (!cfg.sdk_key || !window.MP_SDK) return;
+  tour.addEventListener("load", async () => {
+    try {
+      const sdk = await window.MP_SDK.connect(tour, cfg.sdk_key, "");
+      log("tour connected");
+      sdk.Camera.pose.subscribe(pose => {
+        // Send when the scan point changes, the view turns >= 10 deg, or every 2 s.
+        const yaw = pose.rotation.y, now = Date.now();
+        const turned = lastSent.yaw == null || Math.abs(((yaw - lastSent.yaw + 540) % 360) - 180) >= 10;
+        if (pose.sweep !== lastSent.sweep || turned || now - lastSent.t > 2000) {
+          lastSent = {sweep: pose.sweep, yaw, t: now};
+          send({cmd: "nav_pose", sweep: pose.sweep, position: pose.position, yaw});
+        }
+      });
+    } catch (e) { log("tour SDK: " + e); }
+  }, {once: true});
+}
+$("go").onclick = () => send({cmd: "nav_goal", to: $("to").value.trim()});
+$("to").onkeydown = e => { if (e.key === "Enter") $("go").onclick(); };
+$("stop").onclick = () => send({cmd: "nav_stop"});
+main();
+</script>
+</body>
+</html>

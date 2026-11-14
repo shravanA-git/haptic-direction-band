@@ -10,6 +10,8 @@
   python -m app.main --sim --vision --mirror   # laptop's own camera facing you
   python -m app.main --name Shravan       # buzz toward whoever calls the name
   python -m app.main --sim --vision --lan # phones on the same Wi-Fi can open the dashboard
+  python -m app.main --sim --nav <model id>   # CoStar: walk a Matterport tour at /nav, say
+                                          # "take me to the kitchen" (MATTERPORT_* keys in env)
 Then open http://localhost:8765
 """
 from __future__ import annotations
@@ -72,6 +74,12 @@ def main(argv=None) -> int:
                     help="caregiver texts are logged, never sent (even if Photon is configured)")
     ap.add_argument("--sound", action="store_true",
                     help="Teach a Sound: laptop mic; teach from the dashboard, then it buzzes its own pattern")
+    ap.add_argument("--nav", metavar="MODEL_ID",
+                    help="visit a building before you go: guide through this Matterport model's "
+                         "3D tour (page /nav; 'take me to X' on hold-to-talk)")
+    ap.add_argument("--nav-file", help="with --nav: read the model from this JSON (offline)")
+    ap.add_argument("--nav-yaw-sign", type=float, default=-1.0,
+                    help="tour yaw -> heading sign (flip to 1 if left/right come out swapped)")
     a = ap.parse_args(argv)
 
     reopen = None
@@ -147,6 +155,26 @@ def main(argv=None) -> int:
         except Exception as e:  # no numpy/sounddevice, or no mic permission
             sound = None
             print(f"[hdb] sound listener off: {e}")
+    if a.nav or a.nav_file:
+        try:
+            from tools.costar_nav import NavError, build_twin, load_model
+            from .nav import NavGuide
+            twin = build_twin(load_model(a.nav, a.nav_file, False))
+            nav = NavGuide(twin, play=lambda cue: app.play_cue(cue, "nav"),
+                           yaw_sign=a.nav_yaw_sign).start()
+            app.attach_nav(nav, {"model": a.nav})
+            n_links = sum(len(v) for v in twin.links.values()) // 2
+            print(f"[hdb] nav: {twin.name}, {len(twin.panos)} scan points, {n_links} walkable links; "
+                  f"open http://localhost:{a.http}/nav")
+            if app.speech is None and not a.no_speech:
+                try:
+                    from .speech import Speech
+                    app.attach_speech(Speech())
+                    print("[hdb] hold-to-talk on Action: \"take me to the kitchen\"")
+                except Exception as e:
+                    print(f"[hdb] speech off ({e}); type the room on /nav")
+        except (NavError, OSError, ValueError, KeyError) as e:
+            print(f"[hdb] nav off: {e}")
     from .notify import caregiver_from_env
     caregiver = caregiver_from_env(app.settings, dry=a.dry_texts)
     app.attach_caregiver(caregiver)
