@@ -372,8 +372,10 @@ class NameListener:
         nl.feed(samples, t_first)  # or push audio yourself (tests, replay)
 
     Rolling window: the last WINDOW_S of audio is decoded every HOP_S while
-    someone is talking (frame RMS above the noise floor within the last
-    ACTIVE_TAIL_S), with the names as whisper hotwords, then fuzzy-matched.
+    anything is audible (frame RMS above ACTIVE_RATIO x the noise floor within
+    the last ACTIVE_TAIL_S), with the names as whisper hotwords, then
+    fuzzy-matched. The floor is the 10th percentile over FLOOR_S (~30 s): a 3 s
+    floor became the chatter itself and stopped decoding in a busy room.
     This doesn't wait for a pause in the conversation, so a name said over
     background chatter is reported about one hop + one decode after it ends.
     Hotwords can make whisper invent the name (in chatter it rewrites "the sun"
@@ -382,8 +384,11 @@ class NameListener:
     (measured over TTS chatter: real calls 0.08-0.34, invented ones <= 0.01),
     the name appears at most MAX_REPEATS times in the window, and the audio under
     the word is louder than the room (WORD_LOUD x noise floor). verify="decode"
-    instead re-decodes +-VERIFY_PAD_S around the word without hotwords; over
-    chatter that rejected most real calls, so it is off by default.
+    also re-decodes +-VERIFY_PAD_S around the word without hotwords; over
+    chatter that rejected most real calls, so it is off by default. Known gap:
+    a sound-alike ("Sharon") in loud chatter can still pass; requiring two
+    windows to agree, or re-decoding confident candidates, did not fix it in
+    tests (fewer real calls found, false alarms unchanged).
     Decodes run at temperature 0 with a token cap (whisper's temperature
     fallback took up to 9 s on near-silent windows). The same name seen in
     overlapping windows is reported once (starts within cooldown_s merge).
@@ -399,13 +404,15 @@ class NameListener:
     HOP_S = 0.5
     ACTIVE_TAIL_S = 1.0    # keep decoding this long after the last loud frame
     MIN_START_RMS = 0.003  # absolute floor for "someone is talking"
+    FLOOR_S = 30.0         # noise floor = 10th percentile of frame RMS over this long
+    ACTIVE_RATIO = 1.5     # "audible" = frame RMS above this x floor
     EDGE_S = 0.2           # a name ending this close to the window's end may be cut off:
                            # wait for the next window (one hop later) for full timing
     MIN_PROB = 0.05
     MAX_REPEATS = 2
     WORD_LOUD = 2.0
     MAX_TOKENS = 40        # ~2 s of speech is ~15 tokens; caps hallucination loops
-    VERIFY_PAD_S = 0.5     # verify="decode" only
+    VERIFY_PAD_S = 0.5     # unbiased re-decode around a single sighting
     VERIFY_THRESHOLD = 0.6
     LIVE_QUEUE = 2         # live: windows waiting for the decoder (older ones dropped)
 
@@ -434,12 +441,14 @@ class NameListener:
         self._qlock = threading.Lock()
         self._worker: Optional[threading.Thread] = None
         self._warm = False
-        self._levels: "collections.deque" = collections.deque(maxlen=100)
+        self._levels: "collections.deque" = collections.deque(
+            maxlen=int(self.FLOOR_S * SAMPLE_RATE / self.FRAME))
         self.noise_floor = 0.0
         self._n = 0                # samples fed so far
         self._offset = None        # monotonic(sample 0), min-filtered
         self._last_hit_t = -1e9
         self._pending: Optional[NameHit] = None   # edge-deferred candidate
+        self.rejected: dict = {}   # reason -> count (diagnostics)
         self._reset_buf()
 
     # ---- public ----
@@ -544,8 +553,6 @@ class NameListener:
         if self.paused or len(f) == 0:
             return
         rms = float(np.sqrt(np.mean(f * f)) + 1e-9)
-        # Noise floor = 20th percentile of the last ~3 s of frames: robust to the
-        # mic's start-up click and to speech itself.
         self._levels.append(rms)
         self._buf.append((n0, f))
         self._buf_len += len(f)
@@ -553,9 +560,9 @@ class NameListener:
             self._buf_len -= len(self._buf.popleft()[1])
         if len(self._levels) < 10:
             return
-        floor = float(np.percentile(self._levels, 20))
+        floor = float(np.percentile(self._levels, 10))
         self.noise_floor = floor
-        if rms > max(3.0 * floor, self.MIN_START_RMS):
+        if rms > max(self.ACTIVE_RATIO * floor, self.MIN_START_RMS):
             if self._last_loud is None:          # talking starts: first decode one hop in
                 self._next_hop = self._n + int(self.HOP_S * SAMPLE_RATE)
             self._last_loud = self._n
@@ -606,13 +613,6 @@ class NameListener:
         """Why this candidate is probably invented by the hotword, or None."""
         import numpy as np
         start, end = words[i].start, words[j].end
-        if self.verify == "decode":
-            a = max(0, int((start - self.VERIFY_PAD_S - t0) * SAMPLE_RATE))
-            b = min(len(audio), int((end + self.VERIFY_PAD_S - t0) * SAMPLE_RATE))
-            _, plain = self._decode(audio[a:b], t0 + a / SAMPLE_RATE, hotwords=None)
-            if match_name(plain, [name], self.VERIFY_THRESHOLD) is None:
-                return f"unbiased decode heard {' '.join(w.text for w in plain)!r}"
-            return None
         prob = max(w.prob for w in words[i:j + 1])
         if prob < self.MIN_PROB:
             return f"word probability {prob:.3f} < {self.MIN_PROB}"
@@ -655,9 +655,12 @@ class NameListener:
             if start - self._last_hit_t < self.cooldown_s:
                 continue               # same call already reported from an earlier window
             why = self._reject(audio, t0, words, name, i, j)
+            if not why and self.verify == "decode":
+                heard = self._unbiased(audio, t0, start, end)
+                if match_name(heard, [name], self.VERIFY_THRESHOLD) is None:
+                    why = f"unbiased decode heard {' '.join(w.text for w in heard)!r}"
             if why:
-                if self.on_text:
-                    self.on_text(f"(rejected {name!r}: {why})", words)
+                self._note(name, why, words)
                 continue
             hit = NameHit(name, " ".join(w.text for w in words[i:j + 1]), start, end, score,
                           text, 0.0)
@@ -683,6 +686,17 @@ class NameListener:
             except Exception as e:
                 print(f"[names] callback error: {e}")
         return found
+
+    def _unbiased(self, audio, t0: float, start: float, end: float) -> list:
+        a = max(0, int((start - self.VERIFY_PAD_S - t0) * SAMPLE_RATE))
+        b = min(len(audio), int((end + self.VERIFY_PAD_S - t0) * SAMPLE_RATE))
+        return self._decode(audio[a:b], t0 + a / SAMPLE_RATE, hotwords=None)[1]
+
+    def _note(self, name: str, why: str, words: list) -> None:
+        key = why.split(" ")[0]
+        self.rejected[key] = self.rejected.get(key, 0) + 1
+        if self.on_text:
+            self.on_text(f"(rejected {name!r}: {why})", words)
 
 
 # --------------------------------------------------------------------------
