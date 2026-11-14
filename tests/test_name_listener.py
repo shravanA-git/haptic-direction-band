@@ -161,3 +161,31 @@ def test_continuous_chatter_keeps_decoding_through_a_louder_name():
     nl.drain(5)
     nl.stop()
     assert any(e >= 10.0 for e in ends), ends          # a window holding the whole name
+
+
+class SoundAlikeModel(FakeModel):
+    """The hotword turns "Sharon" into "Shravan"; without hotwords whisper hears
+    `plain` (a different name, or a garbled real call)."""
+
+    def __init__(self, plain):
+        super().__init__(lambda rms, a, b: ("Shravan", 0.5) if rms > 0.05 else None)
+        self.plain = plain
+
+    def transcribe(self, audio, hotwords=None, **kw):
+        if hotwords:
+            return super().transcribe(audio, hotwords=hotwords, **kw)
+        self.calls.append({"n": len(audio), "hotwords": None, **kw})
+        return [NS(text=" " + self.plain, words=[NS(word=" " + self.plain, start=0.1,
+                                                   end=0.5, probability=0.9)])], None
+
+
+def test_sound_alike_name_is_rejected():
+    model = SoundAlikeModel("Sharon")
+    _, hits, texts = listen(audio_with([(1.5, 2.0, 0.3)]), model)
+    assert hits == [] and any("sound-alike" in t for t in texts)
+
+
+def test_garbled_real_call_is_not_mistaken_for_a_sound_alike():
+    model = SoundAlikeModel("Soften")   # not a name: the real call stands
+    _, hits, _ = listen(audio_with([(1.5, 2.0, 0.3)]), model)
+    assert len(hits) == 1 and hits[0].name == "Shravan"

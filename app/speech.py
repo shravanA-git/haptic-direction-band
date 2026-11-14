@@ -343,6 +343,33 @@ def match_name(words: list, names: list, threshold: float = 0.8):
     return best
 
 
+# Common first names: the sound-alike check rejects a hotword hit when an unbiased
+# re-decode hears one of these instead (e.g. "Hey Sharon" -> "Shravan").
+COMMON_NAMES = frozenset("""
+aaron adam adrian aiden alan alex alexa alice alicia allen alyssa amanda amber amy
+ana andre andrea andrew angela anna anne anthony april ariana arthur ashley austin ava
+barbara ben benjamin beth betty bill blake bob brad brandon brenda brian brittany brooke
+bruce bryan caleb cameron carl carla carlos carol caroline carter casey catherine chad charles
+charlie chelsea cheryl chloe chris christian christina christine christopher cindy claire cody colin connor
+craig crystal cynthia dan daniel danielle danny david dawn dean deborah denise dennis derek
+diana diane donald donna doug dylan eddie edward elena eli elijah elizabeth ella ellen
+emily emma eric erica erin ethan eva evan frank gabriel gary george grace greg
+hailey hannah harry heather helen henry holly ian isaac isabella jack jackson jacob jake
+james jamie jan jane janet jared jasmine jason jay jean jeff jen jenna jennifer
+jenny jeremy jerry jesse jessica jill jim joan joe joel john johnny jon jonathan
+jordan jose joseph josh joshua joy juan judy julia julie justin karen kate katie
+kayla keith kelly ken kevin kim kyle laura lauren leah lee leo liam lily
+linda lisa logan lori louis lucas lucy luis luke lynn madison maria mark martin
+mary mason matt matthew megan melissa mia michael michelle mike molly morgan nancy natalie
+nathan nicholas nick nicole noah olivia oscar owen pam pat patrick paul peter rachel
+randy ray rebecca richard rick rob robert robin roger ron rose ruby russell ryan
+sam samantha sandra sara sarah scott sean seth shane shannon sharon shawn sheila sherry
+sophia sophie stacy stan stephanie stephen steve steven sue susan taylor terry thomas tim
+timothy tina todd tom tony tracy travis tyler vanessa victor victoria vincent wayne wendy
+will william zach zoe shaun shana shauna shayna sherman shirley sharron sharyn shan sheldon
+""".split())
+
+
 @dataclass
 class NameHit:
     name: str          # configured name that matched
@@ -413,6 +440,7 @@ class NameListener:
     WORD_LOUD = 2.0
     MAX_TOKENS = 40        # ~2 s of speech is ~15 tokens; caps hallucination loops
     VERIFY_PAD_S = 0.5     # unbiased re-decode around a single sighting
+    ALIKE_PAD_S = 0.3      # sound-alike check: unbiased re-decode of the word +- this
     VERIFY_THRESHOLD = 0.6
     LIVE_QUEUE = 2         # live: windows waiting for the decoder (older ones dropped)
 
@@ -448,6 +476,7 @@ class NameListener:
         self._offset = None        # monotonic(sample 0), min-filtered
         self._last_hit_t = -1e9
         self._pending: Optional[NameHit] = None   # edge-deferred candidate
+        self._vetoed: "collections.deque" = collections.deque(maxlen=20)  # (name, start)
         self.rejected: dict = {}   # reason -> count (diagnostics)
         self._reset_buf()
 
@@ -659,6 +688,13 @@ class NameListener:
                 heard = self._unbiased(audio, t0, start, end)
                 if match_name(heard, [name], self.VERIFY_THRESHOLD) is None:
                     why = f"unbiased decode heard {' '.join(w.text for w in heard)!r}"
+            if not why and any(n == name and abs(st - start) < self.cooldown_s
+                               for n, st in self._vetoed):
+                why = "sound-alike: same moment as an earlier sound-alike window"
+            if not why:
+                why = self._soundalike(audio, t0, name, start, end)
+                if why:
+                    self._vetoed.append((name, start))
             if why:
                 self._note(name, why, words)
                 continue
@@ -687,9 +723,25 @@ class NameListener:
                 print(f"[names] callback error: {e}")
         return found
 
-    def _unbiased(self, audio, t0: float, start: float, end: float) -> list:
-        a = max(0, int((start - self.VERIFY_PAD_S - t0) * SAMPLE_RATE))
-        b = min(len(audio), int((end + self.VERIFY_PAD_S - t0) * SAMPLE_RATE))
+    def _soundalike(self, audio, t0: float, name: str, start: float, end: float) -> Optional[str]:
+        """The hotword turns similar names into the target ("Hey Sharon" -> "Shravan").
+        Re-decode the word without hotwords: if whisper then hears a different common
+        first name that sounds like the target, someone else was called. Garbled real
+        calls ("Soften it", "KJ signs") aren't names, so they pass. Runs only on
+        candidates that passed the other checks, so it rarely costs a decode."""
+        key = re.sub(r"[^a-z]", "", name.lower())
+        for w in self._unbiased(audio, t0, start, end, pad=self.ALIKE_PAD_S):
+            tok = re.sub(r"[^a-z]", "", w.text.lower())
+            if tok and tok != key and tok in COMMON_NAMES:
+                m = match_name([tok], [name], 0.0)
+                if m and m[3] >= 0.5:
+                    return f"sound-alike: unbiased decode heard {w.text!r} (score {m[3]:.2f})"
+        return None
+
+    def _unbiased(self, audio, t0: float, start: float, end: float, pad: float = None) -> list:
+        pad = self.VERIFY_PAD_S if pad is None else pad
+        a = max(0, int((start - pad - t0) * SAMPLE_RATE))
+        b = min(len(audio), int((end + pad - t0) * SAMPLE_RATE))
         return self._decode(audio[a:b], t0 + a / SAMPLE_RATE, hotwords=None)[1]
 
     def _note(self, name: str, why: str, words: list) -> None:
