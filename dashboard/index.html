@@ -70,6 +70,10 @@
         <span>Object</span><b id="obj">–</b>
         <span>Name</span><b id="name">–</b>
       </div>
+      <div class="row" style="margin-top:10px">
+        <input id="tgt" placeholder="target, e.g. banana" style="font:inherit;background:#2a2f3a;color:var(--ink);border:1px solid #454c5c;border-radius:8px;padding:7px;flex:1">
+        <button id="find">Find</button>
+      </div>
     </section>
     <section>
       <h2>Record &amp; replay</h2>
@@ -146,6 +150,8 @@ $("rec").onclick = () => send({cmd: recording ? "record_stop" : "record_start"})
 $("mark").onmousedown = () => send({cmd: "alert_down"});
 $("mark").onmouseup = () => send({cmd: "alert_up"});
 $("play").onclick = () => { $("est").textContent = ""; send({cmd: "replay", name: $("traces").value}); };
+$("find").onclick = () => send({cmd: "target", name: $("tgt").value});
+$("tgt").onkeydown = e => { if (e.key === "Enter") $("find").onclick(); };
 $("halt").onclick = () => send({cmd: "replay_stop"});
 
 // ---- websocket

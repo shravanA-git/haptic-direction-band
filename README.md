@@ -42,6 +42,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m app.main                 # real band (auto-detects the USB port)
 .venv/bin/python -m app.main --sim           # simulated band, no hardware
 .venv/bin/python -m tools.bench --gate       # H3 gate: PULSE 0 + STOP, no browser
+.venv/bin/python -m app.main --target banana  # webcam cues (needs: pip install ultralytics opencv-python)
 .venv/bin/python -m pytest -q
 ```
 Dashboard: http://localhost:8765 (motor ring, mic levels, test pulses, STOP

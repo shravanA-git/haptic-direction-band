@@ -7,6 +7,7 @@ WebSocket, page -> server (JSON):
   {"cmd":"cue","name":"generic|centered|lost|directional","motor":k}
   {"cmd":"record_start"}  {"cmd":"record_stop"}  {"cmd":"alert_down"} {"cmd":"alert_up"}
   {"cmd":"replay","name":"fixtures/back_left.json"}  {"cmd":"replay_stop"}
+  {"cmd":"target","name":"banana"}   (typed target for vision)
 server -> page:
   {"type":"mic","ms":..,"levels":[f,r,b,l],"replay":bool}
   {"type":"pulse","motor":k,"ms":..,"dry":bool}   {"type":"stop"}
@@ -42,6 +43,8 @@ class App:
         self.clock = direction.ClockSync()
         self.replayer: Optional[trace.Replayer] = None
         self.state = {"object": None, "name": None}
+        self.vision = None
+        self.guide = None
         link.subscribe(self._on_event)
         link.subscribe(self.recorder)
         link.on_sent(self._on_sent)
@@ -61,6 +64,19 @@ class App:
             else:
                 asyncio.ensure_future(ws.send_str(data))
 
+    # -------------------------------------------------------------- vision
+    def attach_vision(self, vision, guide) -> None:
+        """vision: app.vision.Vision (or anything with on_change/set_target/
+        pause/resume); guide: app.guide.ObjectGuide driving the band."""
+        self.vision, self.guide = vision, guide
+        vision.on_change(self._on_vision)
+
+    def _on_vision(self, d) -> None:
+        self.guide.on_decision(d)
+        target = getattr(d, "target", None)
+        self.state["object"] = f"{target or '–'}: {d.state}"
+        self.emit({"type": "state", **self.state})
+
     # ----------------------------------------------------------- link side
     def _on_event(self, ev) -> None:
         if isinstance(ev, MicFrame):
@@ -70,6 +86,9 @@ class App:
             self.emit({"type": "btn", "name": ev.name, "down": ev.down})
             if ev.name == "ACTION" and self.recorder.active:
                 (self.recorder.alert_down if ev.down else self.recorder.alert_up)()
+            if ev.name == "ACTION" and self.vision:  # hold-to-talk: no cues while held
+                for obj in (self.vision, self.guide):
+                    (obj.pause if ev.down else obj.resume)()
         elif isinstance(ev, RawLine):
             self.emit({"type": "raw", "text": ev.text[:200]})
 
@@ -115,6 +134,11 @@ class App:
             self.replayer.cancel()
         elif cmd == "traces":
             return self.traces_msg()
+        elif cmd == "target":
+            if not self.vision:
+                return {"type": "log", "text": "vision not running (start with --target)"}
+            cls = self.vision.set_target(m.get("name") or None)
+            return {"type": "log", "text": f"target: {cls or 'none (not a known class)'}"}
         elif cmd == "state":  # vision/speech status from other code paths
             self.state.update({k: m[k] for k in ("object", "name") if k in m})
             self.emit({"type": "state", **self.state})

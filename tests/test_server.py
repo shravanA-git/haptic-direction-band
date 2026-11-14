@@ -50,3 +50,55 @@ def test_ws_pulse_stop_and_replay():
         link.close()
 
     asyncio.run(run())
+
+
+class FakeVision:
+    def __init__(self):
+        self.cb, self.paused, self.target = None, False, None
+
+    def on_change(self, cb):
+        self.cb = cb
+
+    def set_target(self, name):
+        self.target = name
+        return name
+
+    def pause(self):
+        self.paused = True
+
+    def resume(self):
+        self.paused = False
+
+
+def test_vision_decisions_drive_band_and_action_pauses():
+    from types import SimpleNamespace as D
+
+    from app import haptics
+    from app.guide import ObjectGuide
+
+    async def run():
+        port = SimPort()
+        link = Link(port).start()
+        app = App(link)
+        fv = FakeVision()
+        guide = ObjectGuide(lambda cue: haptics.play(cue, link.pulse).join())
+        app.attach_vision(fv, guide)
+        async with TestClient(TestServer(app.make_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await ws.send_json({"cmd": "target", "name": "banana"})
+            m = await _collect(ws, lambda m: m["type"] == "log")
+            assert fv.target == "banana" and "banana" in m["text"]
+            fv.cb(D(state="left", target="banana"))
+            st = await _collect(ws, lambda m: m["type"] == "state")
+            assert st["object"] == "banana: left"
+            fv.cb(D(state="centered", target="banana"))
+            port.inject("BTN ACTION DOWN")
+            await _collect(ws, lambda m: m["type"] == "btn")
+            assert fv.paused and guide.paused
+            fv.cb(D(state="lost", target="banana"))   # suppressed while held
+            await ws.close()
+        link.close()
+        assert port.sent[:3] == ["PULSE 6 200", "PULSE 0 100", "PULSE 0 100"]
+        assert "PULSE 4 400" not in port.sent
+
+    asyncio.run(run())
