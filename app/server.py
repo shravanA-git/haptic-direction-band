@@ -443,7 +443,11 @@ class App:
             haptics.cancel_all()
             self.link.stop()
         elif cmd == "pulse":
-            self.link.pulse(int(m["motor"]), int(m.get("ms", haptics.TEST_MS)))
+            motor, ms = int(m["motor"]), int(m.get("ms", haptics.TEST_MS))
+            if haptics.ACTIVE is not None and motor not in haptics.ACTIVE:
+                haptics.play([(0, motor, ms)], self.link.pulse)    # a diagonal: its two neighbours
+            else:
+                self.link.pulse(motor, ms)
         elif cmd == "cue":
             name = m.get("name")
             if name in ("generic", "centered", "lost", "sound", "ack", "unknown"):
@@ -554,7 +558,8 @@ class App:
             threading.Timer(1.3, cut).start()
             return {"type": "log", "text": "gate: motor 0 short buzz, long buzz cut by STOP "
                                            "at 0.3 s, then a 300 ms buzz that must end by itself"}
-        motors = {"walk": range(8), "cardinals": (0, 2, 4, 6)}.get(name)
+        every = haptics.ACTIVE if haptics.ACTIVE is not None else range(8)
+        motors = {"walk": every, "cardinals": (0, 2, 4, 6)}.get(name)
         if motors is None:
             return {"type": "log", "text": f"unknown bench sequence {name!r}"}
         haptics.play(haptics.walk(motors), self.link.pulse)
@@ -620,7 +625,8 @@ class App:
         return {"type": "status", "device": self.link.device,
                 "connected": self.link.connected(), "error": self.link.error,
                 "frames": self.link.frames_rx, "recording": self.recorder.active,
-                "health": self.link.health(), "faults": dict(self.faults)}
+                "health": self.link.health(), "faults": dict(self.faults),
+                "motors": list(haptics.ACTIVE) if haptics.ACTIVE is not None else list(range(8))}
 
     # ------------------------------------------------------------- watchdog
     VISION_STALL_S = 2.0      # no camera frame this long -> fault, target treated as lost

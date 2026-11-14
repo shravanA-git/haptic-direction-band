@@ -114,6 +114,8 @@
   .motor .lbl { font-size: 12px; pointer-events: none; }
   .motor.on rect { fill: var(--accent); stroke: var(--accent); }
   .motor.on .n { fill: var(--accent-ink); }
+  .motor.absent rect { fill: none; stroke-dasharray: 2 4; opacity: .5; }
+  .motor.absent .n, .motor.absent .lbl { opacity: .5; }
   .motor.dry rect { fill: var(--bg); stroke: var(--accent); stroke-dasharray: 4 3; stroke-width: 3; }
   .motor:focus-visible rect { stroke: var(--accent); stroke-width: 4; }
   #motorread { font-size: 15px; color: var(--ink-2); text-align: center; margin: 6px 0 0; min-height: 1.4em; }
@@ -536,6 +538,15 @@ function light(k, ms, dry) {
   clearTimeout(readTimer);
   readTimer = setTimeout(() => { $("motorread").textContent = ""; }, Math.max(ms, 120) + 1500);
 }
+function showMotors(list) {   // which motors the band has (status.motors): others are drawn absent
+  const have = new Set(list || [0, 1, 2, 3, 4, 5, 6, 7]);
+  motors.forEach((m, k) => {
+    m.g.classList.toggle("absent", !have.has(k));
+    m.g.setAttribute("aria-label", `Motor ${k}, ${NAMES[k].toLowerCase()}: ` +
+      (have.has(k) ? "test pulse" : "no motor here, test plays its two neighbours"));
+  });
+  $("ring").setAttribute("aria-label", `Belt with ${have.size} motors, motor 0 at the front, numbered clockwise`);
+}
 function allOff() {
   motors.forEach(m => { clearTimeout(m.timer); m.g.classList.remove("on", "dry"); });
   $("motorread").textContent = "Stopped. All motors off.";
@@ -708,6 +719,7 @@ function connect() {
           $("dev").textContent = (m.connected ? "Band on " : "Band not connected: ") + m.device + (m.error ? ", " + m.error : "");
         }
         $("frames").textContent = m.frames;
+        showMotors(m.motors);
         {
           const fl = Object.values(m.faults || {});
           $("faults").style.display = fl.length ? "block" : "none";

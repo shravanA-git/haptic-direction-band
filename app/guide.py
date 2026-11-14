@@ -40,11 +40,14 @@ def motor_for(state: str, offset: Optional[float]) -> int:
     if state == "centered":
         return FRONT
     if offset is None:                       # no live offset: the side the state names
-        return LEFT if state == "left" else RIGHT if state == "right" else FRONT
+        return haptics.nearest_active(
+            LEFT if state == "left" else RIGHT if state == "right" else FRONT)
     far = abs(offset) > SIDE_FAR
     if offset < 0:
-        return LEFT if far else FRONT_LEFT
-    return RIGHT if far else FRONT_RIGHT
+        m = LEFT if far else FRONT_LEFT
+    else:
+        m = RIGHT if far else FRONT_RIGHT
+    return haptics.nearest_active(m, offset)       # 4-motor band: 7 -> 6, 1 -> 2
 
 
 def heat(state: str, offset: Optional[float], size: float) -> float:

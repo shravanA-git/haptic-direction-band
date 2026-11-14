@@ -15,6 +15,7 @@ Then open http://localhost:8765
 from __future__ import annotations
 
 import argparse
+import os
 import secrets
 import socket
 import sys
@@ -53,6 +54,10 @@ def main(argv=None) -> int:
     ap.add_argument("--trace", help="with --sim: stream this trace's MIC frames")
     ap.add_argument("--loop", action="store_true", help="with --trace: loop forever")
     ap.add_argument("--http", type=int, default=8765, help="dashboard port")
+    ap.add_argument("--motors", default=os.environ.get("HDB_MOTORS"),
+                    help="which logical motors exist, e.g. 0,2,4,6 for a 4-motor band (front, right, "
+                         "back, left; env HDB_MOTORS). Diagonals play as their two neighbours back to "
+                         "back; default: all 8")
     ap.add_argument("--lan", action="store_true",
                     help="also serve phones on this Wi-Fi/hotspot (binds 0.0.0.0). No accounts: "
                          "anyone with the printed URL (it carries a random ?k= token) can buzz the "
@@ -74,6 +79,14 @@ def main(argv=None) -> int:
                     help="Teach a Sound: laptop mic; teach from the dashboard, then it buzzes its own pattern")
     a = ap.parse_args(argv)
 
+    try:
+        from . import haptics
+        haptics.set_motors(haptics.parse_motors(a.motors))
+    except ValueError as e:
+        ap.error(f"--motors: {e}")
+    if haptics.ACTIVE is not None:
+        print(f"[hdb] {len(haptics.ACTIVE)}-motor band: motors {list(haptics.ACTIVE)}; "
+              "diagonals play as their two neighbours, one motor at a time")
     reopen = None
     if a.sim:
         frames = trace.load(a.trace)["frames"] if a.trace else None
