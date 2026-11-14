@@ -128,14 +128,15 @@ class NavError(Exception):
 
 # --- fetching --------------------------------------------------------------
 
-def fetch_model(model_id: str) -> dict:
-    """GraphQL Model API; HTTP basic auth, key as user, token as password."""
+def graphql(query: str, variables: dict) -> dict:
+    """One Model API call; HTTP basic auth, key as user, token as password.
+    Returns the "data" object; raises NavError on auth/API errors."""
     key = os.environ.get("MATTERPORT_API_KEY")
     token = os.environ.get("MATTERPORT_API_TOKEN")
     if not key or not token:
         raise NavError("Set MATTERPORT_API_KEY and MATTERPORT_API_TOKEN "
                        "(from /costar-keys), or use --file.")
-    body = json.dumps({"query": QUERY, "variables": {"id": model_id}}).encode()
+    body = json.dumps({"query": query, "variables": variables}).encode()
     auth = base64.b64encode(f"{key}:{token}".encode()).decode()
     req = urllib.request.Request(API_URL, data=body, headers={
         "Content-Type": "application/json", "Authorization": f"Basic {auth}"})
@@ -146,7 +147,11 @@ def fetch_model(model_id: str) -> dict:
         raise NavError(f"Model API HTTP {e.code} (check the key/token)") from None
     if out.get("errors"):
         raise NavError(f"Model API error: {out['errors'][0].get('message')}")
-    model = (out.get("data") or {}).get("model")
+    return out.get("data") or {}
+
+
+def fetch_model(model_id: str) -> dict:
+    model = graphql(QUERY, {"id": model_id}).get("model")
     if not model:
         raise NavError(f"Model API returned no model for {model_id!r}")
     return model

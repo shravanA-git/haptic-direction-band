@@ -7,40 +7,93 @@
 <style>
   :root { --bg:#14171d; --panel:#1d222b; --ink:#e8ecf3; --dim:#97a1b3; --ok:#5fd38d; --bad:#ff6b6b; --acc:#ffb547; }
   body { margin:0; font:18px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--ink);
-         display:grid; grid-template-columns: 1fr 340px; height:100vh; }
-  #tour { width:100%; height:100%; border:0; background:#000; }
+         display:grid; grid-template-columns: 1fr 360px; height:100vh; }
+  main { overflow:auto; position:relative; }
+  #tour { width:100%; height:100%; border:0; background:#000; display:none; }
+  #routeview { padding:16px; display:none; }
   aside { padding:16px; background:var(--panel); overflow:auto; }
   h1 { font-size:20px; margin:0 0 8px; }
+  h2 { font-size:16px; margin:14px 0 6px; color:var(--dim); font-weight:600; }
   .big { font-size:28px; font-weight:700; margin:8px 0; }
   .dim { color:var(--dim); font-size:15px; }
-  .row { display:flex; gap:8px; margin:8px 0; flex-wrap:wrap; }
-  input, button { font:inherit; background:#2a2f3a; color:var(--ink); border:1px solid #454c5c;
-                  border-radius:8px; padding:7px 10px; }
+  .row { display:flex; gap:8px; margin:8px 0; flex-wrap:wrap; align-items:center; }
+  input, button, select { font:inherit; background:#2a2f3a; color:var(--ink); border:1px solid #454c5c;
+                          border-radius:8px; padding:7px 10px; }
   input { flex:1; min-width:0; }
   button:hover { border-color:var(--acc); }
+  button.primary { background:#3a3220; border-color:var(--acc); }
   #ring { display:block; margin:8px auto; }
-  #log { font-size:14px; color:var(--dim); max-height:30vh; overflow:auto; white-space:pre-wrap; }
+  #log { font-size:14px; color:var(--dim); max-height:24vh; overflow:auto; white-space:pre-wrap; }
   .warn { color:var(--bad); }
+  .card { display:flex; gap:16px; background:var(--panel); border-radius:12px; padding:14px; }
+  .card img { width:220px; height:220px; object-fit:cover; border-radius:8px; background:#000; }
+  .card .title { font-size:26px; font-weight:700; }
+  #view { display:flex; gap:2px; margin:14px 0; height:30vh; background:#000; border-radius:10px; overflow:hidden; }
+  #view img { flex:1; min-width:0; height:100%; object-fit:cover; }
+  #view .none { margin:auto; color:var(--dim); }
+  ol#steps { padding-left:28px; font-size:20px; }
+  ol#steps li { padding:4px 6px; border-radius:6px; }
+  ol#steps li.cur { background:#3a3220; color:var(--acc); font-weight:700; }
+  ol#steps li.done { color:var(--dim); }
+  .live, .export, .route { display:none; }
+  body.mode-live .live, body.mode-export .export, body.mode-route .route,
+  body.mode-live .route { display:block; }
+  body.mode-live #tour, body.mode-export #tour { display:block; }
+  body.mode-route #routeview { display:block; }
 </style>
 </head>
 <body>
-<iframe id="tour" allow="xr-spatial-tracking; fullscreen"></iframe>
+<main>
+  <iframe id="tour" allow="xr-spatial-tracking; fullscreen"></iframe>
+  <div id="routeview">
+    <div class="card" id="brief">
+      <img id="aerial" alt="aerial photo of the lot">
+      <div>
+        <div class="title" id="bname">–</div>
+        <div id="baddr" class="dim"></div>
+        <div id="bfacts" style="margin-top:8px"></div>
+        <div class="dim" style="margin-top:8px">Visit before you go: the band walks you through the
+          building from its 3D scan.</div>
+      </div>
+    </div>
+    <div id="view"><div class="none">plan a route to see the way</div></div>
+    <h1 id="routetitle">Route</h1>
+    <ol id="steps"></ol>
+  </div>
+</main>
 <aside>
   <h1 id="name">Visit before you go</h1>
   <div class="dim" id="where">connecting…</div>
   <div class="big" id="step">–</div>
   <svg id="ring" width="180" height="180" viewBox="-90 -90 180 180"></svg>
-  <div class="dim" id="facing">heading –</div>
-  <div class="row">
-    <input id="to" placeholder="take me to… (e.g. kitchen)">
-    <button id="go">Go</button>
-    <button id="stop">Stop</button>
+
+  <div class="route">
+    <div class="row"><span class="dim">Start</span><select id="start"></select></div>
+    <div class="row">
+      <input id="to" placeholder="take me to… (e.g. kitchen)">
+      <button id="go">Plan</button>
+    </div>
+    <div class="row" id="rooms"></div>
+    <div class="row">
+      <button id="play" class="primary">▶ Play</button>
+      <button id="next">Next step</button>
+      <button id="rstop">■ Stop</button>
+    </div>
+    <div class="dim">Or hold Action and say "take me to the kitchen": it plans and plays.
+      Name and sound alerts interrupt; nothing is spoken while Action is held.</div>
   </div>
-  <div class="row" id="rooms"></div>
-  <div id="exportbox" style="margin-top:12px">
-    <h1>Tour graph</h1>
-    <div class="dim" id="exportnote">Reads the tour's own scan points and links through the
-      Showcase SDK (for tours the Model API can't load). Name rooms as you walk, then export.</div>
+
+  <div class="live">
+    <h2>Live tour</h2>
+    <div class="dim" id="facing">heading –</div>
+    <div class="row"><input id="liveto" placeholder="guide me in the tour to…">
+      <button id="livego">Go</button><button id="stop">Stop</button></div>
+  </div>
+
+  <div class="export live">
+    <h2>Tour graph</h2>
+    <div class="dim">Reads the tour's own scan points and links through the Showcase SDK
+      (for tours the Model API can't load). Name rooms as you walk, then export.</div>
     <div class="row">
       <input id="roomname" placeholder="name this room (e.g. kitchen)">
       <button id="nameroom">Name</button>
@@ -49,19 +102,15 @@
       <button id="download">Download JSON</button></div>
     <div class="dim" id="named"></div>
   </div>
-  <div class="dim">Or hold Action on the band and say "take me to the kitchen".
-    The band buzzes toward the next scan point; walk the tour by clicking it.</div>
-  <h1 style="margin-top:14px">Log</h1>
+  <h2>Log</h2>
   <div id="log"></div>
 </aside>
-<script src="https://static.matterport.com/showcase-sdk/latest.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const KEY = new URLSearchParams(location.search).get("k");
 const withKey = (u, sep) => KEY ? `${u}${sep}k=${encodeURIComponent(KEY)}` : u;
-const NAMES = ["front", "front-right", "right", "back-right", "back", "back-left", "left", "front-left"];
 let ws, lastSent = {sweep: null, yaw: null, t: 0};
-let cfg = {}, sdkRef = null, sweeps = {}, floors = {}, rooms = {}, currentSweep = null, labels = {};
+let cfg = {}, sweeps = {}, floors = {}, rooms = {}, currentSweep = null, labels = {}, route = null;
 const labelKey = () => `hdb-nav-labels-${cfg.model}`;
 
 function log(t) { const d = $("log"); d.textContent = `${new Date().toLocaleTimeString()} ${t}\n` + d.textContent; }
@@ -83,32 +132,74 @@ function drawRing(active) {
 }
 drawRing(null);
 
-function connectWs() {
-  ws = new WebSocket(withKey(`ws://${location.host}/ws`, "?"));
-  ws.onmessage = ev => {
-    const m = JSON.parse(ev.data);
-    if (m.type === "nav") {
-      $("where").textContent = `here: ${m.room || "?"}` + (m.goal ? ` → ${m.goal}` : "");
-      if (m.heading != null) $("facing").textContent = `tour heading ${m.heading}° (model)`;
-      if (m.info) { $("step").textContent = m.info; drawRing(m.info === "arrived" ? 0 : null); log(m.info); }
-      else if (m.motor != null) {
-        $("step").textContent = `${m.direction} · ${m.metres} m`;
-        drawRing(m.motor);
-      } else if (!m.goal) { $("step").textContent = "–"; drawRing(null); }
-    } else if (m.type === "log" && /^((heard .*)?nav:)/.test(m.text)) {
-      log(m.text);
-    } else if (m.type === "pulse") {
-      drawRing(m.motor);
-    }
-  };
-  ws.onclose = () => setTimeout(connectWs, 1000);
+// ------------------------------------------------------------ route mode
+async function showView(pano) {
+  const v = $("view"); v.innerHTML = "";
+  let faces = [];
+  if (pano) {
+    try { faces = (await (await fetch(withKey(`/nav/pano/${encodeURIComponent(pano)}`, "?"))).json()).faces || []; }
+    catch (e) { faces = []; }
+  }
+  if (faces.length) {
+    for (const f of faces) { const i = document.createElement("img"); i.src = withKey(f, "?"); v.appendChild(i); }
+  } else if (cfg.brief && cfg.brief.preview) {
+    const i = document.createElement("img"); i.src = withKey("/nav/asset/preview.jpg", "?"); v.appendChild(i);
+  } else {
+    v.innerHTML = '<div class="none">no photo cached (run --nav-prefetch once online)</div>';
+  }
 }
 
+function showRoute(m) {
+  route = m;
+  $("routetitle").textContent = m.goal ? `Route to the ${m.goal}` : "Route";
+  const ol = $("steps"); ol.innerHTML = "";
+  m.steps.forEach((s, k) => {
+    const li = document.createElement("li");
+    li.textContent = `${s.turn}, ${s.metres} m → ${s.room}`;
+    if (m.current === k) li.className = "cur"; else if (m.current > k) li.className = "done";
+    ol.appendChild(li);
+  });
+  const arr = document.createElement("li");
+  arr.textContent = `arrive: ${m.goal}`;
+  if (m.event === "arrived") arr.className = "cur";
+  ol.appendChild(arr);
+  if (m.event === "step") {
+    $("step").textContent = m.text; drawRing(m.motor);
+    const nxt = m.steps[m.current];
+    showView(nxt ? nxt.pano : null);
+  } else if (m.event === "arrived") {
+    $("step").textContent = m.text; drawRing(0);
+  } else if (m.event === "planned") {
+    $("step").textContent = `${m.steps.length} steps · press Play`;
+    drawRing(null); showView(m.steps.length ? m.steps[0].pano : m.start);
+  } else if (m.event === "stopped") {
+    $("step").textContent = "stopped";
+  }
+}
+
+function showBrief() {
+  const b = cfg.brief || {};
+  $("bname").textContent = b.name || cfg.name || "–";
+  $("baddr").textContent = b.address || "";
+  const facts = Object.entries(b.facts || {}).map(([k, v]) => `${k.replace(/_/g, " ")}: ${v}`);
+  $("bfacts").textContent = facts.join(" · ");
+  if (b.aerial) $("aerial").src = withKey("/nav/asset/aerial.jpg", "?");
+  else if (b.preview) $("aerial").src = withKey("/nav/asset/preview.jpg", "?");
+  else $("aerial").style.display = "none";
+}
+
+$("start").onchange = () => send({cmd: "route_start", start: $("start").value});
+$("go").onclick = () => send({cmd: "route_plan", start: $("start").value, to: $("to").value.trim()});
+$("to").onkeydown = e => { if (e.key === "Enter") $("go").onclick(); };
+$("play").onclick = () => send({cmd: "route_play"});
+$("next").onclick = () => send({cmd: "route_next"});
+$("rstop").onclick = () => send({cmd: "route_stop"});
+
+// ------------------------------------------------------------ live tour + export
 function showNamed() {
-  const n = Object.entries(labels).map(([k, v]) => v).join(", ");
+  const n = Object.values(labels).join(", ");
   $("named").textContent = `${Object.keys(sweeps).length} scan points read` + (n ? ` · named: ${n}` : "");
 }
-
 function tourGraph() {
   const sw = Object.values(sweeps).map(s => ({
     sid: s.sid, position: s.position, neighbors: s.neighbors || [],
@@ -120,7 +211,6 @@ function tourGraph() {
                                                  label: r.label || r.name || ""})),
           labels};
 }
-
 $("nameroom").onclick = () => {
   const name = $("roomname").value.trim();
   const s = sweeps[currentSweep];
@@ -144,32 +234,28 @@ $("download").onclick = () => {
   a.href = URL.createObjectURL(new Blob([JSON.stringify(tourGraph(), null, 1)], {type: "application/json"}));
   a.download = `${cfg.model || "tour"}-showcase.json`; a.click();
 };
+$("livego").onclick = () => send({cmd: "nav_goal", to: $("liveto").value.trim()});
+$("stop").onclick = () => send({cmd: "nav_stop"});
 
-async function main() {
-  cfg = await (await fetch(withKey("/nav/config", "?"))).json();
-  try { labels = JSON.parse(localStorage.getItem(labelKey()) || "{}"); } catch (e) { labels = {}; }
-  if (cfg.export_only) {
-    $("where").innerHTML = '<span class="warn">The Model API can\'t load this tour' +
-      (cfg.error ? ` (${cfg.error})` : "") + '. Walk it, name the rooms, then Export tour graph.</span>';
-  }
-  $("name").textContent = cfg.name || "Visit before you go";
-  for (const r of cfg.rooms || []) {
-    const b = document.createElement("button"); b.textContent = r;
-    b.onclick = () => send({cmd: "nav_goal", to: r}); $("rooms").appendChild(b);
-  }
-  connectWs();
-  if (!cfg.model) { log("no model id"); return; }
-  if (!cfg.sdk_key) {
-    $("where").innerHTML = '<span class="warn">MATTERPORT_SDK_KEY is not set: the tour shows, ' +
-      'but its position can\'t reach the band.</span>';
-  }
+function loadScript(src) {
+  return new Promise((ok, bad) => { const s = document.createElement("script"); s.src = src;
+    s.onload = ok; s.onerror = bad; document.head.appendChild(s); });
+}
+
+async function startTour() {
   const tour = $("tour");
   tour.src = `https://my.matterport.com/show?m=${encodeURIComponent(cfg.model)}&play=1&qs=1` +
              (cfg.sdk_key ? `&applicationKey=${encodeURIComponent(cfg.sdk_key)}` : "");
-  if (!cfg.sdk_key || !window.MP_SDK) return;
+  if (!cfg.sdk_key) {
+    $("where").innerHTML = '<span class="warn">MATTERPORT_SDK_KEY is not set: the tour shows, ' +
+      'but it can\'t be exported or guide the band.</span>';
+    return;
+  }
+  try { await loadScript("https://static.matterport.com/showcase-sdk/latest.js"); }
+  catch (e) { log("tour SDK didn't load (offline?)"); return; }
   tour.addEventListener("load", async () => {
     try {
-      const sdk = sdkRef = await window.MP_SDK.connect(tour, cfg.sdk_key, "");
+      const sdk = await window.MP_SDK.connect(tour, cfg.sdk_key, "");
       log("tour connected");
       const watch = (coll, set) => {
         try { coll.data.subscribe({onCollectionUpdated: c => { set(c); showNamed(); }}); }
@@ -179,7 +265,6 @@ async function main() {
       if (sdk.Floor) watch(sdk.Floor, c => { floors = c; });
       if (sdk.Room) watch(sdk.Room, c => { rooms = c; });
       sdk.Camera.pose.subscribe(pose => {
-        // Send when the scan point changes, the view turns >= 10 deg, or every 2 s.
         const yaw = pose.rotation.y, now = Date.now();
         currentSweep = pose.sweep;
         const turned = lastSent.yaw == null || Math.abs(((yaw - lastSent.yaw + 540) % 360) - 180) >= 10;
@@ -191,9 +276,54 @@ async function main() {
     } catch (e) { log("tour SDK: " + e); }
   }, {once: true});
 }
-$("go").onclick = () => send({cmd: "nav_goal", to: $("to").value.trim()});
-$("to").onkeydown = e => { if (e.key === "Enter") $("go").onclick(); };
-$("stop").onclick = () => send({cmd: "nav_stop"});
+
+// ------------------------------------------------------------ messages
+function connectWs() {
+  ws = new WebSocket(withKey(`ws://${location.host}/ws`, "?"));
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.type === "route") {
+      showRoute(m);
+      if (m.event === "step" || m.event === "arrived") log(m.text);
+    } else if (m.type === "nav") {
+      $("where").textContent = `here: ${m.room || "?"}` + (m.goal ? ` → ${m.goal}` : "");
+      if (m.heading != null) $("facing").textContent = `tour heading ${m.heading}° (model)`;
+      if (m.info) { $("step").textContent = m.info; drawRing(m.info === "arrived" ? 0 : null); log(m.info); }
+      else if (m.motor != null) { $("step").textContent = `${m.direction} · ${m.metres} m`; drawRing(m.motor); }
+    } else if (m.type === "log" && /(nav|route):/.test(m.text)) {
+      log(m.text);
+    } else if (m.type === "pulse") {
+      drawRing(m.motor);
+    } else if (m.type === "btn" && m.name === "ACTION") {
+      $("where").textContent = m.down ? "Action held: listening (route paused, no speech)" : "";
+    }
+  };
+  ws.onclose = () => setTimeout(connectWs, 1000);
+}
+
+async function main() {
+  cfg = await (await fetch(withKey("/nav/config", "?"))).json();
+  try { labels = JSON.parse(localStorage.getItem(labelKey()) || "{}"); } catch (e) { labels = {}; }
+  document.body.classList.add(`mode-${cfg.mode}`);
+  $("name").textContent = cfg.name || "Visit before you go";
+  $("where").textContent = cfg.mode === "live" ? "live tour guidance" :
+                           cfg.mode === "route" ? "pick a start and a room" : "";
+  for (const s of cfg.starts || []) {
+    const o = document.createElement("option"); o.value = o.textContent = s; $("start").appendChild(o);
+  }
+  if (cfg.start) $("start").value = cfg.start;
+  for (const r of cfg.rooms || []) {
+    const b = document.createElement("button"); b.textContent = r;
+    b.onclick = () => send({cmd: "route_plan", start: $("start").value, to: r}); $("rooms").appendChild(b);
+  }
+  showBrief();
+  connectWs();
+  if (cfg.mode === "export") {
+    $("where").innerHTML = '<span class="warn">The Model API can\'t load this tour' +
+      (cfg.error ? ` (${cfg.error})` : "") + '. Walk it, name the rooms, then Export tour graph.</span>';
+  }
+  if ((cfg.mode === "live" || cfg.mode === "export") && cfg.model) startTour();
+}
 main();
 </script>
 </body>

@@ -128,6 +128,10 @@ class App:
         self.nav = None                  # app.nav.NavGuide with --nav (CoStar track)
         self.nav_info: dict = {}
         self.nav_factory = None          # main: twin -> start a NavGuide (after a tour export)
+        self.route = None                # app.nav.RoutePlayer: plan once, play the route
+        self.route_start: Optional[str] = None
+        self.brief: dict = {}
+        self.speaker = None
         link.subscribe(self._on_event)
         link.subscribe(self.live)
         link.subscribe(self.recorder)
@@ -204,14 +208,20 @@ class App:
         self.faults.pop("speech", None)
         self.state["heard"] = r.text or "–"
         self.emit({"type": "state", **self.state})
-        if self.nav is not None:             # --nav only: "take me to X" is a route
+        if self.nav is not None or self.route is not None:   # --nav only: "take me to X"
             from .nav import route_request
             place = route_request(r.text or "")
             if place:
-                self.emit(self.nav_goal(place, heard=r.text))
+                if self.nav_live or self.route is None:
+                    self.emit(self.nav_goal(place, heard=r.text))
+                else:                        # no tour position: plan once and play it
+                    self.emit(self.route_go(self.route_start, place, play=True, heard=r.text))
                 return
             if r.target:                     # "find my X" stays the webcam find
-                self.nav.cancel("find started")
+                if self.nav is not None:
+                    self.nav.cancel("find started")
+                if self.route is not None:
+                    self.route.stop()
         if not r.target:
             self.emit({"type": "log", "text": f"heard \"{r.text}\": no known object; type it in Find"})
             self.notify.cue("find", "unknown", heard=r.text, reason="no known object")
@@ -231,9 +241,41 @@ class App:
         nav.on_status = lambda st: self.emit({"type": "nav", **st})
         self.alerts.subscribe(self._nav_alert_hold)
 
+    @property
+    def nav_live(self) -> bool:
+        """Live tour mode (Showcase SDK pose) only with a browser SDK key."""
+        import os
+        return self.nav is not None and bool(os.environ.get("MATTERPORT_SDK_KEY"))
+
+    def attach_route(self, player, brief: Optional[dict] = None, speaker=None) -> None:
+        """player: app.nav.RoutePlayer. Same alert priority and Action rules as
+        live guidance; speaker never talks while Action is held."""
+        self.route, self.brief, self.speaker = player, dict(brief or {}), speaker
+        player.on_status = lambda st: self.emit({"type": "route", **st})
+        if not getattr(self, "_nav_hold_subscribed", False):
+            self._nav_hold_subscribed = True
+            self.alerts.subscribe(self._nav_alert_hold)
+
+    def route_go(self, start: Optional[str], place: str, play: bool = False, **detail) -> dict:
+        if self.route is None:
+            return {"type": "log", "text": "route player is off (start with --nav <model id>)"}
+        if self.vision is not None:
+            self.vision.set_target(None)     # one guidance at a time
+        if self.brief:
+            from tools.costar_assets import briefing_text
+            self.route.intro = briefing_text(self.brief)
+        ok, msg = self.route.plan(start, place)
+        if not ok:
+            self.play_cue(haptics.target_unknown(), "nav")
+        elif play:
+            self.play_cue(haptics.target_ack(), "nav")
+            self.route.play()
+        heard = detail.get("heard")
+        return {"type": "log", "text": (f"heard \"{heard}\" -> " if heard else "") + f"route: {msg}"}
+
     def _nav_alert_hold(self, rec: dict) -> None:
-        if self.nav is None or rec.get("type") != "alert" or rec.get("source") not in ("name", "sound") \
-                or rec.get("dry") or rec.get("muted"):
+        if (self.nav is None and self.route is None) or rec.get("type") != "alert" \
+                or rec.get("source") not in ("name", "sound") or rec.get("dry") or rec.get("muted"):
             return
         from .notify import pattern
         try:
@@ -242,7 +284,9 @@ class App:
             steps = []
         f = haptics.INTENSITY.get(self.settings.intensity, 1.0)
         span_ms = max((off + ms for off, _, ms in steps), default=300) * f
-        self.nav.hold(span_ms / 1000 + 0.4)
+        for g in (self.nav, self.route):
+            if g is not None:
+                g.hold(span_ms / 1000 + 0.4)
 
     def nav_goal(self, place: str, **detail) -> dict:
         if self.nav is None:
@@ -436,6 +480,10 @@ class App:
                 (obj.pause if down else obj.resume)()
         if self.nav is not None:
             (self.nav.pause if down else self.nav.resume)()
+        if self.route is not None:
+            (self.route.pause if down else self.route.resume)()
+        if down and self.speaker is not None:
+            self.speaker.cancel()            # the mic is listening to the wearer now
         for lst in (self.names, self.sound):  # hold-to-talk owns the mic while held
             if lst:
                 (lst.pause if down else lst.resume)()
@@ -582,6 +630,20 @@ class App:
             return self.nav_goal(str(m.get("to") or "").strip())
         elif cmd == "nav_stop" and self.nav is not None:
             self.nav.cancel("stopped")
+        elif cmd == "route_plan":
+            if m.get("start") is not None:
+                self.route_start = str(m.get("start") or "") or None
+            return self.route_go(self.route_start, str(m.get("to") or "").strip())
+        elif cmd == "route_start":
+            self.route_start = str(m.get("start") or "") or None
+        elif cmd == "route_play" and self.route is not None:
+            self.route.play()
+        elif cmd == "route_next" and self.route is not None:
+            self.route.next()
+        elif cmd == "route_stop" and self.route is not None:
+            self.route.stop()
+            if self.speaker is not None:
+                self.speaker.cancel()
         elif cmd == "state":  # vision/speech status from other code paths
             self.state.update({k: m[k] for k in ("object", "name", "heard", "sound") if k in m})
             self.emit({"type": "state", **self.state})
@@ -793,7 +855,7 @@ class App:
         return web.FileResponse(DASH / "index.html")
 
     async def nav_page(self, request):
-        if self.nav is None and not self.nav_info.get("model"):
+        if self.nav is None and self.route is None and not self.nav_info.get("model"):
             return web.Response(status=404, text="navigation is off (start with --nav <model id>)")
         return web.FileResponse(DASH / "nav.html")
 
@@ -801,16 +863,52 @@ class App:
         """Model id, rooms and the Showcase SDK key (MATTERPORT_SDK_KEY, a browser
         key) for the /nav page. export_only: the Model API couldn't give us the
         model, so the page offers to export the tour's sweep graph instead."""
-        if self.nav is None and not self.nav_info.get("model"):
+        if self.nav is None and self.route is None and not self.nav_info.get("model"):
             return web.json_response({"error": "navigation is off"}, status=404)
         import os
-        twin = self.nav.twin if self.nav is not None else None
+        twin = self.nav.twin if self.nav is not None else (self.route.twin if self.route else None)
         rooms = sorted({r.label for r in twin.rooms.values() if r.label != "Void"}) if twin else []
+        brief = {k: self.brief.get(k) for k in ("name", "address", "facts", "aerial", "preview")}
         return web.json_response({
             "model": self.nav_info.get("model"), "name": twin.name if twin else None,
             "rooms": rooms, "sdk_key": os.environ.get("MATTERPORT_SDK_KEY", ""),
+            "mode": "live" if self.nav_live else ("route" if self.route is not None else "export"),
+            "starts": [label for label, _ in self.route.starts()] if self.route else [],
+            "start": self.route_start, "brief": brief,
             "yaw_sign": self.nav.yaw_sign if self.nav is not None else None,
-            "export_only": self.nav is None, "error": self.nav_info.get("error")})
+            "export_only": self.nav is None and self.route is None,
+            "error": self.nav_info.get("error")})
+
+    def _asset_dir(self) -> Optional[Path]:
+        model = self.nav_info.get("model")
+        if not model:
+            return None
+        from tools.costar_assets import asset_dir
+        return asset_dir(model)
+
+    async def nav_asset(self, request):
+        """Cached pictures only (the demo runs offline): aerial.jpg, preview.jpg."""
+        name = request.match_info["name"]
+        d = self._asset_dir()
+        if d is None or name not in ("aerial.jpg", "preview.jpg") or not (d / name).exists():
+            return web.Response(status=404)
+        return web.FileResponse(d / name)
+
+    async def nav_pano(self, request):
+        """GET /nav/pano/<pano id> -> {"faces": [urls]} of the cached 360 photo;
+        /nav/pano/<pano id>/<face> -> the image."""
+        import re
+        pano, face = request.match_info["pano"], request.match_info.get("face")
+        d = self._asset_dir()
+        if d is None or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", pano):
+            return web.Response(status=404)
+        from tools.costar_assets import pano_faces
+        faces = pano_faces(self.nav_info["model"], pano)
+        if face is None:
+            return web.json_response({"faces": [f"/nav/pano/{pano}/{p.stem.rsplit('_', 1)[1]}"
+                                                for p in faces]})
+        path = d / "pano" / f"{pano}_{face}.jpg"
+        return web.FileResponse(path) if path in faces else web.Response(status=404)
 
     def save_nav_export(self, raw: dict) -> dict:
         """The /nav page's Showcase SDK read-out -> mp_cache/<model>.json (what
@@ -973,6 +1071,9 @@ class App:
         app.router.add_get("/nav", self.nav_page)
         app.router.add_get("/nav/config", self.nav_config)
         app.router.add_post("/nav/export", self.nav_export)
+        app.router.add_get("/nav/asset/{name}", self.nav_asset)
+        app.router.add_get("/nav/pano/{pano}", self.nav_pano)
+        app.router.add_get("/nav/pano/{pano}/{face}", self.nav_pano)
 
         async def on_startup(_):
             self.loop = asyncio.get_running_loop()

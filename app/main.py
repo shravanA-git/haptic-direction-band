@@ -10,8 +10,10 @@
   python -m app.main --sim --vision --mirror   # laptop's own camera facing you
   python -m app.main --name Shravan       # buzz toward whoever calls the name
   python -m app.main --sim --vision --lan # phones on the same Wi-Fi can open the dashboard
-  python -m app.main --sim --nav <model id>   # CoStar: walk a Matterport tour at /nav, say
-                                          # "take me to the kitchen" (MATTERPORT_* keys in env)
+  python -m app.main --nav <model id> --nav-prefetch   # CoStar: fetch + cache everything, exit
+  python -m app.main --sim --nav <model id>   # then /nav: plan a route, Play / Next (offline ok);
+                                          # "take me to the kitchen" on hold-to-talk. With
+                                          # MATTERPORT_SDK_KEY set: live 3D tour guidance too
 Then open http://localhost:8765
 """
 from __future__ import annotations
@@ -78,9 +80,24 @@ def main(argv=None) -> int:
                     help="visit a building before you go: guide through this Matterport model's "
                          "3D tour (page /nav; 'take me to X' on hold-to-talk)")
     ap.add_argument("--nav-file", help="with --nav: read the model from this JSON (offline)")
+    ap.add_argument("--nav-prefetch", action="store_true",
+                    help="with --nav: fetch and cache the model, 360 photos, preview, aerial "
+                         "photo and briefing (so the demo runs with wifi off), then exit")
     ap.add_argument("--nav-yaw-sign", type=float, default=-1.0,
                     help="tour yaw -> heading sign (flip to 1 if left/right come out swapped)")
     a = ap.parse_args(argv)
+    if a.nav_prefetch:
+        if not a.nav:
+            ap.error("--nav-prefetch needs --nav <model id>")
+        from tools.costar_assets import prefetch
+        from tools.costar_nav import NavError
+        try:
+            print(f"[hdb] nav prefetch {a.nav}:")
+            prefetch(a.nav, refresh=True)
+            return 0
+        except (NavError, OSError) as e:
+            print(f"[hdb] nav prefetch failed: {e}")
+            return 1
 
     reopen = None
     if a.sim:
@@ -159,13 +176,29 @@ def main(argv=None) -> int:
         from tools.costar_nav import NavError, build_twin, load_model
         from .nav import NavGuide
 
-        def start_nav(twin):
+        from .nav import RoutePlayer, Speaker
+
+        def start_nav(twin, model=None):
             nav = NavGuide(twin, play=lambda cue: app.play_cue(cue, "nav"),
                            yaw_sign=a.nav_yaw_sign).start()
             app.attach_nav(nav, {"model": a.nav})
+            brief = {"name": twin.name}
+            if a.nav:
+                from tools.costar_assets import brief as load_brief
+                try:   # cache only (fast, offline); --nav-prefetch fills it
+                    brief = load_brief(a.nav, model or {"name": twin.name}, online=False)
+                    if not (brief.get("aerial") or brief.get("preview")):
+                        print(f"[hdb] nav: no cached pictures; run once online: "
+                              f"python -m app.main --nav {a.nav} --nav-prefetch")
+                except Exception as e:
+                    print(f"[hdb] nav briefing: {e}")
+            speaker = Speaker(blocked=lambda: app._action_down)
+            app.attach_route(RoutePlayer(twin, play=lambda cue: app.play_cue(cue, "nav"),
+                                         speak=speaker.say), brief, speaker)
             n_links = sum(len(v) for v in twin.links.values()) // 2
+            mode = "live tour + route" if app.nav_live else "route plan (no MATTERPORT_SDK_KEY)"
             print(f"[hdb] nav: {twin.name}, {len(twin.panos)} scan points, {n_links} walkable links; "
-                  f"open http://localhost:{a.http}/nav")
+                  f"{mode}; open http://localhost:{a.http}/nav")
             if app.speech is None and not a.no_speech:
                 try:
                     from .speech import Speech
@@ -175,7 +208,8 @@ def main(argv=None) -> int:
                     print(f"[hdb] speech off ({e}); type the room on /nav")
         app.nav_factory = start_nav
         try:
-            start_nav(build_twin(load_model(a.nav, a.nav_file, False)))
+            model = load_model(a.nav, a.nav_file, False)
+            start_nav(build_twin(model), model)
         except (NavError, OSError, ValueError, KeyError) as e:
             print(f"[hdb] nav: model not loaded ({e})")
             if a.nav:   # the tour may still be public: export its sweep graph from /nav
