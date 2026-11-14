@@ -15,6 +15,9 @@
   h1 { font-size:20px; margin:0 0 8px; }
   h2 { font-size:16px; margin:14px 0 6px; color:var(--dim); font-weight:600; }
   .big { font-size:28px; font-weight:700; margin:8px 0; }
+  /* fixed heights: wrapping text must never move the buttons under the cursor */
+  #step { height:2.6em; line-height:1.3em; overflow:hidden; font-size:24px; }
+  #where { height:2.8em; overflow:hidden; }
   .dim { color:var(--dim); font-size:15px; }
   .row { display:flex; gap:8px; margin:8px 0; flex-wrap:wrap; align-items:center; }
   input, button, select { font:inherit; background:#2a2f3a; color:var(--ink); border:1px solid #454c5c;
@@ -133,20 +136,32 @@ function drawRing(active) {
 drawRing(null);
 
 // ------------------------------------------------------------ route mode
+let viewKey = null, viewSeq = 0;
 async function showView(pano) {
-  const v = $("view"); v.innerHTML = "";
+  // Keep the current photo until the next one has loaded (no black flash).
+  const seq = ++viewSeq;
   let faces = [];
   if (pano) {
     try { faces = (await (await fetch(withKey(`/nav/pano/${encodeURIComponent(pano)}`, "?"))).json()).faces || []; }
     catch (e) { faces = []; }
   }
-  if (faces.length) {
-    for (const f of faces) { const i = document.createElement("img"); i.src = withKey(f, "?"); v.appendChild(i); }
-  } else if (cfg.brief && cfg.brief.preview) {
-    const i = document.createElement("img"); i.src = withKey("/nav/asset/preview.jpg", "?"); v.appendChild(i);
-  } else {
-    v.innerHTML = '<div class="none">no photo cached (run --nav-prefetch once online)</div>';
+  let srcs = faces.map(f => withKey(f, "?"));
+  if (!srcs.length && cfg.brief && cfg.brief.preview) srcs = [withKey("/nav/asset/preview.jpg", "?")];
+  const key = srcs.join("|");
+  if (key === viewKey || seq !== viewSeq) return;
+  const v = $("view");
+  if (!srcs.length) {
+    if (!viewKey) v.innerHTML = '<div class="none">no photo cached (run --nav-prefetch once online)</div>';
+    return;
   }
+  const imgs = srcs.map(src => { const i = new Image(); i.src = src; return i; });
+  await Promise.race([
+    Promise.all(imgs.map(i => i.decode ? i.decode().catch(() => {}) : new Promise(r => { i.onload = i.onerror = r; }))),
+    new Promise(r => setTimeout(r, 4000))]);
+  if (seq !== viewSeq) return;                  // a newer step already asked for its photo
+  v.replaceChildren(...imgs.filter(i => i.complete && i.naturalWidth));
+  if (!v.children.length && !viewKey) v.innerHTML = '<div class="none">photo unavailable</div>';
+  viewKey = key;
 }
 
 function showRoute(m) {
@@ -183,9 +198,11 @@ function showBrief() {
   $("baddr").textContent = b.address || "";
   const facts = Object.entries(b.facts || {}).map(([k, v]) => `${k.replace(/_/g, " ")}: ${v}`);
   $("bfacts").textContent = facts.join(" · ");
-  if (b.aerial) $("aerial").src = withKey("/nav/asset/aerial.jpg", "?");
-  else if (b.preview) $("aerial").src = withKey("/nav/asset/preview.jpg", "?");
-  else $("aerial").style.display = "none";
+  const img = $("aerial");
+  img.onerror = () => { img.style.display = "none"; };     // missing/broken: no empty slot
+  if (b.aerial) img.src = withKey("/nav/asset/aerial.jpg", "?");
+  else if (b.preview) img.src = withKey("/nav/asset/preview.jpg", "?");
+  else img.style.display = "none";
 }
 
 $("start").onchange = () => send({cmd: "route_start", start: $("start").value});
