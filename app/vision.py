@@ -10,7 +10,7 @@ Interface for app/main.py and app/haptics.py
 
     v = Vision(camera=0)                 # opens nothing until start()
     v.on_change(callback)                # callback(decision), called from the vision thread
-    v.start()
+    v.start()                            # False + v.error if camera/detector failed (no raise)
     v.set_target("banana")               # typed name; returns the COCO class or raises ValueError
     d = v.latest()                       # most recent VisionDecision (poll instead of callback)
     v.pause(); v.resume()                # e.g. while Action is held
@@ -39,6 +39,7 @@ Running it
     pip install ultralytics opencv-python
     python -m app.vision --target banana --show          # webcam 0, live window
     python -m app.vision --target banana --source clip.mp4
+    python -m app.vision --check                         # is this computer ready? camera, mic, weights
     python -m app.vision --selftest                      # tracker logic, no camera/weights
     python -m app.vision --target banana --show --log recordings/banana.csv   # tuning run
         (also --dead-band, --dead-band-exit, --lost-after, --smoothing, --min-score)
@@ -317,22 +318,40 @@ class Vision:
             self.tracker.set_target(self.tracker.target)  # fresh start, no stale direction
         self._paused = False
 
-    def start(self) -> None:
+    def start(self, strict: bool = False) -> bool:
+        """Load the detector and open the camera. On failure, sets ``self.error``,
+        prints it and returns False (raises RuntimeError if strict) so the app and
+        dashboard keep running without vision."""
         if self._running:
-            return
-        self.detector = Detector(self.weights, self.imgsz)
+            return True
+        try:
+            self.detector = Detector(self.weights, self.imgsz)
+        except Exception as e:
+            return self._fail(f"detector failed to load ({type(e).__name__}: {e}); "
+                              "pip install ultralytics opencv-python, and be online on first run "
+                              "(weights download into models/)", strict)
         # Open on the caller's (main) thread: macOS only shows the camera
         # permission prompt from the main run loop.
         cap = self._open()
         if not cap.isOpened():
             cap.release()
-            self.error = (f"cannot open camera {self.camera!r} (macOS: allow camera access "
-                          "for your terminal in System Settings > Privacy & Security > Camera)")
-            raise RuntimeError(self.error)
+            return self._fail(f"cannot open camera {self.camera!r} (macOS: allow camera access "
+                              "for your terminal app in System Settings > Privacy & Security > "
+                              "Camera, then quit and reopen the terminal; or try --camera 1)",
+                              strict)
+        self.error = None
         self._running = True
         self._thread = threading.Thread(target=self._loop, args=(cap,), name="vision",
                                         daemon=True)
         self._thread.start()
+        return True
+
+    def _fail(self, msg: str, strict: bool) -> bool:
+        self.error = msg
+        print(f"[vision] OFF: {msg}")
+        if strict:
+            raise RuntimeError(msg)
+        return False
 
     def stop(self) -> None:
         self._running = False
@@ -542,6 +561,69 @@ def analyze(path: str) -> dict:
     return out
 
 
+def check(camera=0) -> bool:
+    """Is this computer ready for vision + speech? Prints one line per item with a fix."""
+    import importlib
+    import socket
+    import sys
+    ok_all = True
+
+    def line(ok, what, fix=""):
+        nonlocal ok_all
+        ok_all &= bool(ok)
+        print(f"  [{'ok' if ok else 'FAIL'}] {what}" + ("" if ok or not fix else f"\n         fix: {fix}"))
+
+    print(f"python: {sys.executable} ({sys.version.split()[0]})")
+    pip = f"{sys.executable} -m pip install -r requirements.txt"
+    for mod in ("aiohttp", "serial", "numpy", "cv2", "ultralytics", "torch",
+                "faster_whisper", "sounddevice"):
+        try:
+            m = importlib.import_module(mod)
+            line(True, f"import {mod} {getattr(m, '__version__', '')}")
+        except Exception as e:
+            line(False, f"import {mod}: {e}", pip)
+    try:
+        det = Detector()
+        line(True, f"detector yolov8n on {det.device}")
+    except Exception as e:
+        line(False, f"detector: {e}", "be online once so weights download into models/")
+    try:
+        import cv2
+        v = Vision(camera=camera)
+        cap = v._open()
+        got = cap.isOpened() and cap.read()[0]
+        shape = cap.read()[1].shape if got else None
+        cap.release()
+        line(got, f"camera {camera}" + (f" {shape[1]}x{shape[0]}" if shape else " not readable"),
+             "System Settings > Privacy & Security > Camera: enable your terminal app, "
+             "quit and reopen it; or try --camera 1")
+    except Exception as e:
+        line(False, f"camera: {e}")
+    try:
+        import numpy as np
+        import sounddevice as sd
+        rec = sd.rec(int(0.5 * 16000), samplerate=16000, channels=1, dtype="float32")
+        sd.wait()
+        rms = float(np.sqrt(np.mean(rec ** 2)))
+        line(rms > 1e-5, f"microphone '{sd.query_devices(kind='input')['name']}' rms={rms:.5f}",
+             "System Settings > Privacy & Security > Microphone: enable your terminal app "
+             "(rms 0 means macOS is feeding silence)")
+    except Exception as e:
+        line(False, f"microphone: {e}")
+    try:
+        from .speech import Transcriber
+        Transcriber().load()
+        line(True, "whisper tiny.en loaded")
+    except Exception as e:
+        line(False, f"whisper: {e}", "be online once so weights download into models/whisper/")
+    with socket.socket() as so:
+        free = so.connect_ex(("127.0.0.1", 8765)) != 0
+    line(free, "port 8765 free for the dashboard",
+         "another app.main is already running: open http://localhost:8765 or stop it")
+    print("READY" if ok_all else "NOT READY: fix the FAIL lines above")
+    return ok_all
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description="HDB vision: find a target in the front webcam")
     p.add_argument("--target", default="banana")
@@ -559,7 +641,11 @@ def main(argv=None) -> None:
     p.add_argument("--min-score", type=float, default=d.min_score)
     p.add_argument("--selftest", action="store_true")
     p.add_argument("--analyze", metavar="CSV", help="summarize a --log file and exit")
+    p.add_argument("--check", action="store_true",
+                   help="is this computer ready? (imports, weights, camera, mic, port)")
     a = p.parse_args(argv)
+    if a.check:
+        raise SystemExit(0 if check(int(a.source) if a.source.isdigit() else a.source) else 1)
     if a.analyze:
         import json
         print(json.dumps(analyze(a.analyze), indent=2))
@@ -575,9 +661,9 @@ def main(argv=None) -> None:
     v.on_change(lambda d: print(f"{d.t:10.3f}  {d.state:9s} offset={d.offset} "
                                 f"conf={d.confidence:.2f}"))
     try:
-        v.start()
-    except RuntimeError as e:
-        raise SystemExit(f"[vision] {e}")
+        v.start(strict=True)
+    except RuntimeError:
+        raise SystemExit(1)
     print(f"[vision] tracking {v.set_target(a.target)!r} on {a.source} "
           f"(device={v.detector.device}); Ctrl-C to quit")
     t0 = time.monotonic()
