@@ -46,6 +46,7 @@
   body.mode-live .route { display:block; }
   body.mode-live #tour, body.mode-export #tour { display:block; }
   body.mode-route #routeview { display:block; }
+  body.mode-live #startrow { display:none; }       /* live: the route starts where the tour is */
 </style>
 </head>
 <body>
@@ -76,7 +77,7 @@
   <svg id="ring" width="180" height="180" viewBox="-90 -90 180 180"></svg>
 
   <div class="route">
-    <div class="row"><span class="dim">Start</span><select id="start"></select></div>
+    <div class="row" id="startrow"><span class="dim">Start</span><select id="start"></select></div>
     <div class="row">
       <input id="to" list="tenants" placeholder="room, tenant or suite (e.g. kitchen, suite 1008)">
       <datalist id="tenants"></datalist>
@@ -124,6 +125,10 @@ const KEY = new URLSearchParams(location.search).get("k");
 const withKey = (u, sep) => KEY ? `${u}${sep}k=${encodeURIComponent(KEY)}` : u;
 let ws, lastSent = {sweep: null, yaw: null, t: 0};
 let cfg = {}, sweeps = {}, floors = {}, rooms = {}, currentSweep = null, labels = {}, route = null;
+let sdk = null;
+const isLive = () => cfg.mode === "live";
+const startValue = () => isLive() ? "" : $("start").value;
+function focusTour() { if (isLive()) { const t = $("tour"); t.focus(); try { t.contentWindow.focus(); } catch (e) {} } }
 const labelKey = () => `hdb-nav-labels-${cfg.model}`;
 
 function log(t) { const d = $("log"); d.textContent = `${new Date().toLocaleTimeString()} ${t}\n` + d.textContent; }
@@ -208,6 +213,8 @@ function showRoute(m) {
     drawRing(null); showView(m.steps.length ? m.steps[0].pano : m.start);
   } else if (m.event === "stopped") {
     $("step").textContent = "stopped";
+  } else if (m.event === "override") {
+    $("step").textContent = m.text; $("steps").innerHTML = ""; showProgress({});
   } else if (m.event === "info") {
     $("step").textContent = m.text; drawRing(null); $("steps").innerHTML = "";
     $("routetitle").textContent = "No route in this scan";
@@ -231,11 +238,11 @@ function showBrief() {
 }
 
 $("start").onchange = () => send({cmd: "route_start", start: $("start").value});
-$("go").onclick = () => send({cmd: "route_plan", start: $("start").value, to: $("to").value.trim()});
+$("go").onclick = () => { send({cmd: "route_plan", start: startValue(), to: $("to").value.trim()}); focusTour(); };
 $("to").onkeydown = e => { if (e.key === "Enter") $("go").onclick(); };
-$("play").onclick = () => send({cmd: "route_play"});
+$("play").onclick = () => { send({cmd: "route_play"}); focusTour(); };
 $("speed").onchange = () => send({cmd: "route_speed", speed: $("speed").value});
-$("next").onclick = () => send({cmd: "route_next"});
+$("next").onclick = () => { send({cmd: "route_next"}); focusTour(); };
 $("rstop").onclick = () => send({cmd: "route_stop"});
 
 // ------------------------------------------------------------ live tour + export
@@ -277,7 +284,31 @@ $("download").onclick = () => {
   a.href = URL.createObjectURL(new Blob([JSON.stringify(tourGraph(), null, 1)], {type: "application/json"}));
   a.download = `${cfg.model || "tour"}-showcase.json`; a.click();
 };
-$("livego").onclick = () => send({cmd: "nav_goal", to: $("liveto").value.trim()});
+$("livego").onclick = () => { send({cmd: "nav_goal", to: $("liveto").value.trim()}); focusTour(); };
+
+// Route playback drives the tour: move to the scan point, facing where the walker goes.
+function sweepFor(pano, pos) {
+  if (sweeps[pano]) return pano;
+  let best = null, bd = 1.5;                         // else nearest scan point (same frame)
+  for (const s of Object.values(sweeps)) {
+    const p = s.position || {}, d = Math.hypot((p.x ?? 1e9) - pos.x, (p.z ?? 1e9) - pos.z);
+    if (d < bd) { best = s.sid; bd = d; }
+  }
+  return best;
+}
+async function tourMove(m) {
+  if (!sdk) return;
+  const sid = sweepFor(m.pano, m.position);
+  if (!sid) { log(`tour: no scan point for ${m.pano}`); return; }
+  try {
+    const T = (sdk.Sweep.Transition || {}).FLY ?? "transition.fly";
+    if (sid === currentSweep && sdk.Camera.setRotation) {     // already here: just turn
+      await sdk.Camera.setRotation({x: 0, y: m.yaw}, {speed: 90});
+    } else {
+      await sdk.Sweep.moveTo(sid, {rotation: {x: 0, y: m.yaw}, transition: T, transitionTime: 1200});
+    }
+  } catch (e) { log("tour move: " + e); }
+}
 $("stop").onclick = () => send({cmd: "nav_stop"});
 
 function loadScript(src) {
@@ -298,7 +329,7 @@ async function startTour() {
   catch (e) { log("tour SDK didn't load (offline?)"); return; }
   tour.addEventListener("load", async () => {
     try {
-      const sdk = await window.MP_SDK.connect(tour, cfg.sdk_key, "");
+      sdk = await window.MP_SDK.connect(tour, cfg.sdk_key, "");
       log("tour connected");
       const watch = (coll, set) => {
         try { coll.data.subscribe({onCollectionUpdated: c => { set(c); showNamed(); }}); }
@@ -325,7 +356,9 @@ function connectWs() {
   ws = new WebSocket(withKey(`ws://${location.host}/ws`, "?"));
   ws.onmessage = ev => {
     const m = JSON.parse(ev.data);
-    if (m.type === "route") {
+    if (m.type === "tour_move") {
+      tourMove(m);
+    } else if (m.type === "route") {
       showRoute(m);
       if (m.event === "step" || m.event === "arrived") log(m.text);
     } else if (m.type === "nav") {

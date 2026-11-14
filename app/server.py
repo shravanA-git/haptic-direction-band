@@ -257,6 +257,9 @@ class App:
         tools.costar_kit property cache (briefing line, tenant lookups)."""
         self.route, self.brief, self.speaker = player, dict(brief or {}), speaker
         self.costar = costar
+        from .nav import TourDriver
+        self.driver = TourDriver()
+        player.on_move = self._tour_move
         player.on_status = lambda st: self.emit({"type": "route", **st})
         if not getattr(self, "_nav_hold_subscribed", False):
             self._nav_hold_subscribed = True
@@ -285,6 +288,9 @@ class App:
                     text = f"This scan is suite {self.costar.get('scan_suite')}; you're already there."
                     self.route.announce(text, haptics.centered())
                     return {"type": "log", "text": prefix + "route: " + text}
+        if not start and self.nav_live and self.nav is not None and self.nav.pano:
+            start = self.nav.pano                  # live tour: plan from where the tour stands
+        self.route.short_hops = self.nav_live          # driven tour: pass the scan points between
         ok, msg = self.route.plan(start, place)
         if not ok:
             self.play_cue(haptics.target_unknown(), "nav")
@@ -292,6 +298,38 @@ class App:
             self.play_cue(haptics.target_ack(), "nav")
             self.route.play()
         return {"type": "log", "text": prefix + f"route: {msg}"}
+
+    def _tour_move(self, pano: str, heading: float) -> None:
+        """Route playback drives the live 3D tour (only in --nav-live with a key)."""
+        if not self.nav_live or self.route is None:
+            return
+        p = self.route.twin.panos.get(pano)
+        if p is None:
+            return
+        yaw = (heading * self.nav.yaw_sign + 180) % 360 - 180      # model heading -> tour yaw
+        self.driver.moved(pano, yaw)
+        self.emit({"type": "tour_move", "pano": pano, "yaw": round(yaw, 1),
+                   "position": {"x": p.x, "y": p.z, "z": -p.y}})    # z-up model -> y-up tour
+
+    def _nav_pose(self, sweep, position, yaw) -> None:
+        """A pose from the live tour. While a route drives the tour, our own
+        moves echo back: ignore them. Anything else means the user took over:
+        pause Play and guide interactively from where they are."""
+        r = self.route
+        driving = (self.nav_live and r is not None and r.goal and not r.done and r.leg >= 0
+                   and getattr(self, "driver", None) is not None)
+        if driving:
+            verdict = self.driver.classify(self.nav._match(sweep, position), yaw)
+            if verdict == "override":
+                goal = r.goal
+                r.stop()
+                self.driver.clear()
+                with r._lock:
+                    r.goal, r.steps, r.texts, r.legs = None, [], [], []
+                self.nav.set_goal(goal, quiet=True)
+                r._status("override", text="You took over the tour: guiding from here.")
+                self.emit({"type": "log", "text": f"route: tour moved by hand; live guidance to {goal}"})
+        self.nav.update_pose(sweep, position, yaw)
 
     def briefing_line(self) -> str:
         """Spoken once when a route starts: the CoStar property line if the kit
@@ -671,7 +709,7 @@ class App:
                 self._target_feedback(cls, typed=typed)
             return {"type": "log", "text": f"target: {cls or 'none (not a known class)'}"}
         elif cmd == "nav_pose" and self.nav is not None:   # the /nav page's tour camera
-            self.nav.update_pose(m.get("sweep"), m.get("position"), m.get("yaw"))
+            self._nav_pose(m.get("sweep"), m.get("position"), m.get("yaw"))
         elif cmd == "nav_goal":
             return self.nav_goal(str(m.get("to") or "").strip())
         elif cmd == "nav_stop" and self.nav is not None:
@@ -682,10 +720,10 @@ class App:
             return self.route_go(self.route_start, str(m.get("to") or "").strip())
         elif cmd == "route_start":
             self.route_start = str(m.get("start") or "") or None
-        elif cmd == "route_play" and self.route is not None:
-            self.route.play()
-        elif cmd == "route_next" and self.route is not None:
-            self.route.next()
+        elif cmd in ("route_play", "route_next") and self.route is not None:
+            if self.nav_live and self.nav is not None:
+                self.nav.cancel("route playing")     # the route drives; no double cues
+            (self.route.play if cmd == "route_play" else self.route.next)()
         elif cmd == "route_speed" and self.route is not None:
             try:
                 v = self.route.set_speed(m.get("speed", "normal"))

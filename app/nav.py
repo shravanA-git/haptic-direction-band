@@ -75,7 +75,7 @@ class NavGuide:
         self._stop = threading.Event()
 
     # ------------------------------------------------------------- inputs
-    def set_goal(self, place: str, now: Optional[float] = None) -> tuple:
+    def set_goal(self, place: str, now: Optional[float] = None, quiet: bool = False) -> tuple:
         """(ok, message). Plays 'got it' or 'can't' and starts guiding."""
         now = time.monotonic() if now is None else now
         goals = goal_panos(self.twin, place)
@@ -87,8 +87,9 @@ class NavGuide:
             self.goal, self.goals = place, goals
             self._last_motor = self._last_pano = None
             self._last_cue_t = -1e9
-        self.play(haptics.target_ack())
-        self._last_cue_t = now          # let 'got it' finish before the first step
+        if not quiet:
+            self.play(haptics.target_ack())
+        self._last_cue_t = now if not quiet else -1e9   # let 'got it' finish first
         self._status()
         return True, f"route to {place}" + ("" if self.pano else " (waiting for the tour position)")
 
@@ -301,6 +302,13 @@ class RoutePlayer:
         self.on_status = on_status
         self.speed = speed
         self.threaded = threaded
+        # on_move(pano id, heading deg): drive a 3D tour along the route (live mode):
+        # through each scan point of a leg as the walker passes it, and at the leg
+        # end to the turn point facing the next leg (same moment as the turn PULSE)
+        self.on_move: Optional[Callable[[str, float], None]] = None
+        self.short_hops = False     # live tour: route through more scan points (see shortest_path)
+        self.legs: list = []        # per leg: start pano, first bearing, [(pano, metres in, bearing on)]
+        self._sub_i = 0
         self.steps: list = []
         self.texts: list = []
         self.intro = ""             # spoken once with the first step (arrival briefing)
@@ -345,19 +353,20 @@ class RoutePlayer:
         if not goals:
             rooms = sorted({r.label for r in self.twin.rooms.values() if r.label != "Void"})
             return False, f"no room like '{goal}' (rooms: {', '.join(rooms) or 'none'})"
-        steps = []
+        steps, legs = [], []
         if a.id not in goals:
-            path = shortest_path(self.twin, a.id, goals)
+            path = shortest_path(self.twin, a.id, goals, 2.0 if self.short_hops else 1.0)
             if not path:
                 return False, f"no walkable route to {goal}"
             steps = route_steps(self.twin, path, None)
+            legs = self._legs(path, steps)
         here = self.twin.rooms[a.room].label if a.room else None
         texts, prev = [], here
         for s in steps:
             texts.append(step_text(s, prev))
             prev = s.room
         with self._lock:
-            self.steps, self.texts, self.goal = steps, texts, goal
+            self.steps, self.texts, self.goal, self.legs = steps, texts, goal, legs
             self.start_pano, self.leg, self.leg_t, self.done = a.id, -1, 0.0, False
             self._intro_due, self._skip = True, 0
         self._status("planned")
@@ -374,6 +383,22 @@ class RoutePlayer:
             self.play_cue(cue)
         self._say(text)
         self._status("info", text=text)
+
+    def _legs(self, path: list, steps: list) -> list:
+        """Scan points along each leg, for driving the tour."""
+        from tools.costar_nav import bearing as brg
+        pos = {p: (self.twin.panos[p].x, self.twin.panos[p].y) for p in path}
+        legs, i = [], 0
+        for s in steps:
+            j = path.index(s.to_pano, i + 1)
+            subs, cum = [], 0.0
+            for k in range(i + 1, j):
+                cum += _dist(self.twin, path[k - 1], path[k])
+                subs.append((path[k], cum, brg(pos[path[k]], pos[path[k + 1]])))
+            legs.append({"start": path[i], "bearing": brg(pos[path[i]], pos[path[i + 1]]),
+                         "end": path[j], "last": brg(pos[path[j - 1]], pos[path[j]]), "subs": subs})
+            i = j
+        return legs
 
     def arrival_text(self) -> str:
         room = self.steps[-1].room if self.steps else self.goal
@@ -444,6 +469,13 @@ class RoutePlayer:
                 else:
                     self.leg_t += max(0.0, now - last) if last is not None else 0.0
                     dur = self.leg_seconds(self.leg)
+                    if self.leg < len(self.legs):            # tour: pass the scan points
+                        walked = min(1.0, self.leg_t / dur) * self.steps[self.leg].metres
+                        subs = self.legs[self.leg]["subs"]
+                        while self._sub_i < len(subs) and subs[self._sub_i][1] <= walked:
+                            pano, _, b = subs[self._sub_i]
+                            self._sub_i += 1
+                            events.append(("move", (pano, b)))
                     if dur > KEEP_GOING_S and self.leg_t >= self._next_keep \
                             and self.leg_t < dur - PRE_TURN_S:
                         self._next_keep += KEEP_GOING_S
@@ -467,6 +499,11 @@ class RoutePlayer:
                 self._say(arg)
             elif kind == "status":
                 self._status(*arg)
+            elif kind == "move" and self.on_move is not None:
+                try:
+                    self.on_move(*arg)
+                except Exception as e:
+                    print(f"[route] tour move: {e}")
         if progress and not any(k == "status" for k, _ in events):
             self._status("walking", self.leg)
 
@@ -474,14 +511,19 @@ class RoutePlayer:
         """Start the next leg (its pulse is the turn cue) or arrive. Lock held."""
         self.leg += 1
         self.leg_t, self._pre_turn_done, self._next_keep = 0.0, False, KEEP_GOING_S
+        self._sub_i = 0
         if self.leg < len(self.steps):
             s = self.steps[self.leg]
-            return [("cue", haptics.directional(s.motor)), ("say", self.texts[self.leg]),
-                    ("status", ("step", self.leg))]
+            out = [("cue", haptics.directional(s.motor))]
+            if self.leg < len(self.legs):    # tour: at the turn point, facing the new leg
+                out.append(("move", (self.legs[self.leg]["start"], self.legs[self.leg]["bearing"])))
+            return out + [("say", self.texts[self.leg]), ("status", ("step", self.leg))]
         self.auto, self._skip = False, 0
         self.done = True
-        return [("cue", haptics.centered()), ("say", self.arrival_text()),
-                ("status", ("arrived", self.leg))]
+        out = [("cue", haptics.centered())]
+        if self.legs:                        # tour: inside the goal room, facing into it
+            out.append(("move", (self.legs[-1]["end"], self.legs[-1]["last"])))
+        return out + [("say", self.arrival_text()), ("status", ("arrived", self.leg))]
 
     def _say(self, text: str) -> None:
         if self.paused:
@@ -526,9 +568,47 @@ class RoutePlayer:
                       of=round(self.steps[i].metres, 1))
         elif event == "arrived":
             st.update(current=len(self.steps), text=self.arrival_text())
-        elif event == "info":
+        elif event in ("info", "override"):
             st["text"] = text
         try:
             self.on_status(st)
         except Exception:
             pass
+
+
+class TourDriver:
+    """Tells our own tour moves' pose echoes from the user taking over (live mode).
+
+    moved() when the route sends the tour somewhere; classify() each pose the
+    page reports while a route is driving:
+      echo      within SETTLE_S of a move, or at the scan point we moved to,
+                looking roughly where we turned it: ignore (don't re-plan)
+      override  anywhere else: the user dragged or clicked; pause Play and
+                guide interactively from there
+      free      nothing driven yet
+    Yaw here is the tour's own (SDK) yaw in degrees."""
+
+    SETTLE_S = 2.5          # fly transition + SDK pose echo
+    YAW_TOL = 30.0
+
+    def __init__(self):
+        self.expect: Optional[tuple] = None
+
+    def moved(self, pano: str, yaw: Optional[float], now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
+        self.expect = (pano, yaw, now + self.SETTLE_S)
+
+    def clear(self) -> None:
+        self.expect = None
+
+    def classify(self, pano: Optional[str], yaw: Optional[float],
+                 now: Optional[float] = None) -> str:
+        now = time.monotonic() if now is None else now
+        if self.expect is None:
+            return "free"
+        want, want_yaw, until = self.expect
+        if now < until:
+            return "echo"
+        same_view = yaw is None or want_yaw is None or \
+            abs((float(yaw) - want_yaw + 180) % 360 - 180) <= self.YAW_TOL
+        return "echo" if pano == want and same_view else "override"

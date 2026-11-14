@@ -435,7 +435,10 @@ def goal_panos(twin: Twin, target: str) -> set[str]:
     return {p.id for p in twin.panos.values() if p.room in room_ids}
 
 
-def shortest_path(twin: Twin, start: str, goals: set[str]) -> list[str] | None:
+def shortest_path(twin: Twin, start: str, goals: set[str], power: float = 1.0) -> list[str] | None:
+    """Dijkstra over walkable links. power > 1 weights each link by distance**power,
+    which prefers several short hops to one long one (a driven 3D tour then passes
+    through the scan points in between instead of jumping 9 m)."""
     dist = {start: 0.0}
     prev: dict[str, str] = {}
     heap = [(0.0, start)]
@@ -449,7 +452,7 @@ def shortest_path(twin: Twin, start: str, goals: set[str]) -> list[str] | None:
         if d > dist.get(u, math.inf):
             continue
         for v, w in twin.links[u]:
-            nd = d + w
+            nd = d + (w if power == 1.0 else w ** power)
             if nd < dist.get(v, math.inf):
                 dist[v], prev[v] = nd, u
                 heapq.heappush(heap, (nd, v))
