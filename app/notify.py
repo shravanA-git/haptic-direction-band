@@ -30,10 +30,12 @@ from .settings import Settings
 SOUND_DIR_OFFSET_MS = 640
 
 
-def pattern(cue: str, motor: Optional[int] = None) -> list:
-    if cue == "sound" and motor is not None:
-        return haptics.taught_sound() + [(SOUND_DIR_OFFSET_MS, int(motor) % 8,
-                                          haptics.DIRECTIONAL_MS)]
+def pattern(cue: str, motor: Optional[int] = None, category: Optional[str] = None) -> list:
+    if cue == "sound":
+        steps = haptics.taught_sound(category)
+        if motor is not None:
+            steps.append((SOUND_DIR_OFFSET_MS, int(motor) % 8, haptics.DIRECTIONAL_MS))
+        return steps
     if cue == "directional":
         if motor is None:
             raise ValueError("directional cue needs a motor")
@@ -60,7 +62,8 @@ class Notifier:
         if not dry and self.settings.is_muted(source):
             play, detail["muted"] = False, True
         if play:
-            steps = haptics.scaled(pattern(cue, motor), self.settings.intensity)
+            steps = haptics.scaled(pattern(cue, motor, detail.get("category")),
+                                   self.settings.intensity)
             haptics.play(steps, self.dry_send if dry else self.send)
         return self.log.add(source, cue, motor, confidence, latency_ms, dry, **detail)
 

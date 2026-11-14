@@ -26,6 +26,34 @@ CENTERED_GAP_MS = 100     # PROVISIONAL (HDB-Protocol suggestion, not agreed)
 LOST_STEPS = [(0, FRONT, 600)]  # PROVISIONAL (HDB-Protocol suggestion, not agreed)
 # Teach a Sound: a sweep around the cardinals, so it can't be read as a side.
 SOUND_STEPS = [(0, 0, 80), (120, 2, 80), (240, 4, 80), (360, 6, 80)]  # PROVISIONAL
+# One pattern per sound category (app.listen.categorize), so the wearer can
+# tell taught sounds apart. Every pattern is symmetric (opposite motors
+# together) or a full circle, so none reads as a direction; at most two motors
+# at once; all end before notify.SOUND_DIR_OFFSET_MS (the pulse toward the
+# sound). ALL PROVISIONAL (not yet reviewed by HDB-Protocol).
+_FB, _LR = (0, 4), (2, 6)            # front+back, left+right
+
+
+def _pair(off, motors, ms):
+    return [(off, m, ms) for m in motors]
+
+
+SOUND_PATTERNS = {
+    # one long front+back buzz
+    "tone": _pair(0, _FB, 300),
+    # ding-dong: front+back, then left+right
+    "two-tone": _pair(0, _FB, 150) + _pair(250, _LR, 150),
+    # three short left+right beeps
+    "repeating": _pair(0, _LR, 80) + _pair(160, _LR, 80) + _pair(320, _LR, 80),
+    # a run once round all eight motors, clockwise from front
+    "melody": [(i * 60, i, 60) for i in range(8)],
+    # knock-knock on the two diagonals (an X)
+    "percussive": _pair(0, (1, 5), 60) + _pair(180, (3, 7), 60),
+    # fizz: front+back and left+right alternating fast
+    "noise": [s for i in range(4) for s in _pair(i * 90, _FB if i % 2 == 0 else _LR, 60)],
+    # two slow front+back pulses
+    "voice": _pair(0, _FB, 150) + _pair(300, _FB, 150),
+}
 # Hold-to-talk feedback for a wearer who can't see the dashboard.
 ACK_STEPS = [(0, 6, 120), (0, 2, 120)]                    # PROVISIONAL: "got it, searching"
 UNKNOWN_STEPS = [(0, 4, 80), (160, 4, 80), (320, 4, 80)]  # PROVISIONAL: "can't look for that"
@@ -51,8 +79,10 @@ def lost() -> Cue:
     return list(LOST_STEPS)
 
 
-def taught_sound() -> Cue:
-    return list(SOUND_STEPS)
+def taught_sound(category: str = None) -> Cue:
+    """The pattern for a taught sound's category; the shared sweep if the
+    category is unknown or not given (e.g. a v1 sound with no signature)."""
+    return list(SOUND_PATTERNS.get(category or "", SOUND_STEPS))
 
 
 def target_ack() -> Cue:
