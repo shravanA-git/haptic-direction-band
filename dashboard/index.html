@@ -12,6 +12,8 @@
   header h1 { font-size:22px; margin:0; flex:1; }
   .dot { display:inline-block; width:14px; height:14px; border-radius:50%; background:var(--bad); margin-right:6px; vertical-align:-1px; }
   .dot.ok { background:var(--ok); }
+  .dot.warn { background:var(--on); }
+  #health { font-size:15px; color:var(--dim); }
   main { display:grid; grid-template-columns: minmax(420px, 1.2fr) 1fr; gap:20px; padding:20px 24px; }
   section { background:var(--panel); border-radius:12px; padding:16px 20px; }
   h2 { font-size:16px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin:0 0 12px; }
@@ -44,6 +46,7 @@
 <header>
   <h1>Haptic Direction Band</h1>
   <div><span id="conn" class="dot"></span><span id="dev">–</span></div>
+  <div id="health" title="link state · MIC interval · lines received">–</div>
   <div><span id="frames">0</span> frames</div>
   <div id="btn">Action: up</div>
 </header>
@@ -56,6 +59,12 @@
       <button data-cue="generic">Generic (300 ms front)</button>
       <button data-cue="centered">Centered (2× front)</button>
       <button data-cue="lost">Lost</button>
+    </div>
+    <div class="row">
+      <span style="color:var(--dim);font-size:15px">Bench:</span>
+      <button data-bench="gate" title="H3: short buzz, long buzz cut by STOP, then a buzz that must end by itself">H3 gate (motor 0)</button>
+      <button data-bench="walk" title="H9: each motor in order; it should buzz where the ring lights">Walk ring 0→7</button>
+      <button data-bench="cardinals" title="fallback: front, right, back, left">Cardinals</button>
     </div>
     <button id="stop" title="Esc">STOP</button>
   </section>
@@ -145,6 +154,7 @@ function send(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); el
 // ---- controls
 $("stop").onclick = () => { send({cmd: "stop"}); allOff(); };
 document.addEventListener("keydown", e => { if (e.key === "Escape") $("stop").onclick(); });
+document.querySelectorAll("[data-bench]").forEach(b => b.onclick = () => send({cmd: "bench", name: b.dataset.bench}));
 document.querySelectorAll("[data-cue]").forEach(b => b.onclick = () => send({cmd: "cue", name: b.dataset.cue}));
 $("rec").onclick = () => send({cmd: recording ? "record_stop" : "record_start"});
 $("mark").onmousedown = () => send({cmd: "alert_down"});
@@ -168,7 +178,14 @@ function connect() {
       case "btn": $("btn").textContent = `${m.name[0] + m.name.slice(1).toLowerCase()}: ${m.down ? "DOWN" : "up"}`; break;
       case "raw": log("< " + m.text); break;
       case "status":
-        $("conn").className = "dot" + (m.connected ? " ok" : "");
+        {
+          const h = m.health || {}, st = h.state || (m.connected ? "streaming" : "silent");
+          $("conn").className = "dot" + ({streaming: " ok", lines: " warn", silent: " warn"}[st] || "");
+          const txt = {streaming: "streaming", lines: "lines, no MIC", silent: "port open, silent", error: "error"}[st] || st;
+          $("health").textContent = txt + (h.mic_gap_ms ? ` · MIC ${h.mic_gap_ms} ms` : "")
+            + ` · ${h.lines ?? 0} lines` + (h.mapped ? " · remapped" : "");
+          $("health").title = h.last_raw ? "last non-protocol line: " + h.last_raw : "link state · MIC interval · lines received";
+        }
         $("dev").textContent = m.device + (m.error ? " — " + m.error : "");
         $("frames").textContent = m.frames;
         recording = m.recording;

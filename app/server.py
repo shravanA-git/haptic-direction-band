@@ -8,6 +8,7 @@ WebSocket, page -> server (JSON):
   {"cmd":"record_start"}  {"cmd":"record_stop"}  {"cmd":"alert_down"} {"cmd":"alert_up"}
   {"cmd":"replay","name":"fixtures/back_left.json"}  {"cmd":"replay_stop"}
   {"cmd":"target","name":"banana"}   (typed target for vision)
+  {"cmd":"bench","name":"gate|walk|cardinals"}   (gate checks by feel; STOP cancels)
 server -> page:
   {"type":"mic","ms":..,"levels":[f,r,b,l],"replay":bool}
   {"type":"pulse","motor":k,"ms":..,"dry":bool}   {"type":"stop"}
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -106,6 +108,7 @@ class App:
     def handle(self, m: dict) -> Optional[dict]:
         cmd = m.get("cmd")
         if cmd == "stop":
+            haptics.cancel_all()
             self.link.stop()
         elif cmd == "pulse":
             self.link.pulse(int(m["motor"]), int(m.get("ms", haptics.TEST_MS)))
@@ -115,6 +118,8 @@ class App:
                    "lost": haptics.lost}.get(name)
             cue = cue() if cue else haptics.directional(int(m.get("motor", 0)))
             haptics.play(cue, self.link.pulse)
+        elif cmd == "bench":
+            return self.bench(m.get("name"))
         elif cmd == "record_start":
             self.recorder.start()
             return {"type": "log", "text": "recording…"}
@@ -143,6 +148,27 @@ class App:
             self.state.update({k: m[k] for k in ("object", "name") if k in m})
             self.emit({"type": "state", **self.state})
         return None
+
+    def bench(self, name: str) -> dict:
+        """H3 gate: short pulse, long pulse cut by STOP, finite pulse.
+        walk/cardinals: one pulse per motor in order (H9 mapping by feel)."""
+        if name == "gate":
+            haptics.play([(0, 0, haptics.TEST_MS), (1000, 0, 1000)], self.link.pulse)
+            born = haptics.epoch()
+
+            def cut():  # skipped if someone pressed STOP first
+                if haptics.epoch() == born:
+                    self.handle({"cmd": "stop"})
+                    haptics.play([(1200, 0, 300)], self.link.pulse)
+            threading.Timer(1.3, cut).start()
+            return {"type": "log", "text": "gate: motor 0 short buzz, long buzz cut by STOP "
+                                           "at 0.3 s, then a 300 ms buzz that must end by itself"}
+        motors = {"walk": range(8), "cardinals": (0, 2, 4, 6)}.get(name)
+        if motors is None:
+            return {"type": "log", "text": f"unknown bench sequence {name!r}"}
+        haptics.play(haptics.walk(motors), self.link.pulse)
+        return {"type": "log", "text": f"{name}: motors {list(motors)} in order, 0.7 s apart; "
+                                       "each should buzz where the ring lights up"}
 
     def traces_msg(self) -> dict:
         items = [f"fixtures/{p.name}" for p in sorted(FIXTURES.glob("*.json"))]
@@ -180,7 +206,8 @@ class App:
     def status(self) -> dict:
         return {"type": "status", "device": self.link.device,
                 "connected": self.link.connected(), "error": self.link.error,
-                "frames": self.link.frames_rx, "recording": self.recorder.active}
+                "frames": self.link.frames_rx, "recording": self.recorder.active,
+                "health": self.link.health()}
 
     # ---------------------------------------------------------------- web
     async def ws_handler(self, request):

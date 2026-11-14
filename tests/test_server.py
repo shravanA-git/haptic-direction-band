@@ -1,5 +1,6 @@
 """Dashboard server over a real WebSocket, with the simulated band."""
 import asyncio
+import time
 import json
 
 from aiohttp.test_utils import TestClient, TestServer
@@ -102,3 +103,33 @@ def test_vision_decisions_drive_band_and_action_pauses():
         assert "PULSE 0 600" not in port.sent
 
     asyncio.run(run())
+
+
+def test_stop_cancels_pending_cue_steps():
+    from app import haptics
+    port = SimPort()
+    link = Link(port).start()
+    app = App(link)
+    app.handle({"cmd": "cue", "name": "centered"})   # two front pulses, 200 ms apart
+    time.sleep(0.05)
+    app.handle({"cmd": "stop"})
+    time.sleep(0.35)
+    assert port.sent == ["PULSE 0 100", "STOP"]      # second pulse never sent
+    haptics.play(haptics.centered(), link.pulse).join()  # new cues still work
+    assert port.sent[-2:] == ["PULSE 0 100", "PULSE 0 100"]
+    link.close()
+
+
+def test_bench_sequences():
+    port = SimPort()
+    link = Link(port).start()
+    app = App(link)
+    app.handle({"cmd": "bench", "name": "gate"})
+    time.sleep(2.8)
+    assert port.sent == ["PULSE 0 150", "PULSE 0 1000", "STOP", "PULSE 0 300"]
+    app.handle({"cmd": "bench", "name": "cardinals"})
+    time.sleep(2.3)
+    assert port.sent[4:] == ["PULSE 0 250", "PULSE 2 250", "PULSE 4 250", "PULSE 6 250"]
+    h = app.status()["health"]
+    assert h["state"] == "streaming" and h["mic"] > 0
+    link.close()

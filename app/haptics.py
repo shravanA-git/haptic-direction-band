@@ -53,17 +53,45 @@ def name_alert(motor) -> Cue:
     return generic_attention() if motor is None else directional(motor)
 
 
+_epoch = 0
+_epoch_lock = threading.Lock()
+
+
+def cancel_all() -> None:
+    """Drop every pending step of every cue/sequence in flight. Call this
+    together with STOP so a half-played cue can't buzz again after STOP."""
+    global _epoch
+    with _epoch_lock:
+        _epoch += 1
+
+
+def epoch() -> int:
+    """Changes whenever cancel_all() runs (lets timers notice a STOP)."""
+    return _epoch
+
+
 def play(cue: Cue, send: Callable[[int, int], object]) -> threading.Thread:
     """Send a cue's steps at their offsets on a background thread.
     `send(motor, ms)` is Link.pulse for the band, or a dry-run sink.
+    cancel_all() stops any steps not yet sent.
     """
+    born = _epoch
+
     def run():
         t0 = time.monotonic()
         for off, motor, ms in sorted(cue):
             d = t0 + off / 1000 - time.monotonic()
             if d > 0:
                 time.sleep(d)
+            if _epoch != born:
+                return
             send(motor, ms)
     t = threading.Thread(target=run, name="cue", daemon=True)
     t.start()
     return t
+
+
+# Bench sequences (dashboard buttons; same steps as tools/bench.py).
+def walk(motors=range(8), ms: int = 250, every_ms: int = 700) -> Cue:
+    """One pulse per motor, in order: check the physical mapping by feel."""
+    return [(i * every_ms, int(m), ms) for i, m in enumerate(motors)]
