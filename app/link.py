@@ -12,11 +12,15 @@ estimator) goes through it: call pulse()/stop() and subscribe() for events.
 from __future__ import annotations
 
 import glob
+import json
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Callable, Optional, Union
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from statistics import median
+from typing import Callable, Optional, Sequence, Union
 
 BAUD = 115200
 NUM_MOTORS = 8
@@ -192,6 +196,36 @@ class SimPort:
         return f"MIC {ms} {lv}", self._t0 + ms / 1000
 
 
+# ------------------------------------------------------------ motor map
+MOTOR_MAP_FILE = Path(__file__).resolve().parent / "motor_map.json"
+
+
+def load_motor_map(path=MOTOR_MAP_FILE) -> Optional[list]:
+    """Logical motor (position: 0 front .. 7 front-left) -> physical channel
+    number sent in PULSE. Written by `python -m tools.bench --map` when the
+    wiring doesn't match the pin map; absent file = identity (no remap).
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    m = json.loads(path.read_text())["map"]
+    validate_motor_map(m)
+    return [int(c) for c in m]
+
+
+def validate_motor_map(m: Sequence[int]) -> None:
+    if len(m) != NUM_MOTORS or sorted(int(c) for c in m) != list(range(NUM_MOTORS)):
+        raise ValueError(f"motor map must be a permutation of 0..{NUM_MOTORS - 1}, got {list(m)}")
+
+
+def save_motor_map(m: Sequence[int], path=MOTOR_MAP_FILE) -> Path:
+    validate_motor_map(m)
+    path = Path(path)
+    path.write_text(json.dumps({"map": [int(c) for c in m],
+                                "note": "map[position] = physical channel; see tools/bench.py --map"}) + "\n")
+    return path
+
+
 # -------------------------------------------------------------------- link
 Listener = Callable[[Event], None]
 
@@ -201,16 +235,28 @@ class Link:
     and fans events out to subscribers; writes are serialized by a lock.
     """
 
-    def __init__(self, port, on_sent: Optional[Callable[[str], None]] = None):
+    def __init__(self, port, on_sent: Optional[Callable[[str], None]] = None,
+                 motor_map: Optional[Sequence[int]] = None):
         self.port = port
         self.device = getattr(port, "device", "?")
+        if motor_map is not None:
+            validate_motor_map(motor_map)
+        self.motor_map = list(motor_map) if motor_map is not None else None
+        self.opened = time.monotonic()
         self._listeners: list[Listener] = []
         self._sent_listeners: list[Callable[[str], None]] = [on_sent] if on_sent else []
         self._wlock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.last_rx: float = 0.0
+        self.last_mic_rx: float = 0.0
         self.frames_rx = 0
+        self.lines_rx = 0
+        self.raw_rx = 0
+        self.btn_rx = 0
+        self.last_raw: Optional[str] = None
+        self._mic_gaps: deque = deque(maxlen=100)   # ESP32 ms between frames
+        self._last_mic_ms: Optional[int] = None
         self.error: Optional[str] = None
 
     # subscriptions
@@ -238,17 +284,55 @@ class Link:
 
     # commands
     def pulse(self, motor: int, duration_ms: int) -> str:
-        return self._send(format_pulse(motor, duration_ms))
+        """Pulse a logical motor (0 front, clockwise). Goes through the motor
+        map if one is loaded; listeners always see the logical motor."""
+        line = format_pulse(motor, duration_ms)
+        if self.motor_map is None:
+            return self._send(line)
+        return self._send(format_pulse(self.motor_map[int(motor)], duration_ms), line)
+
+    def pulse_channel(self, channel: int, duration_ms: int) -> str:
+        """Pulse a physical channel, bypassing the motor map (mapping checks)."""
+        line = format_pulse(channel, duration_ms)
+        logical = line
+        if self.motor_map is not None:
+            logical = format_pulse(self.motor_map.index(int(channel)), duration_ms)
+        return self._send(line, logical)
 
     def stop(self) -> str:
         return self._send(format_stop())
 
-    def _send(self, line: str) -> str:
+    def _send(self, wire: str, logical: Optional[str] = None) -> str:
         with self._wlock:
-            self.port.write_line(line)
+            self.port.write_line(wire)
         for fn in self._sent_listeners:
-            _safe(fn, line)
-        return line
+            _safe(fn, logical or wire)
+        return wire
+
+    def health(self) -> dict:
+        """Link diagnostics for the bench and the dashboard header.
+        state: "error" (port failed), "silent" (open, nothing received yet or
+        for >1 s), "lines" (lines arrive but no MIC frames: early firmware),
+        "streaming" (MIC frames arriving)."""
+        now = time.monotonic()
+        gaps = list(self._mic_gaps)
+        if self.error:
+            state = "error"
+        elif self.last_mic_rx and now - self.last_mic_rx < 1.0:
+            state = "streaming"
+        elif self.last_rx and now - self.last_rx < 3.0:
+            state = "lines"
+        else:
+            state = "silent"
+        return {
+            "state": state,
+            "lines": self.lines_rx, "mic": self.frames_rx, "btn": self.btn_rx, "raw": self.raw_rx,
+            "last_raw": self.last_raw,
+            "last_rx_age": round(now - self.last_rx, 2) if self.last_rx else None,
+            "mic_gap_ms": round(median(gaps), 1) if gaps else None,
+            "mic_gap_max_ms": max(gaps) if gaps else None,
+            "mapped": self.motor_map is not None,
+        }
 
     def connected(self, stale_s: float = 1.0) -> bool:
         return self.error is None and (time.monotonic() - self.last_rx) < stale_s
@@ -265,8 +349,18 @@ class Link:
                 continue
             ev = parse_line(line)
             self.last_rx = ev.rx
+            self.lines_rx += 1
             if isinstance(ev, MicFrame):
                 self.frames_rx += 1
+                self.last_mic_rx = ev.rx
+                if self._last_mic_ms is not None and ev.ms > self._last_mic_ms:
+                    self._mic_gaps.append(ev.ms - self._last_mic_ms)
+                self._last_mic_ms = ev.ms
+            elif isinstance(ev, ButtonEvent):
+                self.btn_rx += 1
+            else:
+                self.raw_rx += 1
+                self.last_raw = ev.text[:120]
             for fn in self._listeners:
                 _safe(fn, ev)
 

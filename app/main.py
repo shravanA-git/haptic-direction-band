@@ -15,7 +15,7 @@ import sys
 from aiohttp import web
 
 from . import trace
-from .link import Link, SerialPort, SimPort, find_esp32_port
+from .link import Link, SerialPort, SimPort, find_esp32_port, load_motor_map
 from .server import App
 
 
@@ -46,7 +46,10 @@ def main(argv=None) -> int:
                   "Is the Arduino Serial Monitor (or another app) holding the port? Close it.")
             return 1
 
-    link = Link(port).start()
+    motor_map = None if a.sim else load_motor_map()
+    if motor_map:
+        print(f"[hdb] motor map from app/motor_map.json: {motor_map}")
+    link = Link(port, motor_map=motor_map).start()
     app = App(link)
     vision = guide = None
     if a.target is not None or a.vision:
