@@ -135,12 +135,15 @@ class VisionDecision:
 @dataclass
 class TrackerConfig:
     dead_band: float = 0.12        # |offset| <= this enters "centered"
-    dead_band_exit: float = 0.18   # |offset| > this leaves "centered"
-    lost_after_s: float = 1.2      # no detection this long -> "lost" (bridges motion-blur misses)
+    # Tuned on the demo camera (Shravan's Logitech USB cam, dim room, Nov 14): 9-10 fps,
+    # target seen in 67% of frames, median score 0.44, gaps p50 0.46 s / max 1.36 s,
+    # 8.2 state flips/min with the old 0.18 / 1.2 s / 0.3 s settings.
+    dead_band_exit: float = 0.24   # |offset| > this leaves "centered" (hysteresis 0.12)
+    lost_after_s: float = 2.0      # no detection this long -> "lost" (bridges the 1.4 s gaps)
     smoothing: float = 0.5         # EMA weight of the newest offset (1.0 = no smoothing)
     max_jump: float = 0.6          # prefer boxes within this offset distance of the last one
     min_score: float = 0.25
-    min_dwell_s: float = 0.3       # a new side must hold this long before it's reported
+    min_dwell_s: float = 0.4       # a new side must hold this long (~4 frames at 10 fps)
 
 
 class TargetTracker:
