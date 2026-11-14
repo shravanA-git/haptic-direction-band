@@ -441,6 +441,7 @@ class Vision:
             while self._running:
                 ok, frame = cap.read()
                 t = time.monotonic()
+                tick = t  # start of this iteration, for pacing
                 if not ok:
                     if is_file:
                         break
@@ -475,11 +476,15 @@ class Vision:
                               f"{'' if raw is None else f'{raw[1]:.2f}'},"
                               f"{'' if d.offset is None else d.offset},"
                               f"{d.confidence:.2f},{d.state}\n")
-                dt = time.monotonic() - last
+                # Pace from the start of this iteration (the old code measured from
+                # before the previous sleep, so it ran at ~2x max_fps when idle).
+                work = time.monotonic() - tick
+                if period and work < period:
+                    time.sleep(period - work)
+                now = time.monotonic()
+                dt = now - last
                 self.fps = 0.8 * self.fps + 0.2 * (1.0 / dt if dt > 0 else 0)
-                last = time.monotonic()
-                if period and dt < period:
-                    time.sleep(period - dt)
+                last = now
         finally:
             cap.release()
             if log:
