@@ -373,7 +373,9 @@ def _format(item: dict, me: set[str]) -> str | None:
         if res.get("is_error") or any(w in out.lower() for w in FAIL_WORDS):
             return f"{RED}✗ {res.get('name', 'tool')} failed: {_one_line(out, 160)}{RESET}"
         return None
-    if kind == "text" and who not in me:
+    if kind == "text" and (who not in me or who == "HDB-Supervisor"):
+        # Your own agents' messages already show as 💬 tool calls; the
+        # supervisor posts over REST, so its text is the only trace.
         return f"{BOLD}{who}{RESET}: " + _one_line(content, 200)
     if kind == "task" and "error" in content.lower():
         return f"{RED}✗ {_one_line(content)}{RESET}"
@@ -402,7 +404,7 @@ async def watch(once: bool = False) -> None:
         for name, client in clients.items():
             try:
                 chats = await client.agent_api_chats.list_agent_chats()
-                for chat in (getattr(chats, "data", None) or [])[:3]:
+                for chat in (getattr(chats, "data", None) or []):
                     page = 1
                     while True:
                         ctx = await client.agent_api_context.get_agent_chat_context(
