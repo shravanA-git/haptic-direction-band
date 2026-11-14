@@ -101,7 +101,8 @@ _VOCAB.update(SYNONYMS)
 # Common mishearings of short demo words.
 _VOCAB.update({"bananas": "banana", "banan": "banana", "nana": "banana",
                "cellphone": "cell phone", "cop": "cup",
-               "coffee": "cup", "macbook": "laptop", "mac book": "laptop"})
+               "coffee": "cup", "macbook": "laptop", "mac book": "laptop",
+               "human": "person", "humans": "person"})
 # Things people ask for that the detector can't see. Matched before the
 # singular forms, so "glasses" doesn't become "glass" -> cup.
 _UNKNOWN = {"glasses", "eyeglasses", "eye glasses", "spectacles", "sunglasses",
@@ -127,7 +128,8 @@ def match_target(text: str) -> Optional[str]:
     if hit:
         return hit
     from .vision import clean_phrase
-    return clean_phrase(text, require_trigger=True)
+    # Hold-to-talk is already a request: a short bare noun ("door.") is the target.
+    return clean_phrase(text, require_trigger=True, bare_words=4)
 
 
 def _scan(words: list[str]) -> Optional[str]:

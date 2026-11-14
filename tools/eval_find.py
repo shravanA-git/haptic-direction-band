@@ -33,8 +33,11 @@ Metrics (in-view = left/center/right/sweep):
                 targets vs open-vocabulary (YOLO-World) targets
   side_acc      % of held-still frames whose side state matches the label
                 (among frames where the tracker reports a side)
-  cue_s         median delay from entering (segment start) to the first ObjectGuide
-                cue; includes the human's reaction to the recorder's prompt
+  cue_s         median delay from entering (the first frame the object is detected
+                in a segment entered from out) to the first ObjectGuide cue pointing
+                the right way (left motor for "left", centered for "center")
+  cue_prompt_s  same from the recorder's prompt (info: includes the human's
+                reaction, ~1.5 s in the Nov 14 clips)
   detect_s      same, to the first box (info)
   det_fps       detector frames per second on this machine
   false_out     % of out frames with a box
@@ -355,6 +358,15 @@ def run_clip(frames: Iterable, fps: float, target: str, detect: Callable,
     return recs, cues
 
 
+def _cue_matches(label: str, kind: str, motor) -> bool:
+    from app.guide import LEFT_MOTOR, RIGHT_MOTOR
+    if label == "center":
+        return kind == "centered"
+    if label in ("left", "right"):
+        return kind == "directional" and motor == (LEFT_MOTOR if label == "left" else RIGHT_MOTOR)
+    return kind in ("directional", "centered")      # sweep: any pointing cue
+
+
 def score_clip(recs: list, cues: list, segments: list, fps: float,
                grace_s: float = GRACE_S) -> dict:
     graceful = int(round(grace_s * fps))
@@ -384,7 +396,7 @@ def score_clip(recs: list, cues: list, segments: list, fps: float,
 
     # Entering: segment start (the recorder's prompt) -> first box. Leaving: last
     # box in the out segment (the object actually gone) -> "lost".
-    detect, lost, cue_d, stale = [], [], [], 0
+    detect, lost, cue_d, cue_p, stale = [], [], [], [], 0
     gone_at = {}
     for k, (label, a, b) in enumerate(segments):
         prev_label = segments[k - 1][0] if k else None
@@ -392,8 +404,16 @@ def score_clip(recs: list, cues: list, segments: list, fps: float,
         if label in IN_VIEW and prev_label in (None, "out"):
             hit = next((r for r in rows if r["box"]), None)
             detect.append((hit["i"] - a) / fps if hit else (b - a + 1) / fps)
-            first = next((t for t, _, _ in cues if a / fps <= t <= (b + 1) / fps), None)
-            cue_d.append(first - a / fps if first is not None else (b - a + 1) / fps)
+            # first cue that points the right way for this segment (a "lost" buzz or
+            # a repeat toward the wrong side doesn't count as finding it)
+            first = next((t for t, kind, motor in cues if a / fps <= t <= (b + 1) / fps
+                          and _cue_matches(label, kind, motor)), None)
+            cue_p.append(first - a / fps if first is not None else (b - a + 1) / fps)
+            if hit is not None:   # entering = the first frame the object is detected
+                t_in = hit["i"] / fps
+                first = next((t for t, kind, motor in cues if t_in <= t <= (b + 1) / fps
+                              and _cue_matches(label, kind, motor)), None)
+                cue_d.append(first - t_in if first is not None else (b + 1) / fps - t_in)
         if label == "out" and prev_label in IN_VIEW:
             lost_r = next((r for r in rows if r["state"] == "lost"), None)
             upto = lost_r["i"] if lost_r else b + 1
@@ -417,13 +437,14 @@ def score_clip(recs: list, cues: list, segments: list, fps: float,
         "frames": len(recs), "seen": seen, "side_acc": _pct(side_ok, side_n),
         "detect_s": round(median(detect), 2) if detect else None,
         "cue_s": round(median(cue_d), 2) if cue_d else None,
+        "cue_prompt_s": round(median(cue_p), 2) if cue_p else None,
         "false_out": _pct(out_box, out_n),
         "flips_min": round(flips / (held_s / 60), 2) if held_s else None,
         "lost_s": round(median(lost), 2) if lost else None,
         "wrong_cue": _pct(dir_bad, dir_n) if dir_n else None,
         "stale_cues": stale,
         "det_fps": _fps(recs),
-        "_counts": {"cue": cue_d, "det_s": sum(r.get("dt", 0) for r in recs), "n": len(recs),"inview": len(inview), "seen": sum(r["box"] for r in inview),
+        "_counts": {"cue": cue_d, "cue_p": cue_p, "det_s": sum(r.get("dt", 0) for r in recs), "n": len(recs),"inview": len(inview), "seen": sum(r["box"] for r in inview),
                     "side_n": side_n, "side_ok": side_ok, "flips": flips, "held_s": held_s,
                     "out_n": out_n, "out_box": out_box, "detect": detect, "lost": lost,
                     "dir_n": dir_n, "dir_bad": dir_bad, "stale": stale},
@@ -447,6 +468,8 @@ def combine(per_clip: list, is_open: Optional[list] = None) -> dict:
     split["det_fps"] = round(sum(s["_counts"]["n"] for s in per_clip) / det_s, 1) if det_s else None
     cue = [x for s in per_clip for x in s["_counts"]["cue"]]
     split["cue_s"] = round(median(cue), 2) if cue else None
+    cue_p = [x for s in per_clip for x in s["_counts"].get("cue_p", [])]
+    split["cue_prompt_s"] = round(median(cue_p), 2) if cue_p else None
     c = {k: 0 for k in ("inview", "seen", "side_n", "side_ok", "flips", "held_s", "out_n",
                         "out_box", "dir_n", "dir_bad")}
     detect, lost = [], []
@@ -626,7 +649,8 @@ def report(res: dict) -> str:
             if "error" in r:
                 lines.append(f"  clip {r['object']}: ERROR {r['error']}")
             else:
-                lines.append("  clip {object:12} seen {seen}%  side {side_acc}%  cue {cue_s}s  "
+                lines.append("  clip {object:12} seen {seen}%  side {side_acc}%  cue {cue_s}s "
+                             "(from prompt {cue_prompt_s}s)  "
                              "false {false_out}%  flips {flips_min}/min  lost {lost_s}s  "
                              "wrong {wrong_cue}%  stale cues {stale_cues}".format(**r))
     lines.append("")
