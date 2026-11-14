@@ -100,21 +100,24 @@ def test_without_live_mode_play_never_moves_the_tour(monkeypatch):
 
 
 def test_driven_tour_routes_through_the_scan_points_in_between():
-    """Matterport links far-apart scan points directly (one 12 m hop here): a
-    driven tour would jump. Weighting by distance squared keeps the chain."""
+    """Matterport links far-apart scan points directly (one 11.5 m hop here,
+    a little shorter than the chain): a driven tour would jump. Weighting by
+    distance squared keeps the chain of scan points."""
     from tools.costar_nav import build_twin
-    t = long_twin()
-    m = {"name": "corridor", "floors": [], "rooms": [{"id": "R", "classifications": [{"label": "Office"}],
-                                                       "boundary": {"edges": []}}],
-         "panoLocations": [{"id": p.id, "label": p.id, "position": {"x": p.x, "y": p.y, "z": 0}}
-                           for p in t.panos.values()],
-         "locations": [{"id": "P4", "room": {"id": "R"}, "neighbors": ["P3", "P0"]},
-                       {"id": "P3", "neighbors": ["P2", "P4"]}, {"id": "P2", "neighbors": ["P1", "P3"]},
-                       {"id": "P1", "neighbors": ["P0", "P2"]}, {"id": "P0", "neighbors": ["P1", "P4"]}]}
-    twin = build_twin(m)                                 # P0 -> P4 directly is 12.4 m
+    pts = {"P0": (0, 0), "P1": (0.5, 4), "P2": (0.5, 8), "P3": (0, 11.5), "P4": (3, 11.5)}
+    nb = {"P0": ["P1", "P3"], "P1": ["P0", "P2"], "P2": ["P1", "P3"], "P3": ["P2", "P4", "P0"],
+          "P4": ["P3"]}
+    twin = build_twin({
+        "name": "corridor", "floors": [],
+        "rooms": [{"id": "R", "classifications": [{"label": "Office"}], "boundary": {"edges": []}}],
+        "panoLocations": [{"id": k, "label": k, "position": {"x": x, "y": y, "z": 0}}
+                          for k, (x, y) in pts.items()],
+        "locations": [{"id": k, "neighbors": v, **({"room": {"id": "R"}} if k == "P4" else {})}
+                      for k, v in nb.items()]})
     rp = RoutePlayer(twin, play=lambda c: None, threaded=False)
     rp.plan("P0", "office")
-    assert [L["subs"] for L in rp.legs] == [[]]          # one hop, nothing in between
+    assert rp.legs[0]["end"] == "P3" and rp.legs[0]["subs"] == []     # one 11.5 m hop
     rp.short_hops = True
     rp.plan("P0", "office")
     assert [p for p, _, _ in rp.legs[0]["subs"]] == ["P1", "P2"]
+    assert round(sum(s.metres for s in rp.steps)) == 15                # barely longer
