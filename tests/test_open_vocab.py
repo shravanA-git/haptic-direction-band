@@ -134,3 +134,12 @@ def test_confirm_needs_hits_in_a_row():
 def test_spoken_requests_without_find(text, want):
     from app.speech import match_target
     assert match_target(text) == want
+
+
+def test_top_edge_sliver_is_not_a_target():
+    tr = V.TargetTracker()
+    tr.set_target("cap", 0.1)
+    hair = [(200, 0, 330, 60, 0.3)]                              # 60 px of 480 at the top edge
+    assert tr.update(hair, 640, 0.0, frame_height=480).state == "searching"
+    held = [(200, 0, 330, 200, 0.3)]                             # a real cap held high
+    assert tr.update(held, 640, 0.1, frame_height=480).state != "searching"
