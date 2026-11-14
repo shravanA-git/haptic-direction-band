@@ -3,7 +3,7 @@
   python -m tools.bench                 # auto-detect port, interactive
   python -m tools.bench --port /dev/cu.usbserial-0001 --gate
 Interactive commands: `p <motor> [ms]`, `s` (STOP), `q`. Incoming lines are printed.
---gate runs: PULSE 0 150, wait 1 s, PULSE 0 1500, STOP after 300 ms, then asks you.
+--gate runs: PULSE 0 150, wait 1 s, PULSE 0 1000, STOP after 300 ms, then asks you.
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def main(argv=None) -> int:
         if a.gate:
             link.pulse(0, 150)
             time.sleep(1.0)
-            link.pulse(0, 1500)
+            link.pulse(0, 1000)
             time.sleep(0.3)
             link.stop()
             ok = input("Did motor 0 buzz briefly, then a long buzz cut short by STOP? [y/n] ")

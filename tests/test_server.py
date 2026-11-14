@@ -99,6 +99,6 @@ def test_vision_decisions_drive_band_and_action_pauses():
             await ws.close()
         link.close()
         assert port.sent[:3] == ["PULSE 6 200", "PULSE 0 100", "PULSE 0 100"]
-        assert "PULSE 4 400" not in port.sent
+        assert "PULSE 0 600" not in port.sent
 
     asyncio.run(run())

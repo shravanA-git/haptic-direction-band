@@ -20,7 +20,7 @@ from typing import Callable, Optional, Union
 
 BAUD = 115200
 NUM_MOTORS = 8
-MAX_PULSE_MS = 2000  # laptop-side cap; firmware enforces its own
+MAX_PULSE_MS = 1000  # laptop-side cap (matches proposed firmware cap)
 
 
 # ---------------------------------------------------------------- messages

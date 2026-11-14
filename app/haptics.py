@@ -20,8 +20,8 @@ DIRECTIONAL_MS = 200
 GENERIC_MS = 300
 TEST_MS = 150
 CENTERED_PULSE_MS = 100   # PROVISIONAL
-CENTERED_GAP_MS = 120     # PROVISIONAL
-LOST_STEPS = [(0, 4, 400)]  # PROVISIONAL: one long back pulse
+CENTERED_GAP_MS = 100     # PROVISIONAL (HDB-Protocol suggestion, not agreed)
+LOST_STEPS = [(0, FRONT, 600)]  # PROVISIONAL (HDB-Protocol suggestion, not agreed)
 
 # A cue is a list of (offset_ms, motor, duration_ms).
 Cue = list
