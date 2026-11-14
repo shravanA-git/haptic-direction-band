@@ -26,6 +26,9 @@ CENTERED_GAP_MS = 100     # PROVISIONAL (HDB-Protocol suggestion, not agreed)
 LOST_STEPS = [(0, FRONT, 600)]  # PROVISIONAL (HDB-Protocol suggestion, not agreed)
 # Teach a Sound: a sweep around the cardinals, so it can't be read as a side.
 SOUND_STEPS = [(0, 0, 80), (120, 2, 80), (240, 4, 80), (360, 6, 80)]  # PROVISIONAL
+# Hold-to-talk feedback for a wearer who can't see the dashboard.
+ACK_STEPS = [(0, 6, 120), (0, 2, 120)]                    # PROVISIONAL: "got it, searching"
+UNKNOWN_STEPS = [(0, 4, 80), (160, 4, 80), (320, 4, 80)]  # PROVISIONAL: "can't look for that"
 
 # A cue is a list of (offset_ms, motor, duration_ms).
 Cue = list
@@ -50,6 +53,16 @@ def lost() -> Cue:
 
 def taught_sound() -> Cue:
     return list(SOUND_STEPS)
+
+
+def target_ack() -> Cue:
+    """Target set: both sides at once, not readable as a direction."""
+    return list(ACK_STEPS)
+
+
+def target_unknown() -> Cue:
+    """Didn't understand / not an object we can look for."""
+    return list(UNKNOWN_STEPS)
 
 
 def test_pulse(motor: int) -> Cue:

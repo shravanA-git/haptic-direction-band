@@ -99,7 +99,8 @@ def test_vision_decisions_drive_band_and_action_pauses():
             fv.cb(D(state="lost", target="banana"))   # suppressed while held
             await ws.close()
         link.close()
-        assert port.sent[:3] == ["PULSE 6 200", "PULSE 0 100", "PULSE 0 100"]
+        assert sorted(port.sent[:2]) == ["PULSE 2 120", "PULSE 6 120"]   # typed target: "got it"
+        assert port.sent[2:5] == ["PULSE 6 200", "PULSE 0 100", "PULSE 0 100"]
         assert "PULSE 0 600" not in port.sent
 
     asyncio.run(run())

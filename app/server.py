@@ -112,18 +112,30 @@ class App:
         speech.on_result = self._on_speech
 
     def _on_speech(self, r) -> None:
+        """Hold-to-talk result. The wearer may not see the dashboard, so every
+        outcome also buzzes: "got it, searching" or "can't look for that"."""
         if getattr(r, "error", None):
             self.emit({"type": "log", "text": f"speech: {r.error} (typed Find box still works)"})
+            self.notify.cue("find", "unknown", reason=r.error)
             return
         self.state["heard"] = r.text or "–"
         self.emit({"type": "state", **self.state})
         if not r.target:
             self.emit({"type": "log", "text": f"heard \"{r.text}\": no known object; type it in Find"})
+            self.notify.cue("find", "unknown", heard=r.text, reason="no known object")
         elif self.vision:
             cls = self.vision.set_target(r.target)
             self.emit({"type": "log", "text": f"heard \"{r.text}\" -> target {cls or r.target}"})
+            self._target_feedback(cls, heard=r.text)
         else:
             self.emit({"type": "log", "text": f"heard target {r.target}, but vision isn't running"})
+            self.notify.cue("find", "unknown", heard=r.text, reason="vision not running")
+
+    def _target_feedback(self, cls, **detail) -> None:
+        if cls:
+            self.notify.cue("find", "ack", target=cls, **detail)
+        else:
+            self.notify.cue("find", "unknown", reason="not a known class", **detail)
 
     def attach_names(self, listener) -> None:
         """listener: app.speech.NameListener (or anything with on_hit,
@@ -262,7 +274,7 @@ class App:
             self.link.pulse(int(m["motor"]), int(m.get("ms", haptics.TEST_MS)))
         elif cmd == "cue":
             name = m.get("name")
-            if name in ("generic", "centered", "lost", "sound"):
+            if name in ("generic", "centered", "lost", "sound", "ack", "unknown"):
                 self.notify.cue("manual", name)
             else:
                 self.notify.cue("manual", "directional", int(m.get("motor", 0)))
@@ -326,7 +338,10 @@ class App:
         elif cmd == "target":
             if not self.vision:
                 return {"type": "log", "text": "vision not running (start with --target)"}
-            cls = self.vision.set_target(m.get("name") or None)
+            typed = (m.get("name") or "").strip()
+            cls = self.vision.set_target(typed or None)
+            if typed:
+                self._target_feedback(cls, typed=typed)
             return {"type": "log", "text": f"target: {cls or 'none (not a known class)'}"}
         elif cmd == "state":  # vision/speech status from other code paths
             self.state.update({k: m[k] for k in ("object", "name", "heard", "sound") if k in m})

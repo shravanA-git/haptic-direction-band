@@ -23,7 +23,8 @@ def pattern(cue: str, motor: Optional[int] = None) -> list:
             raise ValueError("directional cue needs a motor")
         return haptics.directional(motor)
     return {"generic": haptics.generic_attention, "centered": haptics.centered,
-            "lost": haptics.lost, "sound": haptics.taught_sound}[cue]()
+            "lost": haptics.lost, "sound": haptics.taught_sound,
+            "ack": haptics.target_ack, "unknown": haptics.target_unknown}[cue]()
 
 
 class Notifier:

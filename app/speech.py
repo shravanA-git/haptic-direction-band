@@ -92,7 +92,12 @@ _VOCAB = {c: c for c in COCO_CLASSES}
 _VOCAB.update(SYNONYMS)
 # Common mishearings of short demo words.
 _VOCAB.update({"bananas": "banana", "banan": "banana", "nana": "banana",
-               "cellphone": "cell phone", "cop": "cup"})
+               "cellphone": "cell phone", "cop": "cup",
+               "coffee": "cup", "macbook": "laptop", "mac book": "laptop"})
+# Things people ask for that the detector can't see. Matched before the
+# singular forms, so "glasses" doesn't become "glass" -> cup.
+_UNKNOWN = {"glasses", "eyeglasses", "eye glasses", "spectacles", "sunglasses",
+            "sun glasses", "reading glasses", "specs"}
 
 
 def match_target(text: str) -> Optional[str]:
@@ -111,8 +116,14 @@ def match_target(text: str) -> Optional[str]:
 
 
 def _scan(words: list[str]) -> Optional[str]:
-    for n in (3, 2, 1):
+    blocked = set()   # positions inside an _UNKNOWN phrase; longer phrases are tried
+    for n in (3, 2, 1):  # first, so "wine glasses" still finds "wine glass"
         for i in range(len(words) - n + 1):
+            if blocked.intersection(range(i, i + n)):
+                continue
+            if " ".join(words[i:i + n]) in _UNKNOWN:
+                blocked.update(range(i, i + n))
+                continue
             phrase = words[i:i + n]
             for last in _singular(phrase[-1]):
                 key = " ".join(phrase[:-1] + [last])
