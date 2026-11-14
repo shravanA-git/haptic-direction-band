@@ -8,11 +8,13 @@ timestamps to ESP32 ms comes later (ClockSync below is the hook).
 """
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from statistics import median
 from typing import Optional, Sequence
 
@@ -40,8 +42,27 @@ def _baseline(frames: Sequence[dict], start: int, end: int):
     return [max(median(ch), 1e-6) for ch in zip(*quiet)]
 
 
-def estimate(frames: Sequence[dict], start_ms: int, end_ms: int) -> Estimate:
+CALIBRATION_FILE = Path(__file__).resolve().parent / "calibration.json"
+
+
+def load_calibration(path=CALIBRATION_FILE) -> Optional[list]:
+    """Per-channel sensitivity correction (front, right, back, left) written by
+    `python -m tools.calibrate --save`. Absent file -> None (no correction)."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    g = json.loads(path.read_text())["gains"]
+    if len(g) != 4 or not all(0.2 <= float(x) <= 5 for x in g):
+        raise ValueError(f"bad calibration gains {g}")
+    return [float(x) for x in g]
+
+
+def estimate(frames: Sequence[dict], start_ms: int, end_ms: int,
+             gains: Optional[Sequence[float]] = None) -> Estimate:
+    """gains: optional per-channel sensitivity correction from tools/calibrate.py,
+    applied to each channel's excess over its baseline."""
     base = _baseline(frames, start_ms, end_ms)
+    g = list(gains) if gains is not None else [1.0, 1.0, 1.0, 1.0]
     win = [f["levels"] for f in frames if start_ms <= f["ms"] <= end_ms]
     if not win:
         return Estimate(None, None, 0.0, 0.0, 0, "no frames in window (stale?)")
@@ -50,7 +71,7 @@ def estimate(frames: Sequence[dict], start_ms: int, end_ms: int) -> Estimate:
     for lv in win:
         # DC removal + gain match: excess over each channel's own baseline,
         # in units of that baseline.
-        e = [max(v / b - 1.0, 0.0) for v, b in zip(lv, base)]
+        e = [max(v / b - 1.0, 0.0) * k for v, b, k in zip(lv, base, g)]
         f, r, b, l = e
         total = f + r + b + l
         if total / 4 < MIN_LOUDNESS:
@@ -107,8 +128,9 @@ class LiveEstimator:
     """
 
     def __init__(self, keep_ms: int = 8000, pad_ms: int = 100, stale_s: float = 1.0,
-                 clock: Optional[ClockSync] = None):
+                 clock: Optional[ClockSync] = None, gains: Optional[Sequence[float]] = None):
         self.keep_ms, self.pad_ms, self.stale_s = keep_ms, pad_ms, stale_s
+        self.gains = gains          # from load_calibration(); None = uncorrected
         self.clock = clock or ClockSync()
         self._frames: deque = deque()
         self._last_rx = 0.0
@@ -146,4 +168,4 @@ class LiveEstimator:
             return Estimate(None, None, 0.0, 0.0, 0, "no MIC frames (band not streaming)"), None
         if now - last_rx > self.stale_s:
             return Estimate(None, None, 0.0, 0.0, 0, f"MIC stream stale ({now - last_rx:.1f} s)"), win
-        return estimate(frames, *win), win
+        return estimate(frames, *win, gains=self.gains), win

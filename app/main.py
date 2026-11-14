@@ -19,7 +19,7 @@ import time
 
 from aiohttp import web
 
-from . import trace
+from . import direction, trace
 from .link import Link, SerialPort, SimPort, find_esp32_port, load_motor_map
 from .recall import AlertLog
 from .server import App, RECORDINGS
@@ -66,6 +66,12 @@ def main(argv=None) -> int:
     link = Link(port, motor_map=motor_map).start()
     alert_path = RECORDINGS / time.strftime("alerts-%Y%m%d-%H%M%S.jsonl")
     app = App(link, AlertLog(alert_path), recall_mode=a.recall)
+    try:
+        app.live.gains = direction.load_calibration()
+        if app.live.gains:
+            print(f"[hdb] mic calibration from app/calibration.json: gains {app.live.gains}")
+    except (ValueError, KeyError) as e:
+        print(f"[hdb] ignoring app/calibration.json: {e}")
     vision = guide = None
     if a.target is not None or a.vision:
         from .guide import ObjectGuide
