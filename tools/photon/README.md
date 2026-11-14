@@ -36,9 +36,14 @@ Tests (no network): `node --test tools/photon/bridge.test.mjs`, also run by `pyt
 
 ## Notes
 
-* Receiving uses socket.io to `/v1/projects/{id}/events/ws`; the resume cursor (`metadata.seq`) is saved
-  to `tools/photon/.cursor.json` (gitignored) only after an event was handled, and replays are skipped.
-* The incoming event is read from `event.data.message`, `event.message`, `event.data` or `event` (the
-  message has `status: "received"`, `sentBy.handle`, `space.id`, `receivedBy.id`). Verified against the SDK
-  types, not yet against a live line: if no text arrives, log one raw `delivery` event and adjust
-  `messageOf` in `bridge-core.mjs`.
+* Receiving is POLLING: every ~2 s `listMessages({direction: 'received', createdSince, order: 'asc'})`
+  (backs off on 429 using Retry-After). A fresh start begins 60 s back so old texts are not answered;
+  the newest `createdAt` is saved to `tools/photon/.cursor.json` (gitignored) after each handled page.
+  Messages are deduped by id. The websocket (`/v1/projects/{id}/events/ws`) stays on as an optional extra
+  (a probe on the real project acked a subscribe but delivered nothing); both paths share the dedupe.
+* To see why a text got no reply: the bridge logs `[photon] inbound from +1***01` to the terminal, the app
+  logs `[band-agent] ignored a text from ... (not on the allowlist ...)`, and the dashboard (Settings)
+  shows received / ignored / answered / failed to send / last error.
+* A message is read as `status: "received"`, `sentBy.handle`, `space.id`, `receivedBy.id`, `content.text`
+  (matches a masked REST probe of the real project). Websocket events are unwrapped from `event.data.message`,
+  `event.message`, `event.data` or `event` by `messageOf` in `bridge-core.mjs`.

@@ -6,6 +6,7 @@
 //   out: {"id": 3, "ok": true}   or   {"id": 3, "ok": false, "error": "..."}
 //   out: {"ready": true}  /  {"ready": false, "error": ...}
 //   out: {"inbound": true, "from": "+15551234567", "text": "status"}
+//        found by polling listMessages every ~2 s (websocket events are an optional extra)
 //
 // Credentials only from the environment (never the repo, never printed):
 //   PHOTON_PROJECT_ID   the project id (pho_prj_...)
@@ -36,8 +37,11 @@ try {
     transports: ["websocket"],
     extraHeaders: auth,
   });
-  core = createBridge({ photon, socket, projectId, out, cursorPath: path.join(here, ".cursor.json") });
-  core.wire();
+  const log = (line) => process.stderr.write(`[photon] ${line}\n`);
+  core = createBridge({ photon, socket, projectId, out, log, poll: true,
+                        cursorPath: path.join(here, ".cursor.json") });
+  core.wire();                 // optional websocket events (deduped against polling)
+  core.startPolling();         // primary inbound path
 } catch (e) {
   out({ ready: false, error: String(e && e.message ? e.message : e).replace(/pho_sk_\w+/g, "pho_sk_***") });
   process.exit(2);

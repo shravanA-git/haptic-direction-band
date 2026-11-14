@@ -53,3 +53,28 @@ def test_photon_sender_gets_inbound_and_sends_through_a_bridge_process(tmp_path)
     ok, err = s.send("+15550009999", "hello?")
     assert not ok and "text the agent first" in err                  # the caregiver alert degrades, no crash
     s.close()
+
+
+def test_photon_sender_counts_received_and_sent(tmp_path):
+    import sys
+    import threading
+
+    from app.notify import PhotonSender
+    fake = tmp_path / "fake_bridge2.py"
+    fake.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'ready': True}), flush=True)\n"
+        "print(json.dumps({'inbound': True, 'from': '+15550000001', 'text': 'a'}), flush=True)\n"
+        "print(json.dumps({'inbound': True, 'from': '+15550000001', 'text': 'b'}), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    m = json.loads(line)\n"
+        "    ok = m['text'] != 'bad'\n"
+        "    print(json.dumps({'id': m['id'], 'ok': ok, **({} if ok else {'error': 'HTTP 403 nope'})}), flush=True)\n")
+    n, evt = [], threading.Event()
+    s = PhotonSender(node=sys.executable, bridge=fake, timeout_s=5)
+    s.on_message(lambda f, t: (n.append(t), len(n) == 2 and evt.set()))
+    assert evt.wait(5)
+    s.send("+15550000001", "fine")
+    s.send("+15550000001", "bad")
+    assert s.stats() == {"received": 2, "sent_ok": 1, "sent_failed": 1, "last_error": "HTTP 403 nope"}
+    s.close()

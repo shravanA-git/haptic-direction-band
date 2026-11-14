@@ -280,3 +280,33 @@ def test_allowlist_accepts_phones_and_iMessage_emails_in_any_format():
     assert svc.drain() and svc.handled == 1 and svc.ignored == 1
     assert snd.sent[0][0] == "sam@example.COM"                  # answered at the address it came from
     svc.close()
+
+
+def test_service_status_counts_why_a_text_got_no_reply(capsys):
+    class Counting(FakeSender):
+        def stats(self):
+            return {"received": 3, "sent_ok": 1, "sent_failed": 1, "last_error": "no conversation yet"}
+    log, tools = seeded()
+    snd = Counting()
+    svc = B.AgentService(B.BandAgent(tools, offline=True), snd, ["+15550000001"], log).start()
+    snd.handlers[0]("+15559998888", "status")          # a stranger
+    snd.handlers[0]("+15550000001", "status")
+    assert svc.drain()
+    st = svc.status()
+    assert st["received"] == 3 and st["ignored"] == 1 and st["replied"] == 1 and st["allowed"] == 1
+    assert st["sent_failed"] == 1 and st["last_error"] == "no conversation yet" and st["last_inbound"]
+    err = capsys.readouterr().err
+    assert "ignored a text from" in err and "not on the allowlist" in err and "text from" in err
+    assert "+15559998888" not in err and "+15550000001" not in err          # numbers are masked in logs
+    svc.close()
+
+
+def test_app_status_carries_the_agent_counters():
+    from app.link import Link, SimPort
+    from app.server import App
+    link = Link(SimPort()).start()
+    app = App(link)
+    assert app.status()["agent"] is None
+    app.agent_status = lambda: {"brain": "keyword router", "received": 2}
+    assert app.status()["agent"] == {"brain": "keyword router", "received": 2}
+    link.close()

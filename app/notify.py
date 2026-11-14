@@ -142,6 +142,11 @@ class PhotonSender:
         self._next = 1
         self.error: Optional[str] = None
         self._on_message: list = []
+        self.received = self.sent_ok = self.sent_failed = 0     # for the app status / dashboard
+
+    def stats(self) -> dict:
+        return {"received": self.received, "sent_ok": self.sent_ok,
+                "sent_failed": self.sent_failed, "last_error": self.error}
 
     def on_message(self, fn) -> None:
         """fn(sender, text) for each incoming text (band agent). Starts the bridge now so
@@ -161,7 +166,8 @@ class PhotonSender:
 
     def _start(self) -> None:
         self._p = subprocess.Popen([self.node, str(self.bridge)], stdin=subprocess.PIPE,
-                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=None,       # the bridge's [photon] log lines show in the terminal
+                                   
                                    text=True, bufsize=1, cwd=str(self.bridge.parent))
         ready = self._p.stdout.readline()
         try:
@@ -181,6 +187,7 @@ class PhotonSender:
             except ValueError:
                 continue
             if r.get("inbound"):
+                self.received += 1
                 for fn in list(self._on_message):
                     try:
                         fn(str(r.get("from") or ""), str(r.get("text") or ""))
@@ -201,14 +208,18 @@ class PhotonSender:
                 self._p.stdin.flush()
             except Exception as e:
                 self.error = str(e)
+                self.sent_failed += 1
                 return False, self.error
         with self._cv:
             self._cv.wait_for(lambda: mid in self._replies, timeout=self.timeout_s)
             r = self._replies.pop(mid, None)
         if r is None:
             self.error = "no reply from Photon bridge (timeout)"
+            self.sent_failed += 1
             return False, self.error
         self.error = None if r.get("ok") else r.get("error")
+        self.sent_ok += bool(r.get("ok"))
+        self.sent_failed += not r.get("ok")
         return bool(r.get("ok")), self.error
 
     def close(self) -> None:

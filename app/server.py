@@ -262,6 +262,8 @@ class App:
         self.alerts.subscribe(caregiver)
         caregiver.on_status(lambda st: self.emit({"type": "caregiver", **st}))
 
+    agent_status = None              # set by main when --agent is on: callable -> counters dict
+
     def caregiver_test(self) -> dict:
         if not self.caregiver:
             return {"type": "log", "text": "caregiver texting not set up"}
@@ -626,7 +628,8 @@ class App:
                 "connected": self.link.connected(), "error": self.link.error,
                 "frames": self.link.frames_rx, "recording": self.recorder.active,
                 "health": self.link.health(), "faults": dict(self.faults),
-                "motors": list(haptics.ACTIVE) if haptics.ACTIVE is not None else list(range(8))}
+                "motors": list(haptics.ACTIVE) if haptics.ACTIVE is not None else list(range(8)),
+                "agent": self.agent_status() if self.agent_status else None}
 
     # ------------------------------------------------------------- watchdog
     VISION_STALL_S = 2.0      # no camera frame this long -> fault, target treated as lost

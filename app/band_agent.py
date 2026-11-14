@@ -47,6 +47,7 @@ import argparse
 import os
 import queue
 import re
+import sys
 import threading
 import time
 from collections import deque
@@ -476,7 +477,7 @@ class BandAgent:
 # Service: texts in, replies out, urgent alerts out
 # ---------------------------------------------------------------------------
 
-from .notify import norm_handle        # noqa: E402  (phones by digits, emails lowercased)
+from .notify import mask_phone, norm_handle        # noqa: E402  (phones by digits, emails lowercased)
 
 
 class AgentService:
@@ -493,6 +494,7 @@ class AgentService:
         self._last_urgent: dict = {}
         self._urgent_times: deque = deque()
         self.ignored = self.handled = self.proactive = 0
+        self.last_inbound: Optional[str] = None
         self._stop = threading.Event()
         if alerts is not None:
             alerts.subscribe(self.on_alert)          # only enqueues: never blocks the buzz path
@@ -502,13 +504,26 @@ class AgentService:
 
     # -- inbound
     def on_text(self, sender: str, text: str) -> None:
+        self.last_inbound = time.strftime("%H:%M:%S")
         if norm_handle(sender) not in self.allow:
             self.ignored += 1                         # not on the list: no reply, not even "no"
+            print(f"[band-agent] ignored a text from {mask_phone(sender)} (not on the allowlist: "
+                  "WEARER_PHONE / CAREGIVER_PHONE)", file=sys.stderr, flush=True)
             return
+        print(f"[band-agent] text from {mask_phone(sender)}", file=sys.stderr, flush=True)
         try:
             self._q.put_nowait(("text", sender, text))
         except queue.Full:
             pass
+
+    def status(self) -> dict:
+        """Why did a text get no reply? Counters for the app status and the dashboard."""
+        s = self.sender.stats() if hasattr(self.sender, "stats") else {}
+        return {"brain": self.agent.brain, "allowed": len(self.allow),
+                "received": s.get("received", self.handled + self.ignored), "ignored": self.ignored,
+                "replied": self.handled, "sent_ok": s.get("sent_ok"), "sent_failed": s.get("sent_failed"),
+                "proactive": self.proactive, "last_inbound": self.last_inbound,
+                "last_error": s.get("last_error") or self.agent.error}
 
     # -- proactive
     def urgent_kind(self, rec: dict) -> Optional[str]:
@@ -603,6 +618,7 @@ def from_app(app, caregiver, vision=None, offline: bool = False) -> Optional[Age
                        caregiver_on=lambda: app.settings.caregiver_texts == "on")
     print(f"[hdb] band agent: {agent.brain}" + (f" ({agent.error})" if agent.error else "")
           + f"; answers {len(svc.allow)} configured number(s)")
+    app.agent_status = svc.status                      # counters in the app status / dashboard
     if not hasattr(caregiver.sender, "on_message"):
         print("[hdb] band agent: texting is a dry run (no Photon credentials): no texts in or out")
     return svc.start()

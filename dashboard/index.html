@@ -296,6 +296,7 @@
           <button type="button" class="toggle" id="cgtoggle" title="text the caregiver about name calls, found objects, taught sounds">Off</button>
           <button type="button" id="cgtest">Send test text</button></div>
         <p class="note" id="cgstatus"></p>
+        <p class="note" id="agentstatus" title="why a text got no reply"></p>
       </div>
     </details>
     <details>
@@ -720,6 +721,10 @@ function connect() {
         }
         $("frames").textContent = m.frames;
         showMotors(m.motors);
+        { const a = m.agent;
+          $("agentstatus").textContent = a ? `Text agent (${a.brain}): ${a.received} received, ${a.ignored} ignored (not on the list), ` +
+            `${a.replied} answered, ${a.sent_failed ?? 0} failed to send` + (a.last_inbound ? `, last text ${a.last_inbound}` : "") +
+            (a.last_error ? `. Last error: ${a.last_error}` : ".") : ""; }
         {
           const fl = Object.values(m.faults || {});
           $("faults").style.display = fl.length ? "block" : "none";
