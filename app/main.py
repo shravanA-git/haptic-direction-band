@@ -6,6 +6,7 @@
   python -m app.main --sim --trace tests/fixtures/back_left.json --loop
   python -m app.main --target banana      # webcam find-an-object cues on the band
   python -m app.main --vision             # webcam + hold Action, say "find the banana"
+  python -m app.main --sim --vision --mirror   # laptop's own camera facing you
 Then open http://localhost:8765
 """
 from __future__ import annotations
@@ -30,6 +31,8 @@ def main(argv=None) -> int:
     ap.add_argument("--vision", action="store_true", help="start the webcam (no target yet)")
     ap.add_argument("--target", help="start the webcam and find this object, e.g. banana")
     ap.add_argument("--camera", type=int, default=0, help="webcam index")
+    ap.add_argument("--mirror", action="store_true",
+                    help="camera faces you (laptop webcam): swap left/right")
     ap.add_argument("--no-speech", action="store_true", help="with vision: typed target only")
     a = ap.parse_args(argv)
 
@@ -59,7 +62,7 @@ def main(argv=None) -> int:
         from .guide import ObjectGuide
         from .vision import Vision  # heavy import (YOLO); only when asked
         guide = ObjectGuide(lambda cue: haptics.play(cue, link.pulse)).start()
-        vision = Vision(camera=a.camera)
+        vision = Vision(camera=a.camera, mirror=a.mirror)
         app.attach_vision(vision, guide)
         vision.start()
         if a.target:
