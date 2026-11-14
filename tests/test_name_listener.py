@@ -140,3 +140,24 @@ def test_pause_resets_and_suppresses():
     nl.drain(5)
     assert nl.decodes == 0
     nl.stop()
+
+
+def test_continuous_chatter_keeps_decoding_through_a_louder_name():
+    # Room chatter never pauses; the name is a bit louder than the chatter. A floor
+    # from the last 3 s became the chatter itself and decoding stopped before the
+    # name was complete; the 30 s 10th-percentile floor keeps decoding through it.
+    rng = np.random.default_rng(1)
+    n = int(14 * SR)
+    t = np.arange(n) / SR
+    env = 0.5 + 0.5 * np.abs(np.sin(2 * np.pi * 2.5 * t))          # syllable-ish chatter
+    x = (0.08 * env * rng.standard_normal(n)).astype(np.float32)
+    m = (t >= 9.0) & (t < 10.0)
+    x[m] += (0.15 * np.sin(2 * np.pi * 300 * t[m])).astype(np.float32)
+    nl = NameListener(["Shravan"], transcriber=FakeTranscriber(FakeModel()))
+    ends = []
+    nl.process = lambda audio, t0: ends.append(t0 + len(audio) / SR - 100)
+    for i in range(0, n, 480):
+        nl.feed(x[i:i + 480], 100 + i / SR)
+    nl.drain(5)
+    nl.stop()
+    assert any(e >= 10.0 for e in ends), ends          # a window holding the whole name
