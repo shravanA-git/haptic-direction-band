@@ -40,6 +40,9 @@ Running it
     python -m app.vision --target banana --show          # webcam 0, live window
     python -m app.vision --target banana --source clip.mp4
     python -m app.vision --selftest                      # tracker logic, no camera/weights
+    python -m app.vision --target banana --show --log recordings/banana.csv   # tuning run
+        (also --dead-band, --dead-band-exit, --lost-after, --smoothing, --min-score)
+    python -m app.vision --analyze recordings/banana.csv  # gaps, jitter, suggested settings
 
 Weights (yolov8n.pt, ~6 MB) download at runtime into models/ (gitignored).
 """
@@ -264,8 +267,9 @@ class Detector:
 class Vision:
     def __init__(self, camera=0, mirror: bool = False, weights: str = "yolov8n.pt",
                  imgsz: int = 416, config: Optional[TrackerConfig] = None,
-                 max_fps: float = 15.0):
+                 max_fps: float = 15.0, log_path: Optional[str] = None):
         self.camera = camera
+        self.log_path = log_path  # per-frame CSV for tuning dead band / lost timing
         self.mirror = mirror
         self.weights = weights
         self.imgsz = imgsz
@@ -363,6 +367,9 @@ class Vision:
         period = 1.0 / self.max_fps if self.max_fps else 0
         last = time.monotonic()
         is_file = isinstance(self.camera, str) and not self.camera.isdigit()
+        log = open(self.log_path, "w") if self.log_path else None
+        if log:
+            log.write("t,target,n_boxes,raw_offset,raw_score,offset,confidence,state\n")
         try:
             while self._running:
                 ok, frame = cap.read()
@@ -386,6 +393,13 @@ class Vision:
                     d = self.tracker.update(boxes, frame.shape[1], t, self.mirror)
                 self._frame = annotate(frame, d, self.tracker.cfg, self.mirror)
                 self._publish(d)
+                if log:
+                    raw = _raw_best(boxes, frame.shape[1], self.mirror)
+                    log.write(f"{t:.3f},{target or ''},{len(boxes)},"
+                              f"{'' if raw is None else f'{raw[0]:.3f}'},"
+                              f"{'' if raw is None else f'{raw[1]:.2f}'},"
+                              f"{'' if d.offset is None else d.offset},"
+                              f"{d.confidence:.2f},{d.state}\n")
                 dt = time.monotonic() - last
                 self.fps = 0.8 * self.fps + 0.2 * (1.0 / dt if dt > 0 else 0)
                 last = time.monotonic()
@@ -393,7 +407,18 @@ class Vision:
                     time.sleep(period - dt)
         finally:
             cap.release()
+            if log:
+                log.close()
             self._running = False
+
+
+def _raw_best(boxes, width, mirror=False):
+    """(offset, score) of the highest-scoring raw box, unsmoothed; for tuning logs."""
+    if not boxes:
+        return None
+    x1, _, x2, _, score = max(boxes, key=lambda b: b[4])[:5]
+    off = (x1 + x2) / width - 1.0
+    return (-off if mirror else off, score)
 
 
 def annotate(frame, d: VisionDecision, cfg: TrackerConfig, mirror: bool = False):
@@ -470,6 +495,51 @@ def _selftest() -> None:
     print("vision selftest: OK")
 
 
+def analyze(path: str) -> dict:
+    """Summarize a --log CSV: detection gaps (-> lost_after_s), raw offset jitter
+    (-> dead band hysteresis) and how often the state flips."""
+    import csv
+    import statistics as st
+    rows = list(csv.DictReader(open(path)))
+    if len(rows) < 2:
+        return {"frames": len(rows)}
+    ts = [float(r["t"]) for r in rows]
+    gaps, start = [], None
+    for r, t in zip(rows, ts):
+        seen = int(r["n_boxes"]) > 0
+        if not seen and start is None:
+            start = t
+        elif seen and start is not None:
+            gaps.append(t - start)
+            start = None
+    raws = [float(r["raw_offset"]) if r["raw_offset"] else None for r in rows]
+    jitter = [abs(a - b) for a, b in zip(raws, raws[1:]) if a is not None and b is not None]
+    flips = sum(1 for a, b in zip(rows, rows[1:]) if a["state"] != b["state"])
+    dur = ts[-1] - ts[0]
+
+    def pct(xs, q):
+        xs = sorted(xs)
+        return round(xs[min(len(xs) - 1, int(q * len(xs)))], 3) if xs else None
+
+    short = [g for g in gaps if g < 3.0]  # longer gaps are the target really leaving
+    out = {
+        "frames": len(rows), "seconds": round(dur, 1),
+        "fps": round((len(rows) - 1) / dur, 1) if dur else None,
+        "seen_frac": round(sum(int(r["n_boxes"]) > 0 for r in rows) / len(rows), 2),
+        "flicker_gaps_s": {"n": len(short), "p50": pct(short, .5), "p95": pct(short, .95),
+                           "max": round(max(short), 3) if short else None},
+        "raw_jitter": {"p50": pct(jitter, .5), "p95": pct(jitter, .95)},
+        "state_flips_per_min": round(flips / dur * 60, 1) if dur else None,
+        "states": {k: sum(r["state"] == k for r in rows) for k in
+                   ("left", "right", "centered", "lost", "searching")},
+    }
+    if short:
+        out["suggest_lost_after_s"] = round(max(0.5, 1.5 * pct(short, .95)), 2)
+    if jitter:
+        out["suggest_hysteresis"] = round(min(0.12, max(0.04, 2 * pct(jitter, .9))), 2)
+    return out
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description="HDB vision: find a target in the front webcam")
     p.add_argument("--target", default="banana")
@@ -478,13 +548,28 @@ def main(argv=None) -> None:
     p.add_argument("--show", action="store_true", help="show an annotated window")
     p.add_argument("--imgsz", type=int, default=416)
     p.add_argument("--seconds", type=float, default=0, help="stop after N seconds (0 = forever)")
+    p.add_argument("--log", help="write a per-frame CSV here (for tuning)")
+    d = TrackerConfig()
+    p.add_argument("--dead-band", type=float, default=d.dead_band)
+    p.add_argument("--dead-band-exit", type=float, default=d.dead_band_exit)
+    p.add_argument("--lost-after", type=float, default=d.lost_after_s, help="seconds")
+    p.add_argument("--smoothing", type=float, default=d.smoothing)
+    p.add_argument("--min-score", type=float, default=d.min_score)
     p.add_argument("--selftest", action="store_true")
+    p.add_argument("--analyze", metavar="CSV", help="summarize a --log file and exit")
     a = p.parse_args(argv)
+    if a.analyze:
+        import json
+        print(json.dumps(analyze(a.analyze), indent=2))
+        return
     if a.selftest:
         _selftest()
         return
 
-    v = Vision(camera=a.source, mirror=a.mirror, imgsz=a.imgsz)
+    cfg = TrackerConfig(dead_band=a.dead_band, dead_band_exit=a.dead_band_exit,
+                        lost_after_s=a.lost_after, smoothing=a.smoothing,
+                        min_score=a.min_score)
+    v = Vision(camera=a.source, mirror=a.mirror, imgsz=a.imgsz, config=cfg, log_path=a.log)
     v.on_change(lambda d: print(f"{d.t:10.3f}  {d.state:9s} offset={d.offset} "
                                 f"conf={d.confidence:.2f}"))
     try:
