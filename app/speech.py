@@ -178,7 +178,7 @@ PROMPT = None
 
 class Speech:
     def __init__(self, on_result: Optional[Callable[[SpeechResult], None]] = None,
-                 model: str = DEFAULT_MODEL, device=None):
+                 model: str = DEFAULT_MODEL, device=None, preload: bool = True):
         self.on_result = on_result
         self.device = device            # sounddevice input device (None = default mic)
         self.transcriber = Transcriber(model)
@@ -189,6 +189,14 @@ class Speech:
         self.recording = False
         self.busy = False               # transcription in progress
         self.last: Optional[SpeechResult] = None
+        if preload:  # warm whisper in the background so the first Action press is fast
+            threading.Thread(target=self._preload, name="speech-load", daemon=True).start()
+
+    def _preload(self) -> None:
+        try:
+            self.transcriber.load()
+        except Exception as e:
+            print(f"[speech] model load failed: {e}")
 
     def load(self) -> "Speech":
         self.transcriber.load()
