@@ -31,15 +31,23 @@ def test_distance_from_box_height_and_clipping():
     assert A.obstacles([("chair", 300, 100, 340, 300, 0.2)], W, H) == []  # low score
 
 
-def test_far_obstacle_is_clear_and_close_centre_needs_two_frames_to_stop():
+def test_far_obstacle_is_clear_and_close_centre_needs_frames_in_a_row_to_stop():
     av = A.Avoider()
     assert av.update([box("person", 320, 4.0)], W, H, 0.0).action == "clear"
     av.reset()
     close = [("person", 200, 0, 440, H, 0.9)]                    # right in front, cut off
-    assert av.update(close, W, H, 0.0).action != "stop"           # one frame: not yet
-    d = av.update(close, W, H, 0.1)
+    for k in range(A.STOP_FRAMES - 1):
+        assert av.update(close, W, H, 0.1 * k).action != "stop"   # not yet
+    d = av.update(close, W, H, 1.0)
     assert d.action == "stop" and d.nearest.cls == "person" and d.changed
-    assert av.update([], W, H, 0.2).action != "stop"              # gone: warning ends
+    assert av.update([], W, H, 1.1).action != "stop"              # gone: warning ends
+
+
+def test_edge_hugging_box_is_ignored_unless_it_crosses_the_centre():
+    shoulder = [("person", 0, 0, 200, H, 0.9)]                   # wearer's own arm at the edge
+    assert A.obstacles(shoulder, W, H) == []
+    in_front = [("person", 0, 0, 400, H, 0.9)]                   # reaches past the centre
+    assert len(A.obstacles(in_front, W, H)) == 1
 
 
 def test_blocked_ahead_steers_to_the_open_side():
@@ -59,7 +67,7 @@ def test_goal_off_to_the_side_is_clear_even_if_centre_blocked():
 
 def test_everything_blocked_turns_toward_the_roomier_edge():
     av = A.Avoider()
-    wall = [box("couch", 100, 1.0), box("chair", 330, 1.1), ("chair", 450, 60, 640, 470, 0.9)]
+    wall = [box("couch", 100, 1.0), box("chair", 330, 1.1), ("chair", 300, 60, 640, 470, 0.9)]
     d = av.update(wall, W, H, 0.0)
     assert d.action == "turn" and d.motor in (A.TURN_LEFT, A.TURN_RIGHT)
     assert all(s == "blocked" for _, s, _ in d.sectors)
@@ -123,14 +131,16 @@ class FakeVision:
 def test_loop_warns_and_steers_without_a_target():
     v, played = FakeVision(), []
     loop = A.AvoidLoop(v, play=played.append)
+    loop.steer = True                                             # HDB_AVOID_STEER=1
     frame = np.zeros((H, W, 3), np.uint8)
     v.detector.dets = [("person", 200, 0, 440, H, 0.9)]
-    loop.step(frame, now=0.0)
-    loop.step(frame, now=0.1)
+    for k in range(A.STOP_FRAMES):
+        loop.step(frame, now=0.05 * k)
     assert played == [A.stop_cue()]
-    loop.step(frame, now=0.3)
+    t0 = 0.05 * (A.STOP_FRAMES - 1)
+    loop.step(frame, now=t0 + 0.2)
     assert len(played) == 1                                       # repeats every STOP_REPEAT_S
-    loop.step(frame, now=0.1 + A.STOP_REPEAT_S + 0.01)
+    loop.step(frame, now=t0 + A.STOP_REPEAT_S + 0.01)
     assert len(played) == 2
     loop.avoider.reset()
     v.detector.dets = [box("chair", 360, 1.1)]
@@ -147,6 +157,7 @@ def test_loop_warns_and_steers_without_a_target():
 def test_loop_uses_target_bearing_and_ignores_stale_decisions():
     v = FakeVision()
     loop = A.AvoidLoop(v, play=lambda c: None)
+    loop.steer = True
     v.d = SimpleNamespace(state="right", offset=0.9)
     v.detector.dets = [box("chair", 320, 1.1)]
     d = loop.step(np.zeros((H, W, 3), np.uint8), now=0.0)
@@ -220,3 +231,17 @@ def test_eval_avoid_scores_warn_time_and_false_warnings(tmp_path):
     assert m["steer_wrong"] in (None, 0.0)
     assert res["verdict"]["warn_s"] == "PASS" and "RESULT: PASS" in E.report(res)
     assert "SKIP" in E.report(E.evaluate(tmp_path / "none.json"))
+
+
+def test_default_is_crash_warning_only():
+    v, played = FakeVision(), []
+    loop = A.AvoidLoop(v, play=played.append)
+    assert loop.steer is False
+    frame = np.zeros((H, W, 3), np.uint8)
+    v.detector.dets = [box("chair", 360, 1.1)]                    # blocked, not crash-close
+    d = loop.step(frame, now=0.0)
+    assert d.action == "steer" and played == [] and loop.override(0.1) is None
+    v.detector.dets = [("person", 200, 0, 440, H, 0.9)]
+    for k in range(A.STOP_FRAMES + 1):
+        loop.step(frame, now=1 + 0.05 * k)
+    assert played == [A.stop_cue()] and loop.override(1.2).action == "stop"

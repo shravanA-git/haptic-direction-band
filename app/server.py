@@ -20,6 +20,9 @@ WebSocket, page -> server (JSON):
                                      add=true adds an example to that label)
   {"cmd":"forget_sound","label":"doorbell"?}   (no label: forget all)   {"cmd":"sounds"}
   {"cmd":"avoid","on":bool}          (obstacle avoidance on/off, with --avoid)
+HTTP GET /manifest.webmanifest, /icon.svg, /icon-{180,192,512}.png: "Add to
+  Home Screen" (full-screen app on a phone). With a LAN token (main --lan), every
+  other request from another device needs ?k=<token> once (then a cookie).
 HTTP GET /video: MJPEG (multipart/x-mixed-replace) of the vision camera's
   annotated frames (tracked box, dead band, "target: STATE"); 503 without vision.
 server -> page:
@@ -52,6 +55,40 @@ from .settings import Settings
 
 ROOT = Path(__file__).resolve().parent.parent
 DASH = ROOT / "dashboard"
+
+
+def icon_png_bytes(size: int) -> bytes:
+    """The app icon (belt ring seen from above, front motor lit) as a PNG, drawn
+    pixel by pixel and compressed with zlib: no image libraries needed."""
+    import math
+    import struct
+    import zlib
+    bg, ring, pad, edge, lit = (18, 17, 16), (69, 66, 61), (46, 44, 41), (142, 136, 126), (240, 168, 48)
+    f = size / 512.0
+    cx, cy, rx, ry, half = 256, 276, 150, 125, 13
+    pads = [(256 + rx * math.sin(k * math.pi / 4), cy - ry * math.cos(k * math.pi / 4)) for k in range(8)]
+    rows = []
+    for py in range(size):
+        y = (py + 0.5) / f
+        row = bytearray(b"\x00")
+        for px in range(size):
+            x = (px + 0.5) / f
+            c = bg
+            d = math.hypot((x - cx) / rx, (y - cy) / ry)
+            if abs(d - 1) * min(rx, ry) <= half:
+                c = ring
+            if 88 <= y <= 124 and abs(x - 256) <= (y - 88) * 24 / 36:
+                c = lit
+            for k, (mx, my) in enumerate(pads):
+                if abs(x - mx) <= 22 and abs(y - my) <= 22:
+                    c = edge if (abs(x - mx) > 18 or abs(y - my) > 18) else (lit if k == 0 else pad)
+            row += bytes(c)
+        rows.append(bytes(row))
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
 FIXTURES = ROOT / "tests" / "fixtures"
 RECORDINGS = ROOT / "recordings"
 
@@ -751,9 +788,77 @@ class App:
             self.emit(self.status())
             await asyncio.sleep(0.5)
 
+    # ------------------------------------------------------- phone / LAN
+    token: Optional[str] = None      # set by main --lan: phones need ?k=<token> once
+    local_ok = True                  # this laptop itself never needs the token
+
+    PUBLIC = ("/manifest.webmanifest", "/icon.svg", "/icon-180.png", "/icon-192.png", "/icon-512.png")
+
+    @web.middleware
+    async def _guard(self, request, handler):
+        """No accounts: on --lan, a device other than this laptop must bring the
+        token printed in the URL once; it's then kept in a cookie (the page's
+        WebSocket and camera image send it automatically)."""
+        local = self.local_ok and request.remote in ("127.0.0.1", "::1")
+        if self.token and not local \
+                and request.path not in self.PUBLIC:
+            k = request.query.get("k")
+            if k != self.token and request.cookies.get("hdb_k") != self.token:
+                return web.Response(status=403, text="Open the address printed by the laptop "
+                                                     "(it ends in ?k=...).")
+            resp = await handler(request)
+            if k == self.token and not getattr(resp, "prepared", False):
+                resp.set_cookie("hdb_k", self.token, max_age=7 * 24 * 3600, samesite="Lax")
+            return resp
+        return await handler(request)
+
+    async def manifest(self, request):
+        k = request.query.get("k")
+        start = f"/?k={k}" if self.token and k == self.token else "/"
+        return web.json_response({
+            "name": "Haptic Direction Band", "short_name": "HDB", "start_url": start,
+            "display": "standalone", "orientation": "any",
+            "background_color": "#121110", "theme_color": "#121110",
+            "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml"},
+                      {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                      {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png",
+                       "purpose": "any maskable"}]},
+            content_type="application/manifest+json")
+
+    @staticmethod
+    def _icon_svg() -> str:
+        import math
+        pads = "".join(
+            f'<rect x="{256 + 150 * math.sin(k * math.pi / 4) - 22:.0f}" '
+            f'y="{276 - 125 * math.cos(k * math.pi / 4) - 22:.0f}" width="44" height="44" rx="6" '
+            f'fill="{"#f0a830" if k == 0 else "#2e2c29"}" stroke="#8e887e" stroke-width="4"/>'
+            for k in range(8))
+        return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
+                '<rect width="512" height="512" fill="#121110"/>'
+                '<ellipse cx="256" cy="276" rx="150" ry="125" fill="none" stroke="#45423d" '
+                'stroke-width="26"/><polygon points="256,88 232,124 280,124" fill="#f0a830"/>'
+                + pads + '</svg>')
+
+    async def icon_svg(self, request):
+        return web.Response(text=self._icon_svg(), content_type="image/svg+xml")
+
+    async def icon_png(self, request):
+        """The same icon as PNG (iOS home screen ignores SVG): pure Python + zlib."""
+        size = {"/icon-180.png": 180, "/icon-512.png": 512}.get(request.path, 192)
+        cache = getattr(self, "_icons", {})
+        if size not in cache:
+            cache[size] = await asyncio.get_running_loop().run_in_executor(None, icon_png_bytes, size)
+            self._icons = cache
+        return web.Response(body=cache[size], content_type="image/png")
+
     def make_app(self) -> web.Application:
-        app = web.Application()
+        app = web.Application(middlewares=[self._guard])
         app.router.add_get("/", self.index)
+        app.router.add_get("/manifest.webmanifest", self.manifest)
+        app.router.add_get("/icon.svg", self.icon_svg)
+        app.router.add_get("/icon-180.png", self.icon_png)
+        app.router.add_get("/icon-192.png", self.icon_png)
+        app.router.add_get("/icon-512.png", self.icon_png)
         app.router.add_get("/ws", self.ws_handler)
         app.router.add_get("/video", self.video)
 

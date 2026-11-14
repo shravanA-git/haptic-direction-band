@@ -11,6 +11,8 @@ Owner: HDB-Software. Reactive, no map: every update looks at one camera frame.
              target's bearing, or straight ahead). Veer = front-left / front-right
              motor (7 / 1); nothing open in view = turn cue left / right (6 / 2)
              toward the side with more room.
+  Steering (3) plays only with HDB_AVOID_STEER=1; by default the band gives
+  the crash warning only.
   4. Stop    centre bin closer than STOP_M on STOP_FRAMES updates in a row ->
              crash warning, overriding guidance. It repeats every STOP_REPEAT_S
              while the path stays blocked.
@@ -36,6 +38,7 @@ COCO classes count as obstacles (walls, doors and stairs are invisible to it).
 from __future__ import annotations
 
 import math
+import os
 import threading
 import time
 from collections import deque
@@ -49,12 +52,19 @@ N_SECTORS = 5             # bins across the field of view (~13 deg each)
 NEAR_M = 2.5              # closer than this: "near" (still passable)
 BLOCK_M = 1.3             # closer than this: "blocked" (steer around)
 STOP_M = 0.9              # centre closer than this: crash warning
-STOP_FRAMES = 2           # updates in a row before warning (one-frame flukes)
+STOP_FRAMES = 3           # updates in a row before warning (one-frame flukes)
 STOP_REPEAT_S = 0.8
 STEER_REPEAT_S = 1.2      # walking with no find target: steer cue this often
 PAD = 0.04                # widen each box by this share of the frame (body width)
 SMOOTH_N = 3              # median of the last N distances per sector
 MIN_SCORE = 0.35
+# Collision warning only by default (Shravan, Nov 14): steer/turn cues stay in the
+# code but play only with HDB_AVOID_STEER=1.
+STEER = os.environ.get("HDB_AVOID_STEER", "0") == "1"
+# A box touching the left/right frame edge that doesn't cross the frame centre is
+# ignored: on the table clip it was the wearer's own shoulder/arm, cut off by the
+# edge and so read as "person, 0.8 m" -> 36% false warnings.
+EDGE_IGNORE = True
 VEER_LEFT, VEER_RIGHT, TURN_LEFT, TURN_RIGHT = 7, 1, 6, 2
 
 # Typical real heights (m). Only these classes are obstacles; cups, phones and
@@ -118,6 +128,9 @@ def obstacles(dets: Sequence, frame_w: int, frame_h: int, min_score: float = MIN
     out = []
     for cls, x1, y1, x2, y2, score in dets:
         if cls not in CLASS_HEIGHT_M or score < min_score:
+            continue
+        if EDGE_IGNORE and (x1 <= 0.01 * frame_w or x2 >= 0.99 * frame_w) \
+                and not (x1 < frame_w / 2 < x2):
             continue
         d, clipped = estimate_distance(cls, y1, y2, frame_w, frame_h, hfov_deg)
         out.append(Obstacle(cls, x1 / frame_w, x2 / frame_w, d, clipped))
@@ -229,6 +242,7 @@ class AvoidLoop:
         self.avoider = avoider or Avoider()
         self.decision: Optional[AvoidDecision] = None
         self.enabled = True
+        self.steer = STEER              # False: crash warning only
         self._last_frame = None
         self._next_stop = 0.0
         self._next_steer = 0.0
@@ -245,7 +259,9 @@ class AvoidLoop:
         now = time.monotonic() if now is None else now
         if not self.enabled or d is None or now - d.t > 0.6:
             return None
-        return d if d.action in ("stop", "steer", "turn") else None
+        if d.action == "stop" or (self.steer and d.action in ("steer", "turn")):
+            return d
+        return None
 
     def _goal_bearing(self) -> Optional[float]:
         d = self.vision.latest() if self.vision is not None else None
@@ -285,8 +301,8 @@ class AvoidLoop:
                 self._next_stop = now + STOP_REPEAT_S
             return
         self._next_stop = 0.0
-        if self.guiding():
-            return                               # ObjectGuide applies steer via override()
+        if not self.steer or self.guiding():
+            return                               # warning only / ObjectGuide applies steer
         if d.action in ("steer", "turn") and now >= self._next_steer:
             self.play(haptics.directional(d.motor))
             self._next_steer = now + STEER_REPEAT_S
