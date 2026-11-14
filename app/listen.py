@@ -59,7 +59,8 @@ FMIN, FMAX = 100.0, 7000.0
 RATIO = 4.0                    # event starts: frame RMS above RATIO x noise floor
 HOLD_RATIO = 1.5               # ... and continues while above HOLD_RATIO x floor,
 HOLD_ROOM = 1.25               # HOLD_ROOM x the room's 90th-percentile level
-HOLD_PEAK = 0.08               # and HOLD_PEAK x the event's peak (-22 dB)
+HOLD_PEAK = 0.15               # and HOLD_PEAK x the event's peak (-16 dB): talk nearby
+                               # doesn't keep a loud chime's event open
 MIN_RMS = 0.004                # start also needs this absolute level
 END_QUIET = 7                  # quiet frames that close an event (~224 ms)
 MIN_EVENT_FRAMES = 1           # a clap can be a single 32 ms frame
@@ -78,6 +79,8 @@ ONSET_JUMP = 1.8               # level jump over the recent minimum that marks a
 NOISE_SUB = 2.0                # subtract this x the room spectrum before pitch picking
 NOISE_ALPHA = 0.05             # room-spectrum update rate (quiet frames)
 PITCH_RMS_RATIO = 2.5          # only frames this far above the floor get a pitch
+NOTE_MIN_SHARE = 0.3           # notes shorter than this x the longest note are dropped
+ONSET_MIN_PEAK = 0.25          # onsets need this x the event's peak level
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE_FILE = ROOT / "recordings" / "taught_sound.json"
@@ -223,7 +226,7 @@ def categorize(sig: Signature) -> tuple:
         return "noise", f"untuned noise, {ms} ms"
     pitches = _distinct_pitches(sig.notes)
     if max(pitches) < 400 and max(d for _, _, d in sig.notes) < 0.13 \
-            and sig.duration_s <= 0.35 * hits:
+            and sig.duration_s <= 0.25 * hits:
         return "percussive", (f"low thump x{hits} (~{pitches[0]:.0f} Hz, knocking)" if hits > 1
                               else f"low thump (~{pitches[0]:.0f} Hz)")
     if max(pitches) < 350 and len(sig.notes) >= 3:
@@ -254,12 +257,13 @@ def describe_frames(rms: list, pitches: list, on: list) -> Signature:
     last = loud[-1] if loud else 0
     dur = (last + 1) * dt
     tonal = sum(1 for i in loud if pitches[i] is not None) / max(1, len(loud))
+    peak = max(rms[:last + 1]) if rms else 0.0
     # onsets: first frame, then level jumps over the recent minimum after a dip
     onsets = [0.0]
     for i in range(2, last + 1):
         recent = min(rms[max(0, i - 4):i - 1])
         if on[i] and rms[i] > ONSET_JUMP * recent and rms[i] > rms[i - 1] * 1.3 \
-                and i * dt - onsets[-1] >= 0.08:
+                and rms[i] >= ONSET_MIN_PEAK * peak and i * dt - onsets[-1] >= 0.08:
             onsets.append(i * dt)
     onset_frames = {int(round(t / dt)) for t in onsets[1:]}
     # notes: runs of tonal frames at a steady pitch (1-frame dropouts tolerated)
@@ -286,6 +290,9 @@ def describe_frames(rms: list, pitches: list, on: list) -> Signature:
             close(cur)
             cur = {"p": [p], "i0": i, "i1": i}
     close(cur)
+    if notes:   # drop fragments (background talk, room) next to the sound's main notes
+        longest = max(d for _, _, d in notes)
+        notes = [n for n in notes if n[2] >= NOTE_MIN_SHARE * longest]
     sig = Signature(dur, tonal, notes, onsets)
     sig.category, sig.description = categorize(sig)
     return sig
