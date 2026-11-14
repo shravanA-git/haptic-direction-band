@@ -10,6 +10,8 @@ sounddevice>=0.4
 numpy>=1.24
 # vision (find an object): YOLO + webcam; weights download into models/ on first run
 ultralytics>=8.0
+# torch 2.15 aborts on macOS 14 with the MPS backend
+torch<2.12
 opencv-python>=4.8
 # Recall chatbot (optional): uses Claude when credentials exist, offline parser otherwise
 anthropic>=2.8

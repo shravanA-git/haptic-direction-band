@@ -49,7 +49,9 @@ models/whisper/ (gitignored). Set HDB_WHISPER_MODEL to override.
 from __future__ import annotations
 
 import argparse
+import collections
 import os
+import queue
 import re
 import threading
 import time
@@ -353,59 +355,115 @@ class NameListener:
     """Always-on laptop-mic listener that reports when a configured name is said.
 
         nl = NameListener(["Shravan"], on_hit=cb)   # cb(NameHit), from a worker thread
-        nl.start()          # opens the default mic
+        nl.start()          # opens the default mic (loads + warms whisper first)
         nl.pause(); nl.resume()   # while Action is held (hold-to-talk owns speech)
         nl.stop()
         nl.feed(samples, t_first)  # or push audio yourself (tests, replay)
 
-    Utterances are cut by an energy detector (speech, then SILENCE_S of quiet, or
-    MAX_UTTER_S), transcribed with the names as whisper hotwords, then fuzzy-
-    matched. Times are laptop time.monotonic(): each mic block is stamped on
-    arrival and the sample clock is anchored with a min-filter, so callback
-    scheduling jitter doesn't shift the word times.
+    Rolling window: the last WINDOW_S of audio is decoded every HOP_S while
+    someone is talking (frame RMS above the noise floor within the last
+    ACTIVE_TAIL_S), with the names as whisper hotwords, then fuzzy-matched.
+    This doesn't wait for a pause in the conversation, so a name said over
+    background chatter is reported about one hop + one decode after it ends.
+    Hotwords can make whisper invent the name (in chatter it rewrites "the sun"
+    as "Shravan"; on silence it loops "Shravan Shravan ..."), so a candidate must
+    pass three checks: whisper's probability for the matched word >= MIN_PROB
+    (measured over TTS chatter: real calls 0.08-0.34, invented ones <= 0.01),
+    the name appears at most MAX_REPEATS times in the window, and the audio under
+    the word is louder than the room (WORD_LOUD x noise floor). verify="decode"
+    instead re-decodes +-VERIFY_PAD_S around the word without hotwords; over
+    chatter that rejected most real calls, so it is off by default.
+    Decodes run at temperature 0 with a token cap (whisper's temperature
+    fallback took up to 9 s on near-silent windows). The same name seen in
+    overlapping windows is reported once (starts within cooldown_s merge).
+
+    Times are laptop time.monotonic(): each mic block is stamped on arrival and
+    the sample clock is anchored with a min-filter, so callback scheduling
+    jitter doesn't shift the word times. Live (start()), the decoder keeps only
+    the newest windows so it never lags; with feed() every window is decoded.
     """
 
     FRAME = 480            # 30 ms at 16 kHz
-    PRE_ROLL_S = 0.3
-    SILENCE_S = 0.45
-    MAX_UTTER_S = 5.0
-    MIN_UTTER_S = 0.25
+    WINDOW_S = 2.0
+    HOP_S = 0.5
+    ACTIVE_TAIL_S = 1.0    # keep decoding this long after the last loud frame
     MIN_START_RMS = 0.003  # absolute floor for "someone is talking"
-    VERIFY_THRESHOLD = 0.6  # hotwords can make whisper invent the name in noise
-                            # ("Shravan Shravan" from room chatter), so a candidate
-                            # must also roughly match in an unbiased decode
+    EDGE_S = 0.2           # a name ending this close to the window's end may be cut off:
+                           # wait for the next window (one hop later) for full timing
+    MIN_PROB = 0.05
+    MAX_REPEATS = 2
+    WORD_LOUD = 2.0
+    MAX_TOKENS = 40        # ~2 s of speech is ~15 tokens; caps hallucination loops
+    VERIFY_PAD_S = 0.5     # verify="decode" only
+    VERIFY_THRESHOLD = 0.6
+    LIVE_QUEUE = 2         # live: windows waiting for the decoder (older ones dropped)
 
     def __init__(self, names, on_hit: Optional[Callable[[NameHit], None]] = None,
                  transcriber: Optional[Transcriber] = None, device=None,
-                 threshold: float = 0.8, cooldown_s: float = 1.5):
+                 threshold: float = 0.8, cooldown_s: float = 1.5, verify: str = "prob"):
+        if verify not in ("prob", "decode"):
+            raise ValueError("verify must be 'prob' or 'decode'")
+        self.verify = verify
         if isinstance(names, str):
             names = [n.strip() for n in names.split(",") if n.strip()]
         self.names = list(names)
         self.on_hit = on_hit
-        self.on_text: Optional[Callable[[str, list], None]] = None  # debug: every utterance
+        self.on_text: Optional[Callable[[str, list], None]] = None  # debug: every decode
         self.transcriber = transcriber or Transcriber()
         self.device = device
         self.threshold = threshold
         self.cooldown_s = cooldown_s
         self.paused = False
+        self.live = False          # True once start() opened the mic
         self.last: Optional[NameHit] = None
+        self.decodes = 0
+        self.dropped = 0
         self._stream = None
-        self._q: "queue.Queue" = __import__("queue").Queue(maxsize=8)
+        self._q: "queue.Queue" = queue.Queue()
+        self._qlock = threading.Lock()
         self._worker: Optional[threading.Thread] = None
-        self._reset_seg()
-        self._levels: "collections.deque" = __import__("collections").deque(maxlen=100)
+        self._warm = False
+        self._levels: "collections.deque" = collections.deque(maxlen=100)
         self.noise_floor = 0.0
         self._n = 0                # samples fed so far
         self._offset = None        # monotonic(sample 0), min-filtered
         self._last_hit_t = -1e9
+        self._pending: Optional[NameHit] = None   # edge-deferred candidate
+        self._reset_buf()
 
     # ---- public ----
     def set_names(self, names) -> None:
         self.names = [n.strip() for n in (names.split(",") if isinstance(names, str)
                                           else names) if n.strip()]
 
+    def warmup(self) -> None:
+        """Load whisper and decode 1 s of silence so the first real decode is fast."""
+        if self._warm:
+            return
+        import numpy as np
+        self._decode(np.zeros(SAMPLE_RATE, np.float32), 0.0, hotwords=None)
+        self._warm = True
+
+    def _decode(self, audio, t0: float, hotwords: Optional[str]):
+        """Greedy, temperature-0, token-capped decode on the shared whisper model
+        (same lock as hold-to-talk). -> (text, [Word]) on the monotonic clock."""
+        model = self.transcriber.load()
+        with self.transcriber._run_lock:
+            segs, _ = model.transcribe(audio, language="en", beam_size=1, temperature=0.0,
+                                       word_timestamps=True, vad_filter=False,
+                                       condition_on_previous_text=False, hotwords=hotwords,
+                                       max_new_tokens=self.MAX_TOKENS)
+            text, words = [], []
+            for sg in segs:
+                text.append(sg.text.strip())
+                for w in (sg.words or []):
+                    words.append(Word(w.word.strip(), t0 + float(w.start), t0 + float(w.end),
+                                      float(getattr(w, "probability", 1.0))))
+        return " ".join(text).strip(), words
+
     def start(self) -> "NameListener":
         import sounddevice as sd
+        self.live = True
         self._ensure_worker()
         self._stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                                       blocksize=self.FRAME, device=self.device,
@@ -425,10 +483,10 @@ class NameListener:
 
     def pause(self) -> None:
         self.paused = True
-        self._reset_seg()
+        self._reset_buf()
 
     def resume(self) -> None:
-        self._reset_seg()
+        self._reset_buf()
         self.paused = False
 
     def feed(self, samples, t_first: Optional[float] = None) -> None:
@@ -444,6 +502,16 @@ class NameListener:
         for i in range(0, len(samples), self.FRAME):
             self._frame(samples[i:i + self.FRAME])
 
+    def drain(self, timeout: float = 30.0) -> bool:
+        """Wait until every queued window has been fully processed (decodes and
+        on_hit). True if drained within timeout."""
+        end = time.monotonic() + timeout
+        while self._q.unfinished_tasks:
+            if time.monotonic() > end:
+                return False
+            time.sleep(0.02)
+        return True
+
     # ---- internals ----
     def _cb(self, indata, frames, time_info, status) -> None:
         lat = self._stream.latency if self._stream is not None else 0.0
@@ -452,11 +520,11 @@ class NameListener:
     def _t(self, n: int) -> float:
         return (self._offset or 0.0) + n / SAMPLE_RATE
 
-    def _reset_seg(self) -> None:
-        self._seg: list = []
-        self._seg_start = None     # sample index of the segment start
-        self._quiet = 0            # samples of quiet since the last loud frame
-        self._pre: list = []       # pre-roll frames
+    def _reset_buf(self) -> None:
+        self._buf: "collections.deque" = collections.deque()   # (sample index, frame)
+        self._buf_len = 0
+        self._last_loud = None     # sample index of the last loud frame
+        self._next_hop = None      # sample index at which to decode next
 
     def _frame(self, f) -> None:
         import numpy as np
@@ -468,36 +536,38 @@ class NameListener:
         # Noise floor = 20th percentile of the last ~3 s of frames: robust to the
         # mic's start-up click and to speech itself.
         self._levels.append(rms)
+        self._buf.append((n0, f))
+        self._buf_len += len(f)
+        while self._buf_len - len(self._buf[0][1]) >= self.WINDOW_S * SAMPLE_RATE:
+            self._buf_len -= len(self._buf.popleft()[1])
         if len(self._levels) < 10:
             return
         floor = float(np.percentile(self._levels, 20))
         self.noise_floor = floor
-        if self._seg_start is None:
-            loud = rms > max(3.0 * floor, self.MIN_START_RMS)
-        else:  # hysteresis: keep the utterance going on softer frames
-            loud = rms > max(1.8 * floor, self.MIN_START_RMS * 0.6)
-        if self._seg_start is None:
-            self._pre.append((n0, f))
-            pre_n = int(self.PRE_ROLL_S * SAMPLE_RATE / self.FRAME)
-            del self._pre[:-pre_n]
-            if loud:
-                self._seg_start = self._pre[0][0]
-                self._seg = [x for _, x in self._pre]
-                self._pre = []
-                self._quiet = 0
+        if rms > max(3.0 * floor, self.MIN_START_RMS):
+            if self._last_loud is None:          # talking starts: first decode one hop in
+                self._next_hop = self._n + int(self.HOP_S * SAMPLE_RATE)
+            self._last_loud = self._n
+        if self._last_loud is None or self._n < self._next_hop:
             return
-        self._seg.append(f)
-        self._quiet = 0 if loud else self._quiet + len(f)
-        seg_len = sum(len(x) for x in self._seg)
-        if (self._quiet >= self.SILENCE_S * SAMPLE_RATE
-                or seg_len >= self.MAX_UTTER_S * SAMPLE_RATE):
-            if seg_len - self._quiet >= self.MIN_UTTER_S * SAMPLE_RATE:
-                audio = np.concatenate(self._seg)
-                try:
-                    self._q.put_nowait((audio, self._t(self._seg_start)))
-                except Exception:
-                    pass  # decoder is behind; drop rather than lag further
-            self._reset_seg()
+        self._next_hop = self._n + int(self.HOP_S * SAMPLE_RATE)
+        if self._n - self._last_loud > self.ACTIVE_TAIL_S * SAMPLE_RATE:
+            self._last_loud = None               # quiet again: stop decoding
+            return
+        audio = np.concatenate([x for _, x in self._buf])
+        self._enqueue((audio, self._t(self._buf[0][0])))
+
+    def _enqueue(self, item) -> None:
+        with self._qlock:
+            if self.live:   # never lag behind the room: keep only the newest windows
+                while self._q.qsize() >= self.LIVE_QUEUE:
+                    try:
+                        self._q.get_nowait()
+                        self._q.task_done()
+                        self.dropped += 1
+                    except queue.Empty:
+                        break
+            self._q.put(item)
 
     def _ensure_worker(self) -> None:
         if self._worker is None or not self._worker.is_alive():
@@ -505,6 +575,10 @@ class NameListener:
             self._worker.start()
 
     def _work(self) -> None:
+        try:
+            self.warmup()
+        except Exception as e:
+            print(f"[names] warm-up failed: {e}")
         while True:
             item = self._q.get()
             try:
@@ -517,47 +591,87 @@ class NameListener:
             finally:
                 self._q.task_done()
 
-    def drain(self, timeout: float = 30.0) -> bool:
-        """Wait until every queued utterance has been fully processed (both
-        decodes and on_hit). True if drained within timeout."""
-        end = time.monotonic() + timeout
-        while self._q.unfinished_tasks:
-            if time.monotonic() > end:
-                return False
-            time.sleep(0.02)
-        return True
+    def _reject(self, audio, t0: float, words: list, name: str, i: int, j: int) -> Optional[str]:
+        """Why this candidate is probably invented by the hotword, or None."""
+        import numpy as np
+        start, end = words[i].start, words[j].end
+        if self.verify == "decode":
+            a = max(0, int((start - self.VERIFY_PAD_S - t0) * SAMPLE_RATE))
+            b = min(len(audio), int((end + self.VERIFY_PAD_S - t0) * SAMPLE_RATE))
+            _, plain = self._decode(audio[a:b], t0 + a / SAMPLE_RATE, hotwords=None)
+            if match_name(plain, [name], self.VERIFY_THRESHOLD) is None:
+                return f"unbiased decode heard {' '.join(w.text for w in plain)!r}"
+            return None
+        prob = max(w.prob for w in words[i:j + 1])
+        if prob < self.MIN_PROB:
+            return f"word probability {prob:.3f} < {self.MIN_PROB}"
+        reps = sum(1 for k in range(len(words)) if match_name(words[k:k + 1], [name], self.threshold))
+        if reps > self.MAX_REPEATS:
+            return f"name repeated {reps}x (hallucination loop)"
+        a = max(0, int((start - t0) * SAMPLE_RATE))
+        b = min(len(audio), max(a + 1, int((end - t0) * SAMPLE_RATE)))
+        rms = float(np.sqrt(np.mean(audio[a:b] ** 2)) + 1e-9)
+        if rms < self.WORD_LOUD * max(self.noise_floor, 1e-4):
+            return f"word audio is quiet (rms {rms:.4f}, floor {self.noise_floor:.4f})"
+        return None
+
+    def _more_coming(self) -> bool:
+        """Another window will be decoded after this one (still talking)."""
+        return self._last_loud is not None or self._q.qsize() > 0
 
     def process(self, audio, t0: float) -> Optional[NameHit]:
-        """Transcribe one utterance that started at monotonic t0; report a hit."""
+        """Decode one window that starts at monotonic t0; report a new hit."""
         if not self.names or self.paused:
             return None
-        text, words = self.transcriber.transcribe(audio, t0, hotwords=" ".join(self.names),
-                                                  vad=False)
+        self.decodes += 1
+        text, words = self._decode(audio, t0, hotwords=" ".join(self.names))
         if self.on_text:
             self.on_text(text, words)
-        m = match_name(words, self.names, self.threshold)
-        if m is None:
+        # Every occurrence of a name is a candidate (a window can hold an invented
+        # "Shravan" and the real one); try the most probable first.
+        cands, seen = [], set()
+        for n in (1, 2):              # single words first ("Hey Shravan" must not win
+            for k in range(len(words) - n + 1):     # over "Shravan" and shift the start)
+                m = match_name(words[k:k + n], self.names, self.threshold)
+                if m and not seen.intersection(range(k, k + n)):
+                    seen.update(range(k, k + n))
+                    cands.append((m[0], k, k + n - 1, m[3]))
+        cands.sort(key=lambda c: -max(w.prob for w in words[c[1]:c[2] + 1]))
+        win_end = t0 + len(audio) / SAMPLE_RATE
+        found = deferred = None
+        for name, i, j, score in cands:
+            start, end = words[i].start, words[j].end
+            if start - self._last_hit_t < self.cooldown_s:
+                continue               # same call already reported from an earlier window
+            why = self._reject(audio, t0, words, name, i, j)
+            if why:
+                if self.on_text:
+                    self.on_text(f"(rejected {name!r}: {why})", words)
+                continue
+            hit = NameHit(name, " ".join(w.text for w in words[i:j + 1]), start, end, score,
+                          text, 0.0)
+            if end > win_end - self.EDGE_S and self._more_coming():
+                deferred = deferred or hit   # may be cut at the right edge: next window
+                continue                     # usually has all of it (better timing)
+            found = hit
+            break
+        pending, self._pending = self._pending, None
+        if found is None and pending is not None:
+            found = pending            # next window lost it: report the earlier sighting
+        elif found is None and deferred is not None:
+            self._pending = deferred
             return None
-        name, i, j, score = m
-        _, plain = self.transcriber.transcribe(audio, t0, vad=False)
-        if match_name(plain, [name], self.VERIFY_THRESHOLD) is None:
-            if self.on_text:
-                self.on_text(f"(rejected {name!r}: unbiased decode heard "
-                             f"{' '.join(w.text for w in plain)!r})", plain)
+        if found is None:
             return None
-        start, end = words[i].start, words[j].end
-        if start - self._last_hit_t < self.cooldown_s:
-            return None
-        self._last_hit_t = start
-        hit = NameHit(name, " ".join(w.text for w in words[i:j + 1]), start, end, score,
-                      text, round(time.monotonic() - end, 3))
-        self.last = hit
+        self._last_hit_t = found.start
+        found.latency = round(time.monotonic() - found.end, 3)
+        self.last = found
         if self.on_hit:
             try:
-                self.on_hit(hit)
+                self.on_hit(found)
             except Exception as e:
                 print(f"[names] callback error: {e}")
-        return hit
+        return found
 
 
 # --------------------------------------------------------------------------
