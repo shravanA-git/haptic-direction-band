@@ -12,8 +12,8 @@
   python -m app.main --sim --vision --lan # phones on the same Wi-Fi can open the dashboard
   python -m app.main --nav <model id> --nav-prefetch   # CoStar: fetch + cache everything, exit
   python -m app.main --sim --nav <model id>   # then /nav: plan a route, Play / Next (offline ok);
-                                          # "take me to the kitchen" on hold-to-talk. With
-                                          # MATTERPORT_SDK_KEY set: live 3D tour guidance too
+                                          # "take me to the kitchen" on hold-to-talk;
+                                          # --nav-live: live 3D tour guidance (MATTERPORT_SDK_KEY)
 Then open http://localhost:8765
 """
 from __future__ import annotations
@@ -80,6 +80,9 @@ def main(argv=None) -> int:
                     help="visit a building before you go: guide through this Matterport model's "
                          "3D tour (page /nav; 'take me to X' on hold-to-talk)")
     ap.add_argument("--nav-file", help="with --nav: read the model from this JSON (offline)")
+    ap.add_argument("--nav-live", action="store_true",
+                    help="with --nav: live 3D tour guidance (needs MATTERPORT_SDK_KEY) instead of "
+                         "the default route plan + play")
     ap.add_argument("--nav-prefetch", action="store_true",
                     help="with --nav: fetch and cache the model, 360 photos, preview, aerial "
                          "photo and briefing (so the demo runs with wifi off), then exit")
@@ -91,6 +94,8 @@ def main(argv=None) -> int:
             ap.error("--nav-prefetch needs --nav <model id>")
         from tools.costar_assets import prefetch
         from tools.costar_nav import NavError
+        from .notify import load_env
+        load_env()                       # MATTERPORT_*, VEXCEL_API_KEY, COSTAR_* from .env
         try:
             print(f"[hdb] nav prefetch {a.nav}:")
             prefetch(a.nav, refresh=True)
@@ -173,6 +178,8 @@ def main(argv=None) -> int:
             sound = None
             print(f"[hdb] sound listener off: {e}")
     if a.nav or a.nav_file:
+        from .notify import load_env
+        load_env()                       # keys for the Model API and the CoStar kit (.env)
         from tools.costar_nav import NavError, build_twin, load_model
         from .nav import NavGuide
 
@@ -181,7 +188,7 @@ def main(argv=None) -> int:
         def start_nav(twin, model=None):
             nav = NavGuide(twin, play=lambda cue: app.play_cue(cue, "nav"),
                            yaw_sign=a.nav_yaw_sign).start()
-            app.attach_nav(nav, {"model": a.nav})
+            app.attach_nav(nav, {"model": a.nav, "live": a.nav_live})
             brief = {"name": twin.name}
             if a.nav:
                 from tools.costar_assets import brief as load_brief
@@ -195,8 +202,19 @@ def main(argv=None) -> int:
             speaker = Speaker(blocked=lambda: app._action_down)
             app.attach_route(RoutePlayer(twin, play=lambda cue: app.play_cue(cue, "nav"),
                                          speak=speaker.say), brief, speaker)
+            if a.nav:
+                import threading
+
+                def load_costar():   # cached JSON, else one pass over the kit zip (~10 s)
+                    from tools import costar_kit
+                    data = costar_kit.load(a.nav, twin.name)
+                    if data:
+                        app.costar = data
+                        print(f"[hdb] nav: CoStar: {costar_kit.briefing(data)}")
+                threading.Thread(target=load_costar, name="costar", daemon=True).start()
             n_links = sum(len(v) for v in twin.links.values()) // 2
-            mode = "live tour + route" if app.nav_live else "route plan (no MATTERPORT_SDK_KEY)"
+            mode = "live tour + route" if app.nav_live else (
+                "route plan (--nav-live needs MATTERPORT_SDK_KEY)" if a.nav_live else "route plan + play")
             print(f"[hdb] nav: {twin.name}, {len(twin.panos)} scan points, {n_links} walkable links; "
                   f"{mode}; open http://localhost:{a.http}/nav")
             if app.speech is None and not a.no_speech:

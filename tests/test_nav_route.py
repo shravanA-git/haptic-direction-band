@@ -333,3 +333,16 @@ def test_vexcel_box_is_about_70_m():
     lons, lats = nums[0::2], nums[1::2]
     assert (max(lats) - min(lats)) * 111_320 == pytest.approx(70, abs=0.5)
     assert (max(lons) - min(lons)) * 111_320 * math.cos(math.radians(34.05)) == pytest.approx(70, abs=0.5)
+
+
+def test_live_tour_mode_is_opt_in(monkeypatch):
+    from app.nav import NavGuide
+    app, rp, port, link, log = make_app()
+    app.attach_nav(NavGuide(rp.twin, play=lambda c: None), {"model": "M1"})
+    monkeypatch.setenv("MATTERPORT_SDK_KEY", "browser-key")
+    assert not app.nav_live                          # a key in .env alone doesn't switch modes
+    app.nav_info["live"] = True
+    assert app.nav_live
+    monkeypatch.delenv("MATTERPORT_SDK_KEY")
+    assert not app.nav_live                          # --nav-live without a key: route mode
+    link.close()

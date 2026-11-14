@@ -40,7 +40,7 @@ YAW_SIGN = -1.0
 _ROUTE = re.compile(
     r"\b(?:(?:take|bring|walk|lead|guide|get)\s+me|(?:let's|lets|i\s+want\s+to|i\s+wanna)?\s*"
     r"(?:go|head|navigate|get))\s+(?:back\s+)?(?:to|into|towards?)\s+(?:the\s+|my\s+|a\s+)?"
-    r"(?P<place>[a-z][a-z \-']*?)\s*(?:please)?\s*[.!?]*$", re.I)
+    r"(?P<place>[a-z0-9][a-z0-9 \-'&,.]*?)\s*(?:please)?\s*[.!?]*$", re.I)
 
 
 def route_request(text: str) -> Optional[str]:
@@ -49,7 +49,7 @@ def route_request(text: str) -> Optional[str]:
     m = _ROUTE.search((text or "").strip())
     if not m:
         return None
-    place = m.group("place").strip(" -'").lower()
+    place = m.group("place").strip(" -',.").lower()
     return place or None
 
 
@@ -364,6 +364,17 @@ class RoutePlayer:
         total = sum(s.metres for s in steps)
         return True, f"{len(steps)} steps, {total:.0f} m to the {goal}"
 
+    def announce(self, text: str, cue: Optional[list] = None) -> None:
+        """Say something instead of a route (e.g. the tenant is on another floor):
+        no route is invented, the current one stops."""
+        self.stop()
+        with self._lock:
+            self.steps, self.texts, self.goal, self.leg, self.done = [], [], None, -1, False
+        if cue:
+            self.play_cue(cue)
+        self._say(text)
+        self._status("info", text=text)
+
     def arrival_text(self) -> str:
         room = self.steps[-1].room if self.steps else self.goal
         return f"You've arrived at the {str(room or self.goal).lower()}."
@@ -499,7 +510,7 @@ class RoutePlayer:
         """Next leg to start (compat): leg + 1."""
         return self.leg + 1
 
-    def _status(self, event: Optional[str], i: Optional[int] = None) -> None:
+    def _status(self, event: Optional[str], i: Optional[int] = None, text: str = "") -> None:
         if not self.on_status:
             return
         st = {"event": event, "goal": self.goal, "start": self.start_pano,
@@ -515,6 +526,8 @@ class RoutePlayer:
                       of=round(self.steps[i].metres, 1))
         elif event == "arrived":
             st.update(current=len(self.steps), text=self.arrival_text())
+        elif event == "info":
+            st["text"] = text
         try:
             self.on_status(st)
         except Exception:

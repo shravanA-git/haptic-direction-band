@@ -253,7 +253,13 @@ def prefetch(model_id: str, refresh: bool = False) -> dict:
     b = brief(model_id, model, refresh=True)
     report["preview"] = "ok" if b["preview"] else f"FAILED: {b['errors'].get('preview')}"
     report["aerial"] = "ok" if b["aerial"] else f"FAILED: {b['errors'].get('aerial', 'no location')}"
-    report["CoStar"] = f"{len(b['facts'])} facts" if b["facts"] else "none (kit unavailable)"
+    try:
+        from tools import costar_kit
+        kit = costar_kit.build(model_id, model.get("name") or "")
+        report["CoStar kit"] = costar_kit.briefing(kit) + f" ({len(kit['tenants'])} tenant spaces cached)"
+    except Exception as e:            # no kit / not a CoStar model: fine
+        report["CoStar kit"] = f"none ({e})"
+    report["CoStar URL"] = f"{len(b['facts'])} facts" if b["facts"] else "none (kit URL unavailable)"
     report["address"] = b.get("address") or "none"
     for k, v in report.items():
         print(f"  {k:12s} {v}")

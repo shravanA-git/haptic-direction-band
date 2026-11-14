@@ -131,6 +131,7 @@ class App:
         self.route = None                # app.nav.RoutePlayer: plan once, play the route
         self.route_start: Optional[str] = None
         self.brief: dict = {}
+        self.costar: Optional[dict] = None   # tools.costar_kit cache: property + tenants
         self.speaker = None
         link.subscribe(self._on_event)
         link.subscribe(self.live)
@@ -243,14 +244,19 @@ class App:
 
     @property
     def nav_live(self) -> bool:
-        """Live tour mode (Showcase SDK pose) only with a browser SDK key."""
+        """Live tour mode (Showcase SDK pose): asked for (--nav-live) and a browser
+        SDK key set. Otherwise route mode, which needs no key."""
         import os
-        return self.nav is not None and bool(os.environ.get("MATTERPORT_SDK_KEY"))
+        return self.nav is not None and bool(self.nav_info.get("live")) \
+            and bool(os.environ.get("MATTERPORT_SDK_KEY"))
 
-    def attach_route(self, player, brief: Optional[dict] = None, speaker=None) -> None:
+    def attach_route(self, player, brief: Optional[dict] = None, speaker=None,
+                     costar: Optional[dict] = None) -> None:
         """player: app.nav.RoutePlayer. Same alert priority and Action rules as
-        live guidance; speaker never talks while Action is held."""
+        live guidance; speaker never talks while Action is held. costar: the
+        tools.costar_kit property cache (briefing line, tenant lookups)."""
         self.route, self.brief, self.speaker = player, dict(brief or {}), speaker
+        self.costar = costar
         player.on_status = lambda st: self.emit({"type": "route", **st})
         if not getattr(self, "_nav_hold_subscribed", False):
             self._nav_hold_subscribed = True
@@ -261,17 +267,57 @@ class App:
             return {"type": "log", "text": "route player is off (start with --nav <model id>)"}
         if self.vision is not None:
             self.vision.set_target(None)     # one guidance at a time
-        if self.brief:
-            from tools.costar_assets import briefing_text
-            self.route.intro = briefing_text(self.brief)
+        from tools.costar_nav import goal_panos
+        heard = detail.get("heard")
+        prefix = f"heard \"{heard}\" -> " if heard else ""
+        self.route.intro = self.briefing_line()
+        if place and not goal_panos(self.route.twin, place) and self.costar:
+            # not a room in the scan: maybe a tenant or a suite in this building
+            from tools import costar_kit
+            t = costar_kit.resolve(place, self.costar)
+            if t is not None and not t["in_scan"]:
+                text = costar_kit.answer(t, self.costar)          # honest: no route invented
+                self.route.announce(text, haptics.target_unknown())
+                return {"type": "log", "text": prefix + "route: " + text}
+            if t is not None:                                     # the scanned suite itself
+                place = self._suite_destination()
+                if place is None:
+                    text = f"This scan is suite {self.costar.get('scan_suite')}; you're already there."
+                    self.route.announce(text, haptics.centered())
+                    return {"type": "log", "text": prefix + "route: " + text}
         ok, msg = self.route.plan(start, place)
         if not ok:
             self.play_cue(haptics.target_unknown(), "nav")
         elif play:
             self.play_cue(haptics.target_ack(), "nav")
             self.route.play()
-        heard = detail.get("heard")
-        return {"type": "log", "text": (f"heard \"{heard}\" -> " if heard else "") + f"route: {msg}"}
+        return {"type": "log", "text": prefix + f"route: {msg}"}
+
+    def briefing_line(self) -> str:
+        """Spoken once when a route starts: the CoStar property line if the kit
+        knows this scan ('One Park Plaza, 22 floors, 63 tenants. This scan is
+        Suite 301.'), else name and address from the Model API."""
+        if self.costar:
+            from tools.costar_kit import briefing
+            return briefing(self.costar)
+        if self.brief:
+            from tools.costar_assets import briefing_text
+            return briefing_text(self.brief)
+        return ""
+
+    def _suite_destination(self) -> Optional[str]:
+        """Where 'take me to <the scanned tenant>' goes inside the scan: the
+        reception/office if labelled, else the room with the most scan points."""
+        twin = self.route.twin
+        counts: dict = {}
+        for p in twin.panos.values():
+            if p.room and twin.rooms[p.room].label not in ("Void", "Unknown"):
+                lab = twin.rooms[p.room].label
+                counts[lab] = counts.get(lab, 0) + 1
+        for want in ("Reception", "Lobby", "Office"):
+            if want in counts:
+                return want.lower()
+        return max(counts, key=counts.get).lower() if counts else None
 
     def _nav_alert_hold(self, rec: dict) -> None:
         if (self.nav is None and self.route is None) or rec.get("type") != "alert" \
@@ -875,6 +921,10 @@ class App:
         twin = self.nav.twin if self.nav is not None else (self.route.twin if self.route else None)
         rooms = sorted({r.label for r in twin.rooms.values() if r.label != "Void"}) if twin else []
         brief = {k: self.brief.get(k) for k in ("name", "address", "facts", "aerial", "preview")}
+        if self.costar:
+            brief["costar"] = self.briefing_line()
+            brief["name"] = self.costar.get("building") or brief.get("name")
+            brief["tenants"] = sorted({t["name"] for t in self.costar.get("tenants") or []})
         return web.json_response({
             "model": self.nav_info.get("model"), "name": twin.name if twin else None,
             "rooms": rooms, "sdk_key": os.environ.get("MATTERPORT_SDK_KEY", ""),
