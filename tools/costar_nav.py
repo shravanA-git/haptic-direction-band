@@ -40,15 +40,27 @@ import json
 import math
 import os
 import sys
+import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+
+def _ssl_context() -> ssl.SSLContext:
+    """python.org Python on macOS ships without a CA store, so HTTPS fails with
+    CERTIFICATE_VERIFY_FAILED. Use certifi's bundle when it is installed."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
 API_URL = "https://api.matterport.com/api/models/graph"
 CACHE_DIR = Path(__file__).resolve().parent.parent / "mp_cache"   # gitignored
 
-MAX_LINK_M = 4.5      # don't link panos further apart than this
+MAX_LINK_M = 4.5      # don't link panos further apart than this (no sweep graph)
+NEIGHBOUR_MAX_M = 12  # cap for Matterport's own neighbour links
 SAME_FLOOR_DZ = 1.0   # panos within this height difference are on one floor
 STEP_PULSE_MS = 200   # direction cue length (protocol: 200 ms)
 MERGE_DEG = 20        # merge consecutive legs that bend less than this
@@ -67,12 +79,47 @@ query Nav($id: ID!) { model(id: $id) {
   geolocation { lat long }
   floors { id label
            vertices { id position { x y } }
-           edges { id type vertices { id } } }
+           edges { id type vertices { id } openings { type width relativeCenter } } }
   rooms { id floor { id } classifications { label confidence }
           boundary { edges { id } } }
   panoLocations { id label position { x y z } }
+  locations { id neighbors floor { id } room { id } pano { id } }
 } }
 """
+# Real models store doors as openings ON a wall edge, not as separate edges.
+# Only doorways become gaps; windows keep the wall solid.
+DOOR_OPENINGS = {"doorway", "door", "opening"}
+DOOR_MARGIN_M = 0.05   # widen each doorway gap a little on both sides
+
+
+def _cut_doorways(seg: Seg, openings: list[dict]) -> list[Seg]:
+    """Split a wall segment into the solid pieces left after its doorways."""
+    (x1, y1), (x2, y2) = seg
+    length = math.dist(seg[0], seg[1])
+    if length == 0:
+        return [seg]
+    gaps = []
+    for o in openings or []:
+        if str(o.get("type") or "").lower() not in DOOR_OPENINGS:
+            continue
+        rc, w = o.get("relativeCenter"), o.get("width")
+        c = (0.5 if rc is None else float(rc)) * length     # 0..1 along the edge
+        half = (0.8 if w is None else float(w)) / 2 + DOOR_MARGIN_M
+        gaps.append((max(0.0, c - half), min(length, c + half)))
+    if not gaps:
+        return [seg]
+    pieces, pos = [], 0.0
+    for g0, g1 in sorted(gaps):
+        if g0 > pos:
+            pieces.append((pos, g0))
+        pos = max(pos, g1)
+    if pos < length:
+        pieces.append((pos, length))
+
+    def at(d):
+        t = d / length
+        return (x1 + (x2 - x1) * t, y1 + (y2 - y1) * t)
+    return [(at(a), at(b)) for a, b in pieces if b - a > 1e-3]
 
 
 class NavError(Exception):
@@ -93,7 +140,7 @@ def fetch_model(model_id: str) -> dict:
     req = urllib.request.Request(API_URL, data=body, headers={
         "Content-Type": "application/json", "Authorization": f"Basic {auth}"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as r:
             out = json.load(r)
     except urllib.error.HTTPError as e:
         raise NavError(f"Model API HTTP {e.code} (check the key/token)") from None
@@ -111,7 +158,9 @@ def load_model(model_id: str | None, file: str | None, refresh: bool) -> dict:
         return data.get("data", {}).get("model", data)  # raw response or model
     cache = CACHE_DIR / f"{model_id}.json"
     if cache.exists() and not refresh:
-        return json.loads(cache.read_text())
+        cached = json.loads(cache.read_text())
+        if "locations" in cached:          # older caches lack the sweep graph
+            return cached
     model = fetch_model(model_id)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache.write_text(json.dumps(model))
@@ -232,7 +281,7 @@ def build_twin(model: dict) -> Twin:
             kind = str(e.get("type") or "wall").lower()
             edge_types[kind] = edge_types.get(kind, 0) + 1
             if kind not in PASSABLE:             # walls, railings, unknown: block
-                walls[fl["id"]].append(seg)
+                walls[fl["id"]].extend(_cut_doorways(seg, e.get("openings")))
 
     rooms: dict[str, Room] = {}
     for r in model.get("rooms") or []:
@@ -254,24 +303,60 @@ def build_twin(model: dict) -> Twin:
                     pano.room, pano.floor = room.id, room.floor
         panos[pano.id] = pano
 
+    # Matterport's own sweep graph: each location (= pano) lists the panos you
+    # can move to from it, plus its floor and room. Trust its floor/room over
+    # our polygon test, and use its neighbours as the candidate links.
+    neighbours: dict[str, set[str]] = {}
+    locs = model.get("locations") or []
+    # neighbours are location ids; equal to pano ids in the models seen so far,
+    # but map them explicitly in case a model differs
+    loc_pano = {loc.get("id"): (loc.get("pano") or {}).get("id") or loc.get("id") for loc in locs}
+    for loc in locs:
+        pid = loc_pano.get(loc.get("id"))
+        if pid not in panos:
+            continue
+        p = panos[pid]
+        fid = (loc.get("floor") or {}).get("id")
+        rid = (loc.get("room") or {}).get("id")
+        if fid:
+            p.floor = fid
+        if rid in rooms:
+            p.room = rid
+        ns = {loc_pano.get(n, n) for n in loc.get("neighbors") or []}
+        neighbours[pid] = {n for n in ns if n in panos and n != pid}
+
     all_walls = [s for segs in walls.values() for s in segs]
     links: dict[str, list[tuple[str, float]]] = {pid: [] for pid in panos}
-    plist = list(panos.values())
-    for i, a in enumerate(plist):
-        for b in plist[i + 1:]:
-            if abs(a.z - b.z) > SAME_FLOOR_DZ:
-                continue
-            d = math.dist((a.x, a.y), (b.x, b.y))
-            if d > MAX_LINK_M:
-                continue
-            if a.floor and b.floor and a.floor != b.floor:
-                continue
-            floor = a.floor or b.floor
-            segs = walls.get(floor, all_walls) if floor else all_walls
-            if blocked((a.x, a.y), (b.x, b.y), segs):
-                continue
-            links[a.id].append((b.id, d))
-            links[b.id].append((a.id, d))
+
+    def try_link(a: Pano, b: Pano, max_d: float) -> None:
+        d = math.dist((a.x, a.y), (b.x, b.y))
+        if d > max_d or abs(a.z - b.z) > SAME_FLOOR_DZ:
+            return
+        if a.floor and b.floor and a.floor != b.floor:
+            return
+        floor = a.floor or b.floor
+        segs = walls.get(floor, all_walls) if floor else all_walls
+        if blocked((a.x, a.y), (b.x, b.y), segs):
+            return
+        links[a.id].append((b.id, d))
+        links[b.id].append((a.id, d))
+
+    if any(neighbours.values()):
+        # Neighbours can see each other, sometimes through glass or across a
+        # railing, so they still have to pass the wall test (with doorway
+        # gaps). They may be further apart than MAX_LINK_M (long corridors).
+        seen = set()
+        for a_id, ns in neighbours.items():
+            for b_id in ns:
+                key = tuple(sorted((a_id, b_id)))
+                if key not in seen:
+                    seen.add(key)
+                    try_link(panos[a_id], panos[b_id], NEIGHBOUR_MAX_M)
+    else:
+        plist = list(panos.values())
+        for i, a in enumerate(plist):
+            for b in plist[i + 1:]:
+                try_link(a, b, MAX_LINK_M)
     return Twin(model.get("name") or model.get("id", "?"), panos, rooms, walls, links, edge_types)
 
 
@@ -365,7 +450,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("model", nargs="?", help="Matterport model id (sid)")
     ap.add_argument("--file", help="read the model from a JSON file instead")
-    ap.add_argument("--to", required=True, help="room label to reach, e.g. kitchen")
+    ap.add_argument("--to", help="room label to reach, e.g. kitchen (not needed with --rooms)")
     ap.add_argument("--start", help="start pano id/label or room (default: first pano)")
     ap.add_argument("--heading", type=float,
                     help="wearer's heading in model degrees (default: facing the first leg)")
@@ -374,6 +459,8 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if not a.model and not a.file:
         ap.error("give a model id or --file")
+    if not a.to and not a.rooms:
+        ap.error("give --to <room> (or --rooms to list the rooms)")
 
     try:
         return _run(a)

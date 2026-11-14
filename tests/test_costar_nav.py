@@ -155,3 +155,28 @@ def test_room_matching_and_errors_dont_exit():
     assert goal_panos(t, "kitchens") == goal_panos(t, "kitchen") and goal_panos(t, "") == set()
     with pytest.raises(NavError):
         find_pano(t, "garage")
+
+
+def test_doorway_opening_on_a_wall_edge_is_a_gap():
+    """Real models: one wall edge across the divider with a doorway opening on it."""
+    m = model()
+    fl = m["floors"][0]
+    fl["edges"] = [e for e in fl["edges"] if e["id"] not in ("div_lo", "div_hi", "door")]
+    fl["edges"].append({"id": "div", "type": "wall", "vertices": [{"id": "b"}, {"id": "e"}],
+                        "openings": [{"type": "doorway", "width": 1.0, "relativeCenter": 0.5}]})
+    for r in m["rooms"]:
+        r["boundary"]["edges"] = [x for x in r["boundary"]["edges"]
+                                  if x["id"] not in ("div_lo", "div_hi", "door")] + [{"id": "div"}]
+    t = build_twin(m)
+    assert shortest_path(t, "A", goal_panos(t, "kitchen")) is not None
+    fl["edges"][-1]["openings"][0]["type"] = "window"     # a window is not a way through
+    t = build_twin(m)
+    assert shortest_path(t, "A", goal_panos(t, "kitchen")) is None
+
+
+def test_matterport_neighbours_are_the_candidate_links():
+    m = model()
+    m["locations"] = [{"id": "A", "neighbors": ["B"]}, {"id": "B", "neighbors": ["A"]}]
+    t = build_twin(m)
+    assert {v for v, _ in t.links["A"]} == {"B"}          # only listed neighbours
+    assert not t.links["C"]
