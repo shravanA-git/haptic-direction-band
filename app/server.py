@@ -17,6 +17,8 @@ WebSocket, page -> server (JSON):
   {"cmd":"setting","setting":"intensity","value":"high"}   {"cmd":"settings"}
   {"cmd":"caregiver_test"}           (send a test text; caregiver_texts toggles via "setting")
   {"cmd":"teach","seconds":2.5}      (Teach a Sound: make the sound once)  {"cmd":"forget_sound"}
+HTTP GET /video: MJPEG (multipart/x-mixed-replace) of the vision camera's
+  annotated frames (tracked box, dead band, "target: STATE"); 503 without vision.
 server -> page:
   {"type":"mic","ms":..,"levels":[f,r,b,l],"replay":bool}
   {"type":"pulse","motor":k,"ms":..,"dry":bool}   {"type":"stop"}
@@ -603,6 +605,47 @@ class App:
     async def index(self, request):
         return web.FileResponse(DASH / "index.html")
 
+    VIDEO_FPS = 12          # preview cap; the detector runs at ~10 fps anyway
+    VIDEO_QUALITY = 70
+
+    def _jpeg(self, frame) -> Optional[bytes]:
+        """Encode once per camera frame, shared by every viewer."""
+        key = id(frame)
+        cached = getattr(self, "_jpeg_cache", None)
+        if cached and cached[0] == key:
+            return cached[1]
+        import cv2
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.VIDEO_QUALITY])
+        data = buf.tobytes() if ok else None
+        self._jpeg_cache = (key, data, frame)   # keep frame alive so id() stays unique
+        return data
+
+    async def video(self, request):
+        """Live camera preview for the dashboard <img src="/video">."""
+        v = self.vision
+        if v is None or not hasattr(v, "latest_frame"):
+            return web.Response(status=503, text="vision is off")
+        resp = web.StreamResponse(headers={
+            "Content-Type": "multipart/x-mixed-replace; boundary=frame",
+            "Cache-Control": "no-cache, no-store", "Pragma": "no-cache"})
+        await resp.prepare(request)
+        loop = asyncio.get_running_loop()
+        last = None
+        try:
+            while True:
+                frame = v.latest_frame()
+                if frame is not None and frame is not last:
+                    last = frame
+                    data = await loop.run_in_executor(None, self._jpeg, frame)
+                    if data:
+                        await resp.write(b"--frame\r\nContent-Type: image/jpeg\r\n"
+                                         b"Content-Length: " + str(len(data)).encode()
+                                         + b"\r\n\r\n" + data + b"\r\n")
+                await asyncio.sleep(1.0 / self.VIDEO_FPS)
+        except (ConnectionResetError, RuntimeError):
+            pass   # viewer closed the tab
+        return resp
+
     async def _status_loop(self):
         while True:
             self.emit(self.status())
@@ -612,6 +655,7 @@ class App:
         app = web.Application()
         app.router.add_get("/", self.index)
         app.router.add_get("/ws", self.ws_handler)
+        app.router.add_get("/video", self.video)
 
         async def on_startup(_):
             self.loop = asyncio.get_running_loop()
