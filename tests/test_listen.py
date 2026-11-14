@@ -576,3 +576,17 @@ def test_quiet_rings_in_talk_match_and_talk_and_lookalikes_do_not(tmp_path):
                   np.zeros(3 * SR, np.float32)]
     worst = [ring_in_talk(x, 50 + i) for i, x in enumerate(lookalikes)]
     assert max(worst) < sl.threshold, worst
+
+
+def test_real_speaker_rings_in_the_room_are_one_event_each():
+    """tests/fixtures/ring_speaker.npy: int16 16 kHz, 6 s from the laptop mic in the
+    hackathon room: 1 s of room, then a synthetic ding-dong (659->523 Hz) played
+    twice through the laptop speaker."""
+    from pathlib import Path
+    x = np.load(Path(__file__).parent / "fixtures" / "ring_speaker.npy").astype(np.float32) / 32767
+    evs = listen.analyze(x)
+    assert [s.category for _, s in evs] == ["two-tone", "two-tone"]
+    for _, s in evs:
+        assert s.duration_s >= 1.2 and "falling" in s.description
+        hz = listen._distinct_pitches(s.notes)
+        assert hz[0] == pytest.approx(659, rel=0.02) and hz[1] == pytest.approx(523, rel=0.02)
