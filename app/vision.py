@@ -45,8 +45,9 @@ Running it
         (also --dead-band, --dead-band-exit, --lost-after, --smoothing, --min-score)
     python -m app.vision --analyze recordings/banana.csv  # gaps, jitter, suggested settings
 
-Device: HDB_VISION_DEVICE=cpu|mps|cuda overrides; otherwise MPS is used only if it
-passes a test convolution in a child process (some torch/macOS pairs abort on it).
+Device: HDB_VISION_DEVICE=cpu|mps|cuda overrides; otherwise MPS is used only if a
+real detect on MPS survives in a child process (some torch/macOS pairs abort on it);
+the verdict is cached in models/mps_probe.json per torch + macOS version.
 
 Weights (yolo11s.pt, ~18 MB; HDB_YOLO_WEIGHTS to override) download at runtime into
 models/ (gitignored). Tuned on Sophanit's live banana run (Nov 13): yolov8n@416 saw
@@ -251,17 +252,58 @@ DETECT_CONF = 0.15  # detector floor; the tracker applies TrackerConfig.min_scor
 
 
 # A broken torch/macOS pairing (torch 2.15 on macOS 14.5) aborts the whole process
-# on the first MPS convolution - not a Python exception - so test MPS in a child
-# process before trusting it.
-_MPS_PROBE = ("import torch; x = torch.ones(1, 3, 32, 32, device='mps'); "
-              "w = torch.ones(4, 3, 3, 3, device='mps'); "
-              "print('ok', float(torch.nn.functional.conv2d(x, w).sum()))")
+# inside the first MPS detect - an NSException, not a Python exception. A bare conv2d
+# passes on that pairing, so the probe runs one real YOLO detect in a child process.
+# The verdict is cached per torch + macOS version in models/mps_probe.json.
+_MPS_PROBE = """
+import sys, numpy as np
+from ultralytics import YOLO
+m = YOLO(sys.argv[1])
+m.predict(np.zeros((480, 640, 3), np.uint8), imgsz=int(sys.argv[2]), device="mps", verbose=False)
+m.predict(np.full((480, 640, 3), 127, np.uint8), imgsz=int(sys.argv[2]), device="mps", verbose=False)
+print("ok")
+"""
 _device_cache: Optional[str] = None
 
 
+def _probe_key() -> str:
+    import platform
+    import torch
+    return f"torch {torch.__version__} / macOS {platform.mac_ver()[0]} / {DEFAULT_WEIGHTS}"
+
+
+def _mps_works() -> bool:
+    import json
+    import subprocess
+    import sys
+    cache = MODELS_DIR / "mps_probe.json"
+    key = _probe_key()
+    try:
+        saved = json.loads(cache.read_text())
+        if saved.get("key") == key:
+            return bool(saved["ok"])
+    except Exception:
+        pass
+    weights = MODELS_DIR / DEFAULT_WEIGHTS
+    if not weights.exists():
+        return False   # can't test yet; Detector() downloads weights before asking
+    try:
+        r = subprocess.run([sys.executable, "-c", _MPS_PROBE, str(weights), str(DEFAULT_IMGSZ)],
+                           capture_output=True, text=True, timeout=180)
+        ok = r.returncode == 0 and r.stdout.strip().endswith("ok")
+    except subprocess.TimeoutExpired:
+        ok = False
+    try:
+        MODELS_DIR.mkdir(exist_ok=True)
+        cache.write_text(json.dumps({"key": key, "ok": ok}))
+    except Exception:
+        pass
+    return ok
+
+
 def pick_device() -> str:
-    """HDB_VISION_DEVICE (cpu, mps, cuda) if set; else cuda, else MPS if it passes
-    a test convolution in a child process, else cpu."""
+    """HDB_VISION_DEVICE (cpu, mps, cuda) if set; else cuda, else MPS if a real YOLO
+    detect on MPS survives in a child process, else cpu."""
     global _device_cache
     env = os.environ.get("HDB_VISION_DEVICE", "").strip().lower()
     if env:
@@ -274,20 +316,12 @@ def pick_device() -> str:
         if torch.cuda.is_available():
             dev = "cuda"
         elif torch.backends.mps.is_available():
-            import subprocess
-            import sys
-            try:
-                r = subprocess.run([sys.executable, "-c", _MPS_PROBE], capture_output=True,
-                                   text=True, timeout=90)
-                ok = r.returncode == 0 and r.stdout.startswith("ok")
-            except subprocess.TimeoutExpired:
-                ok = False
-            if ok:
+            if _mps_works():
                 dev = "mps"
             else:
-                print(f"[vision] MPS failed a test convolution (torch {torch.__version__}); "
-                      "using CPU. Fix: pip install 'torch<2.12' (or HDB_VISION_DEVICE=cpu "
-                      "to skip this check)")
+                print(f"[vision] MPS failed a test detect ({_probe_key()}); using CPU. "
+                      "Fix: pip install 'torch<2.12' (or HDB_VISION_DEVICE=cpu to skip "
+                      "this check)")
     except Exception:
         dev = "cpu"
     _device_cache = dev
