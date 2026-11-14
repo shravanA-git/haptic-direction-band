@@ -3,6 +3,11 @@ aiohttp>=3.9
 pytest>=8
 # speech (hold-to-talk); optional, app runs without them
 faster-whisper>=1.0
+# av 16+ breaks faster-whisper 1.2.x file decode (av.open metadata_errors)
+av<16
 sounddevice>=0.4
 # Teach a Sound (app/listen.py); also used by speech
 numpy>=1.24
+# vision (find an object): YOLO + webcam; weights download into models/ on first run
+ultralytics>=8.0
+opencv-python>=4.8
