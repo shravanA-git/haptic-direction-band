@@ -106,7 +106,7 @@ def test_app_teach_detect_buzzes_pattern_and_logs(tmp_path):
     sl.feed(quiet(1.0))
     app.handle({"cmd": "teach", "seconds": 1.5})
     sl.feed(np.concatenate([quiet(0.3), tone(1200, 0.3), quiet(1.5)]))
-    assert app.state["sound"] == "taught, listening"
+    assert app.state["sound"] == "taught 'sound' [tone], listening"
     app._action(True)                                   # Action held: listener paused
     sl.feed(np.concatenate([tone(1200, 0.3), quiet(0.5)]))
     app._action(False)
@@ -117,7 +117,8 @@ def test_app_teach_detect_buzzes_pattern_and_logs(tmp_path):
     [a] = app.alerts.recent()
     assert a["source"] == "sound" and a["cue"] == "sound" and a["motor"] is None
     assert a["confidence"] >= 0.8 and a["duration_ms"] == pytest.approx(300, abs=80)
-    want = [f"PULSE {m} {ms}" for _, m, ms in haptics.taught_sound()]
+    assert a["category"] == "tone"
+    want = [f"PULSE {m} {ms}" for _, m, ms in sorted(haptics.taught_sound("tone"))]
     assert port.sent[:len(want)] == want
 
 
@@ -249,10 +250,129 @@ def test_taught_sound_buzzes_its_direction_from_band_mics(tmp_path):
     app.on_sound(listen.SoundHit(0.93, base + 1.0, base + 1.45, 0.1, "doorbell", "two-tone", 659.0))
     time.sleep(1.0)
     link.close()
-    want = [f"PULSE {m} {ms}" for _, m, ms in haptics.taught_sound()] + \
+    want = [f"PULSE {m} {ms}" for _, m, ms in sorted(haptics.taught_sound("two-tone"))] + \
         [f"PULSE 5 {haptics.DIRECTIONAL_MS}"]
     assert port.sent[:len(want)] == want
     [a] = app.alerts.recent()
     assert a["source"] == "sound" and a["motor"] == 5 and a["label"] == "doorbell"
     assert "back-left" in app.state["sound"] and "doorbell" in app.state["sound"]
     assert notify.pattern("sound")[-1] != (notify.SOUND_DIR_OFFSET_MS, 5, haptics.DIRECTIONAL_MS)
+
+
+# ---------------------------------------------------------- several named sounds
+def _app(tmp_path):
+    from app.link import Link, SimPort
+    from app.server import App
+
+    port = SimPort()
+    app = App(Link(port).start())
+    sl = listen.SoundListener(template_file=tmp_path / "t.json")
+    app.attach_sound(sl)
+    sent = []
+    app.emit = lambda m: sent.append(m) if m["type"] != "mic" else None
+    return app, sl, sent
+
+
+def test_app_teach_with_label_and_add_example(tmp_path):
+    app, sl, sent = _app(tmp_path)
+    sl.feed(room(1.0))
+    app.handle({"cmd": "teach", "seconds": 2.4, "label": " doorbell "})
+    assert "'doorbell'" in app.state["sound"]
+    sl.feed(in_room(ding_dong(), 0.3, 2.0))
+    app.handle({"cmd": "teach", "seconds": 2.0, "label": "microwave"})
+    sl.feed(in_room(beeps(), 0.3, 2.0))
+    app.handle({"cmd": "teach", "seconds": 2.4, "label": "doorbell", "add": True})
+    sl.feed(in_room(ding_dong(0.08), 0.3, 2.0))
+    app.link.close()
+    assert len(sl.sounds["doorbell"]) == 2 and len(sl.sounds["microwave"]) == 1
+    assert "doorbell" in app.state["sound"] and "two-tone" in app.state["sound"]
+    items = {i["label"]: i for i in app.handle({"cmd": "sounds"})["items"]}
+    assert items["doorbell"]["examples"] == 2 and items["doorbell"]["category"] == "two-tone"
+    assert items["microwave"]["category"] == "repeating"
+    assert [m for m in sent if m["type"] == "sounds"][-1]["items"] == list(items.values())
+    logs = [m["text"] for m in sent if m["type"] == "log"]
+    assert any("'doorbell'" in t for t in logs) and any("'microwave'" in t for t in logs)
+
+
+def test_app_forget_by_label_keeps_the_others(tmp_path):
+    app, sl, sent = _app(tmp_path)
+    teach_in_room(sl, ding_dong(), "doorbell")
+    teach_in_room(sl, beeps(), "microwave")
+    r = app.handle({"cmd": "forget_sound", "label": "microwave"})
+    assert set(sl.sounds) == {"doorbell"} and "microwave" in r["text"]
+    assert set(listen.SoundListener(template_file=tmp_path / "t.json").sounds) == {"doorbell"}
+    assert app.state["sound"] == "taught, listening"
+    assert [i["label"] for i in [m for m in sent if m["type"] == "sounds"][-1]["items"]] == ["doorbell"]
+    r = app.handle({"cmd": "forget_sound", "label": "kettle"})     # unknown: nothing forgotten
+    assert "no taught sound" in r["text"] and set(sl.sounds) == {"doorbell"}
+    app.handle({"cmd": "forget_sound"})                             # no label: all
+    app.link.close()
+    assert sl.sounds == {} and app.state["sound"] == "not taught yet"
+    assert [m for m in sent if m["type"] == "sounds"][-1] == {"type": "sounds", "items": []}
+
+
+def test_each_category_has_its_own_non_directional_pattern():
+    from app import haptics, notify
+
+    cats = ["tone", "two-tone", "repeating", "melody", "percussive", "noise", "voice"]
+    pats = {c: haptics.taught_sound(c) for c in cats}
+    assert len({tuple(sorted(p)) for p in pats.values()} | {tuple(haptics.SOUND_STEPS)}) == 8
+    for c, p in pats.items():
+        motors = {m for _, m, _ in p}
+        # never readable as a side: opposite motors together, or the full circle
+        assert motors == set(range(8)) or all((m + 4) % 8 in motors for m in motors), c
+        for off in {o for o, _, _ in p}:
+            assert sum(o == off for o, _, _ in p) <= 2, c        # at most two motors at once
+        assert all(haptics.MIN_PULSE_MS <= ms <= haptics.GENERIC_MS for _, _, ms in p), c
+        assert max(o + ms for o, _, ms in p) < notify.SOUND_DIR_OFFSET_MS, c
+        # the pulse toward the sound still follows the category pattern
+        assert notify.pattern("sound", 5, c) == p + [(notify.SOUND_DIR_OFFSET_MS, 5,
+                                                      haptics.DIRECTIONAL_MS)]
+    assert haptics.taught_sound(None) == haptics.taught_sound("unknown") == haptics.SOUND_STEPS
+    assert notify.pattern("sound") == haptics.SOUND_STEPS
+
+
+class FakeYamNet:
+    """Stands in for YAMNet: 'Knock' for untuned sounds, 'Music' otherwise."""
+    def __init__(self):
+        self.calls = 0
+
+    def load(self):
+        return self
+
+    def top(self, audio, k=5):
+        self.calls += 1
+        loud = float(np.sqrt(np.mean(audio ** 2)))
+        return [("Knock", 0.6), ("Door", 0.4)] if loud > 0.02 else [("Music", 0.5)]
+
+
+def wait_for(cond, s=2.0):
+    import time
+    t = time.monotonic()
+    while not cond() and time.monotonic() - t < s:
+        time.sleep(0.02)
+    return cond()
+
+
+def test_yamnet_names_untaught_sounds_and_taught_ones_win(tmp_path):
+    y = FakeYamNet()
+    sl = listen.SoundListener(template_file=tmp_path / "t.json", yamnet=y)
+    hits, heard = [], []
+    sl.on_detect, sl.on_heard = hits.append, heard.append
+    sl.cooldown_s = 0.0
+    sl.feed(room(1.0))
+    sl.feed(in_room(burst(0.15, 0.3), 0.3, 1.0))             # untaught knock-like sound
+    assert wait_for(lambda: hits)
+    assert hits[0].label == "Knock" and hits[0].category == "yamnet" and hits[0].score == 0.6
+    assert heard and heard[0].startswith("YAMNet: Knock 0.60")
+    teach_in_room(sl, ding_dong(), "doorbell")
+    sl._last_hit = -1e9            # fed faster than real time: wall-clock stamps run backwards
+    n = y.calls
+    sl.feed(in_room(ding_dong(), 0.5, 2.0))                    # taught: no YAMNet call needed
+    assert [h.label for h in hits] == ["Knock", "doorbell"]
+    assert wait_for(lambda: True, 0.3) and y.calls == n
+
+
+def test_yamnet_off_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("HDB_YAMNET", raising=False)
+    assert listen.SoundListener(template_file=tmp_path / "t.json").yamnet is None

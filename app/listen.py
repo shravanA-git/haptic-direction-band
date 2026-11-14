@@ -35,7 +35,13 @@ How it works (numpy only, no model):
       untuned template: 0.75 spectrum + 0.25 pattern, capped if the event is tonal;
     all times a duration factor. The best sound >= threshold (default 0.80) fires,
     with a cooldown.
-Direction is not estimated yet. Taught sounds are saved to
+YAMNet (HDB_YAMNET=1; pip install ai-edge-litert): sounds that match no taught
+sound go to Google's pretrained AudioSet classifier on a worker thread; its top
+classes are reported (on_heard) and a watched class (YAMNET_WATCH: doorbell,
+knock, door, smoke alarm, ...) >= HDB_YAMNET_MIN buzzes like a taught sound,
+label = the AudioSet class, category "yamnet". Weights download at runtime into
+models/yamnet/ (gitignored).
+With band MIC frames, app/server.py adds the direction. Taught sounds are saved to
 recordings/taught_sound.json (v2: a list of labelled sounds; a v1 single
 fingerprint still loads, as label "sound", spectrum-only).
 """
@@ -329,6 +335,90 @@ def pattern_score(t: Signature, e: Signature) -> float:
 
 
 # --------------------------------------------------------------------------
+# YAMNet: Google's pretrained AudioSet classifier (521 classes), for sounds
+# nobody taught ("Doorbell", "Knock", "Smoke detector, smoke alarm", ...)
+# --------------------------------------------------------------------------
+
+YAMNET_URL = ("https://storage.googleapis.com/download.tensorflow.org/models/tflite/"
+              "task_library/audio_classification/android/"
+              "lite-model_yamnet_classification_tflite_1.tflite")
+YAMNET_FILE = ROOT / "models" / "yamnet" / "yamnet.tflite"      # gitignored, ~4 MB
+# AudioSet classes that buzz (HDB_YAMNET_CLASSES="Doorbell;Knock" overrides; ';'-separated)
+YAMNET_WATCH = ("Doorbell", "Ding-dong", "Knock", "Door", "Smoke detector, smoke alarm", "Fire alarm",
+                "Alarm", "Alarm clock", "Siren", "Buzzer", "Telephone bell ringing", "Ringtone",
+                "Telephone", "Baby cry, infant cry", "Bark", "Microwave oven", "Beep, bleep",
+                "Shatter")
+YAMNET_MIN = 0.30              # class score that buzzes (HDB_YAMNET_MIN)
+
+
+class YamNet:
+    """YAMNet TFLite on the LiteRT runtime (pip install ai-edge-litert). Weights
+    download at runtime into models/yamnet/. scores() takes 16 kHz float audio
+    and returns the max over 0.975 s windows (hop 0.49 s) per class."""
+
+    def __init__(self, path: Path = YAMNET_FILE):
+        self.path = Path(path)
+        self._it = None
+        self.labels: list = []
+        self._lock = threading.Lock()
+
+    def load(self) -> "YamNet":
+        with self._lock:
+            if self._it is not None:
+                return self
+            if not self.path.exists():
+                import urllib.request
+                try:
+                    import certifi, ssl     # python.org macOS builds ship no CA bundle
+                    ctx = ssl.create_default_context(cafile=certifi.where())
+                except ImportError:
+                    ctx = None
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.path.with_suffix(".part")
+                with urllib.request.urlopen(YAMNET_URL, context=ctx, timeout=60) as r, \
+                        open(tmp, "wb") as f:
+                    f.write(r.read())
+                tmp.rename(self.path)
+            import zipfile
+            from ai_edge_litert.interpreter import Interpreter
+            self.labels = zipfile.ZipFile(self.path).read(
+                "yamnet_label_list.txt").decode().splitlines()
+            it = Interpreter(model_path=str(self.path))
+            it.allocate_tensors()
+            self._in, self._out = it.get_input_details()[0], it.get_output_details()[0]
+            self._it = it
+        return self
+
+    def scores(self, x: np.ndarray) -> np.ndarray:
+        self.load()
+        n = int(self._in["shape"][-1])          # 15600 samples = 0.975 s
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        if len(x) < n:
+            x = np.pad(x, (0, n - len(x)))
+        out = None
+        with self._lock:
+            for i in range(0, len(x) - n + 1, n // 2):
+                self._it.set_tensor(self._in["index"], x[i:i + n].reshape(self._in["shape"]))
+                self._it.invoke()
+                s = self._it.get_tensor(self._out["index"]).reshape(-1)
+                out = s if out is None else np.maximum(out, s)
+        return out
+
+    def top(self, x: np.ndarray, k: int = 5) -> list:
+        s = self.scores(x)
+        return [(self.labels[i], float(s[i])) for i in np.argsort(s)[::-1][:k]]
+
+
+def yamnet_available() -> Optional[str]:
+    """None if YAMNet can run here, else the reason."""
+    try:
+        import ai_edge_litert  # noqa: F401
+    except ImportError:
+        return "pip install ai-edge-litert"
+    return None
+
+
+# --------------------------------------------------------------------------
 # Templates (one example of a taught sound)
 # --------------------------------------------------------------------------
 
@@ -407,13 +497,40 @@ class _Event:
     pitches: list = field(default_factory=list)
     on: list = field(default_factory=list)
     quiet: int = 0
+    audio: list = field(default_factory=list)   # raw frames incl. pre-roll (for YAMNet)
+
+
+PRE_ROLL_FRAMES = 6            # ~190 ms of audio kept before an event starts
 
 
 class SoundListener:
     def __init__(self, on_detect: Optional[Callable[[SoundHit], None]] = None,
                  threshold: float = 0.80, cooldown_s: float = 1.5, device=None,
-                 template_file: Optional[Path] = TEMPLATE_FILE):
+                 template_file: Optional[Path] = TEMPLATE_FILE, yamnet=None):
         self.on_detect = on_detect
+        # YAMNet for untaught sounds: yamnet=True/False, a YamNet-like object, or None
+        # -> on when HDB_YAMNET=1. Runs on its own thread, never in the audio callback.
+        import os
+        if yamnet is None:
+            yamnet = os.environ.get("HDB_YAMNET", "0").lower() in ("1", "on", "true", "yes")
+        if yamnet is True:
+            why = yamnet_available()
+            yamnet = YamNet() if why is None else None
+            if why:
+                print(f"[listen] YAMNet off: {why}")
+        self.yamnet = yamnet or None
+        env = os.environ.get("HDB_YAMNET_CLASSES")
+        self.yamnet_watch = tuple(c.strip() for c in env.split(";") if c.strip()) if env \
+            else YAMNET_WATCH
+        self.yamnet_min = float(os.environ.get("HDB_YAMNET_MIN", YAMNET_MIN))
+        self.on_heard: Optional[Callable[[str], None]] = None   # "YAMNet: Knock 0.41, ..."
+        self.last_yamnet: list = []
+        self._yq = None
+        if self.yamnet is not None:
+            import queue
+            self._yq = queue.Queue(maxsize=8)
+            threading.Thread(target=self._yamnet_worker, name="yamnet", daemon=True).start()
+            threading.Thread(target=self._yamnet_load, name="yamnet-load", daemon=True).start()
         self.on_taught: Optional[Callable[[Optional[Template], str], None]] = None
         self.on_event: Optional[Callable[[float, float], None]] = None   # debug: (score, dur)
         # debug: (Signature, best label or None, best score) for every event
@@ -429,6 +546,7 @@ class SoundListener:
         self._latest: Optional[Template] = None
         self._levels: deque = deque(maxlen=int(3 * SAMPLE_RATE / FRAME))
         self._noise_psd: Optional[np.ndarray] = None   # room spectrum (quiet frames)
+        self._pre: deque = deque(maxlen=PRE_ROLL_FRAMES)  # recent frames (event pre-roll)
         self._buf = np.zeros(0, dtype=np.float32)
         self._n = 0                       # samples consumed
         self._offset: Optional[float] = None
@@ -575,7 +693,10 @@ class SoundListener:
         if ev is None:
             if start:
                 ev = self._ev = _Event(n0, [], rms)
+                ev.audio = list(self._pre)
                 self._add(ev, f, rms, True, spec)
+            else:
+                self._pre.append(f)
         elif hold:
             self._add(ev, f, rms, True, spec)
             ev.peak = max(ev.peak, rms)
@@ -603,6 +724,7 @@ class SoundListener:
              spec: Optional[np.ndarray] = None) -> None:
         ev.rms.append(rms)
         ev.on.append(on)
+        ev.audio.append(f)
         if on:
             ev.bands.append(band_energies(f))
             clear = rms >= PITCH_RMS_RATIO * self.noise_floor   # well above the room
@@ -622,9 +744,11 @@ class SoundListener:
             self._teach_events.append(Template(fp, dur, ev.peak, time.time(),
                                                self._teach_label, sig))
             return
+        end_n = ev.start_n + int(round(dur * SAMPLE_RATE))
         if not self.sounds:
             if self.on_classified:
                 self.on_classified(sig, None, 0.0)
+            self._to_yamnet(ev, sig, end_n)
             return
         best, best_label = 0.0, None
         for label, examples in self.sounds.items():
@@ -636,12 +760,59 @@ class SoundListener:
             self.on_event(best, dur)
         if self.on_classified:
             self.on_classified(sig, best_label, best)
-        end_n = ev.start_n + int(round(dur * SAMPLE_RATE))
         end_t = self._t(end_n)
+        if best < self.threshold:
+            self._to_yamnet(ev, sig, end_n)
         if best >= self.threshold and end_t - self._last_hit >= self.cooldown_s:
             self._last_hit = end_t
             hit = SoundHit(round(best, 3), self._t(ev.start_n), end_t, ev.peak,
                            best_label, sig.category, sig.pitch_hz)
+            self.last = hit
+            if self.on_detect:
+                try:
+                    self.on_detect(hit)
+                except Exception as e:
+                    print(f"[listen] on_detect error: {e}")
+
+    # ------------------------------------------------------------- YAMNet
+    def _to_yamnet(self, ev: _Event, sig: Signature, end_n: int) -> None:
+        if self._yq is None or self.paused:
+            return
+        try:
+            self._yq.put_nowait((np.concatenate(ev.audio), self._t(ev.start_n),
+                                 self._t(end_n), ev.peak, sig))
+        except Exception:
+            pass                       # busy: drop rather than lag behind the room
+
+    def _yamnet_load(self) -> None:
+        try:
+            self.yamnet.load()
+        except Exception as e:
+            print(f"[listen] YAMNet load failed: {e}")
+
+    def _yamnet_worker(self) -> None:
+        while True:
+            audio, start_t, end_t, peak, sig = self._yq.get()
+            try:
+                top = self.yamnet.top(audio, 5)
+            except Exception as e:
+                print(f"[listen] YAMNet error: {e}")
+                continue
+            self.last_yamnet = top
+            if self.on_heard:
+                try:
+                    self.on_heard("YAMNet: " + ", ".join(f"{n} {s:.2f}" for n, s in top[:3]))
+                except Exception:
+                    pass
+            watch = [(n, s) for n, s in top if n in self.yamnet_watch and s >= self.yamnet_min]
+            if not watch:
+                continue
+            name, score = max(watch, key=lambda x: x[1])
+            with self._lock:
+                if self.paused or end_t - self._last_hit < self.cooldown_s:
+                    continue
+                self._last_hit = end_t
+            hit = SoundHit(round(score, 3), start_t, end_t, peak, name, "yamnet", sig.pitch_hz)
             self.last = hit
             if self.on_detect:
                 try:
