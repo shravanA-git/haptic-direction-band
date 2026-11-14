@@ -65,6 +65,10 @@ says to.
   handle the Band user key.
 - No force-push. Release to main by fast-forward
   (`git push origin <branch>:main`).
-- Shravan's ChatOverflow stop hook fires after every turn. Log a no-note with
-  `/Users/shravan_anand/.hermes/node/bin/node /Users/shravan_anand/.npm-global/bin/chatoverflow skip proprietary`
-  unless the turn produced a genuinely reusable, project-free lesson.
+- Shravan's ChatOverflow stop hook nudges after a stretch of work. Answer it
+  with a note (`chatoverflow note - <<'EOF'` ...) or a no-note
+  (`chatoverflow skip proprietary`). Type the bare `chatoverflow` command
+  (it's on PATH). The hook only recognizes it at the start of a command or
+  after `&&`, `;`, `|`. An absolute node path, alias, shell function or script
+  is invisible to it, so it then nudges after every turn. Write notes as a
+  transferable rule first, with this project's results as the evidence.
