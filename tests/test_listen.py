@@ -360,10 +360,11 @@ def test_yamnet_names_untaught_sounds_and_taught_ones_win(tmp_path):
     hits, heard = [], []
     sl.on_detect, sl.on_heard = hits.append, heard.append
     sl.cooldown_s = 0.0
+    sl.yamnet_watch = ("Knock",)
     sl.feed(room(1.0))
     sl.feed(in_room(burst(0.15, 0.3), 0.3, 1.0))             # untaught knock-like sound
     assert wait_for(lambda: hits)
-    assert hits[0].label == "Knock" and hits[0].category == "yamnet" and hits[0].score == 0.6
+    assert hits[0].label == "Knock" and hits[0].category == "percussive" and hits[0].score == 0.6
     assert heard and heard[0].startswith("YAMNet: Knock 0.60")
     teach_in_room(sl, ding_dong(), "doorbell")
     sl._last_hit = -1e9            # fed faster than real time: wall-clock stamps run backwards
@@ -376,3 +377,35 @@ def test_yamnet_names_untaught_sounds_and_taught_ones_win(tmp_path):
 def test_yamnet_off_by_default(tmp_path, monkeypatch):
     monkeypatch.delenv("HDB_YAMNET", raising=False)
     assert listen.SoundListener(template_file=tmp_path / "t.json").yamnet is None
+
+
+class ScriptedYamNet(FakeYamNet):
+    def __init__(self, top):
+        super().__init__()
+        self._top = top
+
+    def top(self, audio, k=5):
+        self.calls += 1
+        return self._top
+
+
+@pytest.mark.parametrize("top,want", [
+    ([("Doorbell", 0.91), ("Ding-dong", 0.6)], [("Doorbell", "two-tone")]),
+    ([("Ding-dong", 0.55)], [("Ding-dong", "two-tone")]),
+    ([("Door", 0.41), ("Knock", 0.3)], []),                   # the live false alerts: off now
+    ([("Doorbell", 0.45)], []),                                # below the 0.5 floor
+])
+def test_yamnet_default_is_doorbell_only_with_its_pattern(tmp_path, monkeypatch, top, want):
+    from app import haptics
+    for k in ("HDB_YAMNET_CLASSES", "HDB_YAMNET_MIN"):
+        monkeypatch.delenv(k, raising=False)
+    sl = listen.SoundListener(template_file=tmp_path / "t.json", yamnet=ScriptedYamNet(top))
+    hits = []
+    sl.on_detect = hits.append
+    sl.feed(room(1.0))
+    sl.feed(in_room(burst(0.15, 0.3), 0.3, 1.0))
+    assert wait_for(lambda: sl.yamnet.calls)
+    wait_for(lambda: bool(hits), 0.3)                          # let the worker finish
+    assert [(h.label, h.category) for h in hits] == want
+    if want:
+        assert haptics.taught_sound(hits[0].category) == haptics.SOUND_PATTERNS["two-tone"]

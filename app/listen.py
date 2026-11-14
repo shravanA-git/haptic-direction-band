@@ -343,12 +343,20 @@ YAMNET_URL = ("https://storage.googleapis.com/download.tensorflow.org/models/tfl
               "task_library/audio_classification/android/"
               "lite-model_yamnet_classification_tflite_1.tflite")
 YAMNET_FILE = ROOT / "models" / "yamnet" / "yamnet.tflite"      # gitignored, ~4 MB
-# AudioSet classes that buzz (HDB_YAMNET_CLASSES="Doorbell;Knock" overrides; ';'-separated)
-YAMNET_WATCH = ("Doorbell", "Ding-dong", "Knock", "Door", "Smoke detector, smoke alarm", "Fire alarm",
-                "Alarm", "Alarm clock", "Siren", "Buzzer", "Telephone bell ringing", "Ringtone",
-                "Telephone", "Baby cry, infant cry", "Bark", "Microwave oven", "Beep, bleep",
-                "Shatter")
-YAMNET_MIN = 0.30              # class score that buzzes (HDB_YAMNET_MIN)
+# AudioSet classes that buzz (HDB_YAMNET_CLASSES="Doorbell;Knock" overrides; ';'-separated).
+# Doorbell only for now (Sophanit, Nov 14): in a live run real rings scored
+# 0.89-0.96 while "Door" fired 7 false alerts at 0.33-0.41.
+YAMNET_WATCH = ("Doorbell", "Ding-dong")
+# Candidates for later: "Knock", "Smoke detector, smoke alarm", "Fire alarm", "Alarm",
+# "Alarm clock", "Siren", "Buzzer", "Telephone bell ringing", "Ringtone",
+# "Baby cry, infant cry", "Bark", "Microwave oven", "Beep, bleep", "Shatter"
+YAMNET_MIN = 0.50              # class score that buzzes (HDB_YAMNET_MIN)
+# Haptic pattern category (haptics.SOUND_PATTERNS) per class; others use "yamnet"
+# (no pattern of its own: the shared sweep).
+YAMNET_CATEGORY = {"Doorbell": "two-tone", "Ding-dong": "two-tone", "Knock": "percussive",
+                   "Smoke detector, smoke alarm": "repeating", "Fire alarm": "repeating",
+                   "Alarm": "repeating", "Siren": "melody", "Baby cry, infant cry": "voice",
+                   "Bark": "noise", "Shatter": "percussive"}
 
 
 class YamNet:
@@ -812,7 +820,8 @@ class SoundListener:
                 if self.paused or end_t - self._last_hit < self.cooldown_s:
                     continue
                 self._last_hit = end_t
-            hit = SoundHit(round(score, 3), start_t, end_t, peak, name, "yamnet", sig.pitch_hz)
+            hit = SoundHit(round(score, 3), start_t, end_t, peak, name,
+                           YAMNET_CATEGORY.get(name, "yamnet"), sig.pitch_hz)
             self.last = hit
             if self.on_detect:
                 try:
