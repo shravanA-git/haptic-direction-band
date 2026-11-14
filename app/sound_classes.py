@@ -246,6 +246,8 @@ def main(argv=None) -> None:
     p.add_argument("--file", nargs="*", help="WAV file(s): print hits and top classes")
     p.add_argument("--listen", action="store_true", help="laptop mic, print hits")
     p.add_argument("--seconds", type=float, default=0, help="with --listen: stop after N s")
+    p.add_argument("--top", action="store_true",
+                   help="with --listen: also print YAMNet's top 3 classes for each non-silent window")
     p.add_argument("--fetch", action="store_true", help="download the model and exit")
     a = p.parse_args(argv)
     if a.fetch:
@@ -263,7 +265,16 @@ def main(argv=None) -> None:
     if a.listen:
         sc = SoundClassifier(on_detect=lambda h: print(
             f"[sounds] {h.label} [{h.category}] score {h.score} "
-            f"({(h.end - h.start) * 1000:.0f} ms)", flush=True)).start()
+            f"({(h.end - h.start) * 1000:.0f} ms)", flush=True))
+        if a.top:
+            def show(t, g, sc=sc):
+                w = sc._buf[:sc._win]
+                top = sc.yamnet.top(w)
+                if top[0][0] != "Silence":
+                    best = max(g, key=g.get)
+                    print(f"  {top}   best sound: {best} {g[best]:.2f}", flush=True)
+            sc.on_window = show
+        sc.start()
         print("[sounds] listening; Ctrl-C to stop", flush=True)
         t0 = time.monotonic()
         try:
