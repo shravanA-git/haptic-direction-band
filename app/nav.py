@@ -421,9 +421,11 @@ class RoutePlayer:
             self._status("step", i)
         else:
             with self._lock:
-                self.done, self.auto, self._want = True, False, 0
+                self.auto, self._want = False, 0
             self.play_cue(haptics.centered())
             self._say(self.arrival_text())
+            with self._lock:
+                self.done = True             # only after the arrival cue and words
             self._status("arrived", i)
 
     def _status(self, event: Optional[str], i: Optional[int] = None) -> None:
