@@ -86,6 +86,16 @@ NOISE_SUB = 2.0                # subtract this x the room spectrum before pitch 
 NOISE_ALPHA = 0.05             # room-spectrum update rate (quiet frames)
 PITCH_RMS_RATIO = 2.5          # only frames this far above the floor get a pitch
 NOTE_MIN_SHARE = 0.3           # notes shorter than this x the longest note are dropped,
+MERGE_GAP_FRAMES = 4           # a same-pitch note continues across a dip this short (~130 ms)
+DECAY_REBOUND = 0.8            # ...and a level jump inside one ringing note is not a new
+                               # strike unless it gets back to this x the note's peak
+# Template-guided recovery of a note the event lost (a weak or masked "ding", or an
+# event that only started at the "dong"): look for the missing note's frequency as a
+# steady spectral peak where the template says it should be (pre-roll included).
+RECOVER_PROM = 10.0            # peak power over the median of its +-300 Hz neighbourhood
+RECOVER_SHARE = 0.7            # of the frames where the note should be
+RECOVER_STEADY_HZ = 6.0        # a bell holds its pitch; speech harmonics glide
+RECOVER_BINS = 2               # search +-2 bins (+-16 Hz) around the expected pitch
 NOTE_KEEP_S = 0.2              # unless at least this long: a doorbell's short "ding"
                                # (~0.3 s) next to its long-ringing "dong" (~1.2 s) sat
                                # right at 0.3x and vanished on some rings (score 0.67)
@@ -276,8 +286,24 @@ def describe_frames(rms: list, pitches: list, on: list) -> Signature:
         if on[i] and rms[i] > ONSET_JUMP * recent and rms[i] > rms[i - 1] * 1.3 \
                 and rms[i] >= ONSET_MIN_PEAK * peak and i * dt - onsets[-1] >= 0.08:
             onsets.append(i * dt)
+
+    def pitch_near(i0, i1):
+        ps = [pitches[j] for j in range(max(0, i0), min(last + 1, i1)) if pitches[j] is not None]
+        return float(np.median(ps)) if ps else None
+
+    # a rebound inside one ringing note (speaker/room dip) is not a new strike
+    kept, prev_f = [0.0], 0
+    for t in onsets[1:]:
+        i = int(round(t / dt))
+        before, after = pitch_near(i - 6, i), pitch_near(i, i + 4)
+        same = before is not None and after is not None and abs(cents(before, after)) <= NOTE_CENTS
+        if same and max(rms[i:i + 4]) < DECAY_REBOUND * max(rms[prev_f:i]):
+            continue
+        kept.append(t)
+        prev_f = i
+    onsets = kept
     onset_frames = {int(round(t / dt)) for t in onsets[1:]}
-    # notes: runs of tonal frames at a steady pitch (1-frame dropouts tolerated)
+    # notes: runs of tonal frames at a steady pitch (same-pitch dips up to MERGE_GAP_FRAMES)
     notes, cur, gap = [], None, 0
 
     def close(c):
@@ -288,7 +314,7 @@ def describe_frames(rms: list, pitches: list, on: list) -> Signature:
         p = pitches[i]
         if p is None:
             gap += 1
-            if gap > 1 and cur:
+            if gap > MERGE_GAP_FRAMES and cur:
                 close(cur)
                 cur = None
             continue
@@ -306,6 +332,64 @@ def describe_frames(rms: list, pitches: list, on: list) -> Signature:
         notes = [n for n in notes if n[2] >= NOTE_MIN_SHARE * longest or n[2] >= NOTE_KEEP_S]
     sig = Signature(dur, tonal, notes, onsets)
     sig.category, sig.description = categorize(sig)
+    return sig
+
+
+def recover_notes(e: Signature, t: Optional[Signature], specs: list, n_pre: int,
+                  noise_psd: Optional[np.ndarray]) -> Signature:
+    """The event's signature plus any template note it lost, if that note's pitch is a
+    steady, prominent spectral peak where the template puts it (relative to a note
+    both share). specs: pitch_spectrum of the pre-roll frames then the event frames;
+    n_pre: how many are pre-roll. Returns e itself when nothing is recovered."""
+    if t is None or not t.notes or not e.notes or not specs:
+        return e
+    dt = FRAME / SAMPLE_RATE
+
+    def partner(hz):
+        return next((n for n in e.notes if abs(cents(hz, n[0])) <= NOTE_CENTS), None)
+    anchor = next(((tn, partner(tn[0])) for tn in t.notes if partner(tn[0])), None)
+    if anchor is None:
+        return e
+    (thz, ts, _), (ehz, es, _) = anchor
+    found = []
+    for hz, start, d in t.notes:
+        if partner(hz):
+            continue
+        want = hz * ehz / thz                    # the ring may be a little sharp/flat
+        i0 = n_pre + int(round((es + start - ts) / dt))
+        i1 = i0 + max(1, int(round(d / dt)))
+        i0, i1 = max(0, i0), min(len(specs), i1)
+        if i1 - i0 < 3:
+            continue
+        k = int(round(want * NFFT / SAMPLE_RATE)) - _PLO
+        hits = []
+        for i in range(i0, i1):
+            sp = specs[i]
+            if sp is None:
+                continue
+            p = sp if noise_psd is None else np.maximum(sp - NOISE_SUB * noise_psd, 0.0)
+            lo, hi = k - RECOVER_BINS, k + RECOVER_BINS + 1
+            if lo < 1 or hi >= len(p) - 1:
+                break
+            j = lo + int(np.argmax(p[lo:hi]))
+            if p[j] < p[j - 1] or p[j] < p[j + 1]:
+                continue
+            ring = np.r_[p[max(0, j - 40):max(0, j - PEAK_HALF_BINS)], p[j + PEAK_HALF_BINS + 1:j + 41]]
+            if ring.size and p[j] >= RECOVER_PROM * (float(np.median(ring)) + 1e-20):
+                hits.append((i, (_PLO + j) * SAMPLE_RATE / NFFT))
+        hz_hits = [h for _, h in hits]
+        if len(hits) >= max(3, RECOVER_SHARE * (i1 - i0)) and np.std(hz_hits) <= RECOVER_STEADY_HZ:
+            a, b = hits[0][0], hits[-1][0]
+            found.append((float(np.median(hz_hits)), (a - n_pre) * dt, (b - a + 1) * dt))
+    if not found:
+        return e
+    shift = max(0.0, -min(n[1] for n in found))   # recovered from the pre-roll
+    notes = sorted([(h, st + shift, du) for h, st, du in e.notes + found], key=lambda n: n[1])
+    onsets = sorted({0.0, *[o + shift for o in e.onsets]})
+    sig = Signature(e.duration_s + shift, e.tonal, notes, onsets)
+    sig.category, sig.description = categorize(sig)
+    sig.description += " (recovered a weak note)"
+    sig.lead_s = shift                              # the sound began this long before the event
     return sig
 
 
@@ -486,7 +570,12 @@ def similarity(fp: np.ndarray, dur_s: float, tpl: Template,
     if t.is_tonal:
         if sig.tonal < 0.6 * TONAL_EVENT_FRAC or not sig.notes:
             return min(spectral, 0.5) * 0.6 * dur      # a clap can't be a chime
-        s = 0.5 * pitch_score(t, sig) + 0.2 * pat + 0.3 * spectral
+        ps = pitch_score(t, sig)
+        if ps >= 0.9 and len(_distinct_pitches(t.notes)) >= 2 and 0.25 <= dur_s < t.duration_s:
+            # every note of a multi-note sound matches but the event is shorter: a
+            # ringing tail sank under room noise (talk). Allow 3x shorter, not 2x.
+            dur = min(1.0, 3.0 * max(dur_s, 1e-3) / max(t.duration_s, 1e-3))
+        s = 0.5 * ps + 0.2 * pat + 0.3 * spectral
     else:
         s = 0.75 * spectral + 0.25 * pat
         if sig.is_tonal and sig.tonal > 0.7:
@@ -515,9 +604,13 @@ class _Event:
     on: list = field(default_factory=list)
     quiet: int = 0
     audio: list = field(default_factory=list)   # raw frames incl. pre-roll (for YAMNet)
+    specs: list = field(default_factory=list)   # pitch_spectrum per frame: pre-roll, then event
+    n_pre: int = 0
 
 
-PRE_ROLL_FRAMES = 6            # ~190 ms of audio kept before an event starts
+PRE_ROLL_FRAMES = 12           # ~380 ms kept before an event starts (YAMNet audio, and
+                               # where a weak first note is looked for: a ding 0.32 s
+                               # before the dong that started the event)
 
 
 class SoundListener:
@@ -711,10 +804,12 @@ class SoundListener:
         if ev is None:
             if start:
                 ev = self._ev = _Event(n0, [], rms)
-                ev.audio = list(self._pre)
+                ev.audio = [a for a, _ in self._pre]
+                ev.specs = [sp for _, sp in self._pre]
+                ev.n_pre = len(ev.specs)
                 self._add(ev, f, rms, True, spec)
             else:
-                self._pre.append(f)
+                self._pre.append((f, spec))
         elif hold:
             self._add(ev, f, rms, True, spec)
             ev.peak = max(ev.peak, rms)
@@ -722,7 +817,7 @@ class SoundListener:
             if len(ev.on) * FRAME >= MAX_EVENT_S * SAMPLE_RATE:
                 self._close(self._n)
         else:
-            self._add(ev, f, rms, False)
+            self._add(ev, f, rms, False, spec)
             ev.quiet += 1
             if ev.quiet >= END_QUIET:
                 self._close(self._n - END_QUIET * FRAME)
@@ -743,6 +838,7 @@ class SoundListener:
         ev.rms.append(rms)
         ev.on.append(on)
         ev.audio.append(f)
+        ev.specs.append(spec if spec is not None else pitch_spectrum(f))
         if on:
             ev.bands.append(band_energies(f))
             clear = rms >= PITCH_RMS_RATIO * self.noise_floor   # well above the room
@@ -768,12 +864,18 @@ class SoundListener:
                 self.on_classified(sig, None, 0.0)
             self._to_yamnet(ev, sig, end_n)
             return
-        best, best_label = 0.0, None
+        best, best_label, best_sig = 0.0, None, sig
         for label, examples in self.sounds.items():
             for tpl in examples:
-                s = similarity(fp, dur, tpl, sig)
+                cands = [(similarity(fp, dur, tpl, sig), sig)]
+                rec = recover_notes(sig, tpl.sig, ev.specs, ev.n_pre, self._noise_psd)
+                if rec is not sig:
+                    cands.append((similarity(fp, rec.duration_s, tpl, rec), rec))
+                s, s_sig = max(cands, key=lambda c: c[0])
                 if s > best:
-                    best, best_label = s, label
+                    best, best_label, best_sig = s, label, s_sig
+        sig = best_sig
+        start_t = self._t(ev.start_n) - getattr(sig, "lead_s", 0.0)
         if self.on_event:
             self.on_event(best, dur)
         if self.on_classified:
@@ -783,8 +885,8 @@ class SoundListener:
             self._to_yamnet(ev, sig, end_n)
         if best >= self.threshold and end_t - self._last_hit >= self.cooldown_s:
             self._last_hit = end_t
-            self._hits.append((self._t(ev.start_n), end_t))
-            hit = SoundHit(round(best, 3), self._t(ev.start_n), end_t, ev.peak,
+            self._hits.append((start_t, end_t))
+            hit = SoundHit(round(best, 3), start_t, end_t, ev.peak,
                            best_label, sig.category, sig.pitch_hz)
             self.last = hit
             if self.on_detect:

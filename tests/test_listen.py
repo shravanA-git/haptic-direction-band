@@ -480,3 +480,99 @@ def test_yamnet_backs_up_an_untaught_ring_once(tmp_path):
     assert wait_for(lambda: hits, 3.0)
     wait_for(lambda: len(hits) > 1, 0.5)
     assert [(h.label, h.category) for h in hits] == [("Doorbell", "two-tone")]
+
+
+# ---------------------------------------------------------- dips, weak dings, talk
+def babble(s, level=0.006, seed=0):
+    """Speech-like room talk: voiced syllables (gliding 100-250 Hz harmonics),
+    some noisy consonants, short pauses."""
+    r = np.random.default_rng(seed)
+    n = int(s * SR)
+    out, t = np.zeros(n, np.float32), 0
+    while t < n:
+        m = int(r.uniform(0.08, 0.3) * SR)
+        if r.random() >= 0.2:
+            tt = np.arange(m) / SR
+            f0 = r.uniform(100, 250) * (1 + r.uniform(-0.15, 0.15) * tt / tt[-1])
+            ph = 2 * np.pi * np.cumsum(f0) / SR
+            x = sum(0.6 ** h * np.sin((h + 1) * ph) for h in range(8))
+            if r.random() < 0.3:
+                x = 0.3 * x + r.standard_normal(m)
+            x = x * np.sin(np.pi * np.arange(m) / m) ** 0.5
+            x = x / (np.sqrt(np.mean(x ** 2)) + 1e-9) * level * r.uniform(0.5, 1.5)
+            e = min(n, t + m)
+            out[t:e] += x[:e - t].astype(np.float32)
+        t += m
+    return out
+
+
+def dipped(x, at_s, depth=0.03, dur_s=0.12):
+    """The speaker/room dips the level briefly (what split the dong live)."""
+    env = np.ones(len(x), np.float32)
+    i, n = int(at_s * SR), int(dur_s * SR)
+    env[i:i + n] = depth
+    return x * env
+
+
+def test_a_dip_inside_one_ringing_note_is_not_a_second_strike():
+    dt = listen.FRAME / SR
+    rms = [0.2 * 0.93 ** i for i in range(30)]
+    pitches = [561.0] * 30
+    on = [True] * 30
+    for i in (12, 13, 14):                       # ~100 ms dip, then back (lower: decaying)
+        rms[i], pitches[i], on[i] = 0.004, None, False
+    sig = listen.describe_frames(rms, pitches, on)
+    assert len(sig.notes) == 1 and sig.onsets == [0.0], (sig.notes, sig.onsets)
+    assert sig.category == "tone" and sig.notes[0][2] == pytest.approx(30 * dt)
+    # real beeps (back to full level after each gap) are still separate strikes
+    rms = ([0.1] * 5 + [0.002] * 5) * 3
+    pitches = ([2000.0] * 5 + [None] * 5) * 3
+    on = ([True] * 5 + [False] * 5) * 3
+    sig = listen.describe_frames(rms, pitches, on)
+    assert sig.category == "repeating" and len(sig.onsets) == 3
+
+
+def test_doorbell_with_a_dip_in_the_dong_still_matches_as_two_tone(tmp_path):
+    sl = listen.SoundListener(template_file=tmp_path / "t.json")
+    seen = []
+    sl.on_classified = lambda sig, label, s: seen.append((round(s, 2), sig.category))
+    c = Clock(sl)
+    c.feed(room(1.0))
+    sl.teach(3.0, "doorbell")
+    c.feed(in_room(chime(), 0.3, 2.0))
+    seen.clear()
+    for at in (0.6, 0.8, 1.0):
+        c.feed(in_room(dipped(chime(), at), 1.0, 2.0))
+    assert [cat for _, cat in seen] == ["two-tone"] * 3 and min(s for s, _ in seen) >= 0.95, seen
+
+
+def test_quiet_rings_in_talk_match_and_talk_and_lookalikes_do_not(tmp_path):
+    """Taught loud in a quiet room; rung at 25% volume while people talk nearby,
+    with a weaker ding. Before: the weak ding was lost and the event read as one
+    561 Hz tone (0.55-0.6). Single 561 Hz bells/beeps/tones and the reversed
+    chime in the same talk must stay below the threshold."""
+    sl = listen.SoundListener(template_file=tmp_path / "t.json")
+    seen = []
+    sl.on_classified = lambda sig, label, s: seen.append((round(s, 2), sig.description))
+    c = Clock(sl)
+    c.feed(room(1.0))
+    sl.teach(3.0, "doorbell")
+    c.feed(in_room(chime(), 0.3, 2.0))
+    talk_level = 0.006
+    c.feed(room(2.0) + babble(2.0, talk_level, 99))
+
+    def ring_in_talk(x, seed):
+        seg = np.concatenate([np.zeros(2 * SR, np.float32), x, np.zeros(int(2.5 * SR), np.float32)])
+        seen.clear()
+        c.feed(room(len(seg) / SR) + babble(len(seg) / SR, talk_level, seed) + seg)
+        return max([s for s, _ in seen], default=0.0)
+
+    rings = [ring_in_talk(chime(0.0375, cents=cn, gap=0.32) * 1.0, i) if i % 2 else
+             ring_in_talk(chime(0.0375, cents=cn) - 0.5 * bell(728 * 2 ** (cn / 1200), 1.6, 0.0375), i)
+             for i, cn in enumerate((0, 8, -8, 5, -5, 10))]
+    assert min(rings) >= sl.threshold, rings
+    lookalikes = [bell(561, 1.5, 0.04), bell(561, 1.5, 0.1), beeps(561, amp=0.05),
+                  tone(561, 0.8, 0.04), chime(0.04, hi=561.0, lo=728.0), chime(0.04, hi=880.0, lo=660.0),
+                  np.zeros(3 * SR, np.float32)]
+    worst = [ring_in_talk(x, 50 + i) for i, x in enumerate(lookalikes)]
+    assert max(worst) < sl.threshold, worst
