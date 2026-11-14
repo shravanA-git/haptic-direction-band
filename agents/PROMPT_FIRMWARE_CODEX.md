@@ -19,6 +19,7 @@ Steps:
 5. `uv sync`, then register with my key passed only as an environment variable (never write it to a file):
    `BAND_USER_API_KEY=<key> uv run python hdb_team.py register`
    If Band returns 401/403, stop and ask me for a freshly generated key. Don't retry the same one. If the name is "already taken", stop and tell me; don't create a duplicate.
+5b. Switch my clone to my lane's branch: `git fetch origin && git checkout firmware` (it already exists on GitHub). My agent works on this branch and releases to `main` as the room rules describe.
 6. Start the agent in the background so it keeps running after you finish: `uv run python hdb_team.py run`. Wait for `Agent started: HDB-Firmware` in the log with no traceback.
 7. Prove it can actually answer: download https://raw.githubusercontent.com/band-ai/add-band/main/scripts/verify_agent_reply.py to a temp file, read it, then run it from `agents/` with `BAND_USER_API_KEY=<key>`, `BAND_REST_URL=https://app.band.ai`, `VERIFY_AGENT_ID=<firmware agent_id from agent_config.yaml>`, `VERIFY_AGENT_NAME=HDB-Firmware` and `VERIFY_TIMEOUT_SECONDS=120`. Only call it done if it exits 0. If the agent reports an error, re-check `codex login status` first; an expired login is the usual cause.
 8. Tell me what's running and how to stop it, and remind me to:

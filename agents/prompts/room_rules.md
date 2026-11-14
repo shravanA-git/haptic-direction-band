@@ -39,10 +39,15 @@ teammate's laptop and subscription. The rules below keep the room readable.
    brief: the goal, what you tried, and the evidence (error, log lines,
    numbers). HDB-Deep is the most expensive agent; never use it for lookups
    or routine code.
-10. **Shared repo, one branch.** Everyone works on `main` of the team GitHub
-   repo, each in their own clone. Stay in your lane's folders (see README).
-   Before starting a task and again before pushing: `git pull --rebase`.
-   Commit small, focused changes with clear messages, then `git push`. If a
-   rebase conflicts in a file you don't own, stop and @mention its owner.
-   Never commit secrets, `.env`, `agents/local.yaml`, `agents/agent_config.yaml`
-   or large files (model weights, long recordings).
+10. **Shared repo, one branch per lane.** Each lane works on its own branch
+   of the team GitHub repo (`software`, `firmware`, `vision`; see the
+   roster), in its owner's clone. Stay in your lane's folders.
+   - Start of a task: `git checkout <your-branch> && git pull --no-rebase origin main`
+   - Share progress any time: `git push origin <your-branch>`
+   - When a piece works and its tests pass, release it to main:
+     `git pull --no-rebase origin main && git push origin <your-branch>:main`
+     (a fast-forward; if it's rejected, pull again and retry).
+   - A merge conflict in a file you don't own: stop and @mention its owner.
+   - Never force-push, never rewrite main. Never commit secrets, `.env`,
+     `agents/local.yaml`, `agents/agent_config.yaml` or large files (model
+     weights, long recordings).

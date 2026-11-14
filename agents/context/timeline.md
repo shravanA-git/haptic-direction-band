@@ -1,66 +1,80 @@
-# 36-hour timeline (from the HackPrinceton build plan, Nov 9 2026)
+# Schedule, priorities and demo
 
-Tracks in parallel: Software (Shravan), Firmware, Hardware, Vision and video.
-H0 = 8 PM Friday Nov 13. Hard submission deadline H36 = 8 AM Sunday Nov 15
-(submit by 7:30 AM). Judging starts 9:30 AM Sunday. Each phase ends in a gate;
-if it fails, take the fallback and move on.
+Clock: H0 = 8 PM Friday Nov 13. Hard submission deadline H36 = 8 AM Sunday
+Nov 15 (submit by 7:30 AM). Judging starts 9:30 AM Sunday. Features, build
+order and demo follow the Nov 13 team handoff; it replaces the Nov 9 plan
+where they differ. Each phase ends in a gate; if it fails, take the fallback
+and move on.
 
-1. **H0–H3 (Fri 8–11 PM), bring-up.** Software: repo, frame parser with fake
-   data, dashboard showing the motor ring. Firmware: serial frames, buzz a
-   motor on command, read one mic. Hardware: 8-channel driver board, one motor
-   on batteries, mics marked on the beanie. Vision: webcam + YOLO-World finds
-   "door". **Gate:** the laptop buzzes any motor; one mic streams.
-2. **H3–H9 (Fri 11 PM–Sat 5 AM), direction.** Software: direction v1,
-   calibration script, heading lock, recorded fixtures. Firmware: all 4 mics at
-   16 kHz, BNO055 and button frames. Hardware: 8 motors on the band, mics and
-   BNO055 on the beanie, strain relief. Vision: target angle and distance, hot
-   and cold mapping. **Gate H9:** in a quiet room, claps from 8 directions
-   light the right motor or its neighbour 8/8. **Fallback:** 4 directions.
-3. **H9–H15 (Sat 5–11 AM), both heroes end to end.** Software: Vosk grammar,
-   Who's Talking to Me loop with heading lock. Firmware: patterns stored on the
-   ESP32, link stress test. Hardware: can 3 people tell 8 positions apart? Move
-   motors if not. Vision: Where Am I? on the band. **Gate H15:** teammate in
-   noise-cancelling headphones turns to the right caller 4/5; blindfolded
-   teammate reaches the door from 3 m.
-4. **H15–H23 (Sat 11 AM–7 PM), sleep in shifts.** Two sleep H15–H19, two sleep
-   H19–H23. Software: Teach a Sound, event timeline, then Recall's agent and
-   tools. Vision: fall check with nod cancel; phone page for camera and Recall
-   chat; caregiver messages via Photon (Twilio fallback). Firmware/hardware:
-   Wi-Fi link and audio stream, power bank mount; direction v2 with Software
-   if v1 missed H9. **Gate H23:** doorbell taught in under 30 s recognised 4/5,
-   and Recall answers "who called me in the last 5 minutes?" correctly and
-   points the band at them.
-5. **H23–H27 (Sat 7–11 PM), integration.** Button modes, priority queue,
-   dashboard polish, switch demo to Wi-Fi, Conversation Compass if time.
-6. **H27–H30 (Sat 11 PM–Sun 2 AM), freeze and measure.** No new features. 5
-   people, 16 calls each from 8 directions with and without the band; time to
-   the door blindfolded; Teach a Sound hit rate. These numbers go in the pitch.
-7. **H30–H33 (Sun 2–5 AM), video and Devpost.** Film the optional video in a
-   quiet room; write Devpost with everyone's Discord username. Presenter sleeps.
-8. **H33–H36 (Sun 5–8 AM), rehearse and submit.** Run the live demo 5 times on
-   people who haven't worn the beanie; reset under a minute; submit by 7:30 AM.
+## Feature priorities
 
-**Cut order (first to go first):** route mode, Conversation Compass, Photon
-(keep Twilio), sound alerts, distance sensor (use box size), direction v2,
-Wi-Fi (demo on USB cable). **Never cut:** Who's Talking to Me, heading lock,
-Teach a Sound, Recall.
+1. **Find an object** (first live demo). Hold Action, say "find the banana",
+   release. The webcam tracks the target; left/right buzzes guide the head
+   turn, two front pulses when centered, a distinct cue when lost. Typed
+   target as a fallback.
+2. **Hear your name** (second live demo). A teammate says the configured name
+   once; the band estimates direction from the 4 mics and buzzes that side;
+   unclear direction gets a generic attention buzz.
+3. **Heading lock** (after basic name alerts; needs a stable IMU). The buzz
+   follows the saved room direction as the wearer turns; two front pulses on
+   alignment.
+4. **Teach a Sound** (planned): one taught sound with its own pattern; add
+   direction once recognition is reliable in noise.
+5. **Recall and caregiver texting** (backlog, separate from the core demo):
+   alert log, a chatbot with two tools first (look up recent alerts, change an
+   alert setting); later Photon texting and LangChain Deep Agents.
+6. Optional experiments: forward range sensor, nod acknowledgment, simulated
+   fall (impact plus stillness with a cancel window), phone companion.
+
+## Phases and gates
+
+1. **H0–H3 (Fri 8–11 PM), bring-up.** Hardware: motor 0 on GPIO 18 wired and
+   checked. Firmware: finite `PULSE` and `STOP` bench-tested at 115200. Vision
+   and speech: webcam + detector with a typed target. Software: serial link,
+   motor ring dashboard, replay of the two built-in traces.
+   **Gate H3:** the laptop pulses motor 0 on command and `STOP` works.
+2. **H3–H9 (Fri 11 PM–Sat 5 AM), full band and inputs.** Hardware: label
+   channels, test cardinal positions, expand to 8 motors. Firmware: stream
+   four `MIC` levels, debounce Action (`BTN ACTION DOWN/UP`). Vision: left /
+   right / centered / lost cues from the bounding box. Software: validate the
+   physical motor mapping, direction estimator on replays.
+   **Gate H9:** all 8 motors map correctly from the dashboard; a 4-mic stream
+   is visible. **Fallback:** 4 cardinal motors.
+3. **H9–H15 (Sat 5–11 AM), both demos end to end.** Vision and speech:
+   hold-to-talk target selection; name recognition with word timestamps.
+   Software: clock alignment and live name alerts from speech timestamps.
+   **Gate H15:** "find the banana" works end to end (left/right, centered,
+   lost); a called name gives the right side or a generic alert 4/5 times.
+   **Fallback:** coarse positions only (front/back/left/right).
+4. **H15–H23 (Sat 11 AM–7 PM), sleep in shifts.** Heading lock if the IMU is
+   stable; one taught sound; record quiet and noisy trials.
+   **Gate H23:** both demos survive 5 runs in a noisy room.
+5. **H23–H27 (Sat 7–11 PM), integration and polish.** Dashboard polish,
+   intensity buttons, Recall backlog only if everything above is solid.
+6. **H27–H30 (Sat 11 PM–Sun 2 AM), freeze and measure.** No new features.
+   Record correct directions, wrong directions, generic alerts, false alerts
+   and latency for the pitch.
+7. **H30–H33 (Sun 2–5 AM), video and Devpost.** Short video of a working run;
+   Devpost with everyone's Discord username. Presenter sleeps.
+8. **H33–H36 (Sun 5–8 AM), rehearse and submit.** Rehearse pause, `STOP` and
+   unplug behavior; submit by 7:30 AM.
+
+**Cut order (first to go):** Recall/caregiver texting, Teach a Sound, heading
+lock, range sensor, 8 → 4 motors. **Never cut:** find an object, hear your
+name, `STOP`/safety behavior.
+
+## Live demo (2 minutes, stationary and supervised)
+
+1. **Object first.** Say "find the banana". Move the target left and right;
+   show the motor ring; two front pulses on alignment. Remove it to show the
+   lost state. Keep a typed target and a short video ready.
+2. **Attention second.** A teammate calls the configured name from a known
+   position. Show the cue, then heading lock if stable. If direction only
+   works for coarse positions, use those positions.
+3. Present it as a prototype for orientation cues.
 
 ## Tracks
 
-Main: Best Healthcare Hack. Special/optional: Best Hardware Hack, Best Physical
-AI Hack ($500), Amazon Best Practical AI Innovation, LangChain best use of
-deepagents, Photon Messaging Agent. Each special track adds a separate judge
-visit, so the demo runs 6+ times Sunday. Track swaps for the last 40 s:
-Physical AI/Hardware: Wi-Fi off, smoke alarm, beanie still buzzes. Amazon: ask
-Recall to stop buzzing for "hey". LangChain: show the deepagent plan and tool
-calls. Photon: teammate texts the caregiver number, answer from the timeline.
-
-## Live demo script (2 minutes, judge wears the beanie)
-
-1. 0:00–0:15 problem; type the judge's name on the dashboard.
-2. 0:15–0:40 Who's Talking to Me: teammate behind-left says the name.
-3. 0:40–1:05 Teach a Sound: doorbell 3 times, then hidden behind the judge.
-4. 1:05–1:25 Where Am I?: blindfolded, select "chair", guided 2–3 m.
-5. 1:25–1:50 Recall: "who tried to get their attention while blindfolded?"
-   then "point me to them".
-6. 1:50–2:00 close with accuracy numbers.
+Main: Best Healthcare Hack. Optional/special tracks from the earlier plan
+(Hardware, Physical AI, Amazon, LangChain deepagents, Photon) depend on the
+backlog items; confirm sponsor criteria with organizers before pitching them.

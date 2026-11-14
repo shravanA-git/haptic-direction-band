@@ -1,64 +1,113 @@
-# Agreed protocol (from the HackPrinceton build plan, Nov 9 2026)
+# Hardware contract: pins, serial protocol, wiring
 
-Every message is one short text line, identical over USB serial (921,600 baud)
-and Wi-Fi UDP, so anyone can watch traffic in the Serial Monitor and type
-commands by hand. Audio is the only binary stream: 16 kHz mono in 20 ms packets
-on its own UDP port.
+Source of truth: the team handoff of Nov 13, 2026. It replaces the Nov 9 build
+plan's protocol and pin map. Agree in the room before changing pins or message
+formats (see HDB-Protocol).
 
-## ESP32 -> laptop
+## System split
 
-| Line | When | Meaning |
+- **Laptop:** video (USB webcam), speech (hold-to-talk, name recognition), the
+  direction estimator, haptic decisions, dashboard.
+- **ESP32 (HiLetgo ESP-WROOM-32):** reads 3 buttons and 4 mic levels, switches
+  motors on laptop command over USB. Two AAs power the motors.
+
+## Serial protocol: USB, 115200 baud, one text line per message
+
+| Direction | Line | Meaning |
 |---|---|---|
-| `L,<ms>,<f>,<r>,<b>,<l>,<heading>,<voice>` | Every 20 ms | Loudness of the front, right, back and left mics; head heading in degrees; voice detected 0 or 1 |
-| `EV,ALARM,<angle>` | On detection | Smoke-alarm tone heard; the ESP32 has already buzzed |
-| `EV,FALL` | On detection | Fall detected; the ESP32 has already buzzed all motors |
-| `EV,BTN,<mode\|action\|teach>` | On press | Button pressed |
-| `EV,NOD` | On detection | The user nodded, which cancels a fall alert |
-| `EV,FACED` | On reaching the target | The user turned to face the target |
+| ESP32 → laptop | `MIC <ms> <front> <right> <back> <left>` | Monotonic ESP32 milliseconds and four nonnegative, calibrated loudness values. One frame every 20–50 ms |
+| ESP32 → laptop | `BTN ACTION DOWN` / `BTN ACTION UP` | Action button pressed / released (debounced) |
+| Laptop → ESP32 | `PULSE <motor> <duration_ms>` | Run one motor for a finite time. Example: `PULSE 6 150` = left motor, 150 ms |
+| Laptop → ESP32 | `STOP` | All motors off now |
 
-## Laptop -> ESP32
+Firmware safety rules: initialize every motor off; every pulse is finite;
+stop all motors on `STOP`, on pause, on stale commands, and if the USB link is
+lost. Exactly one program owns the serial port at a time: close the Arduino
+Serial Monitor before the dashboard or laptop app opens it.
 
-| Line | Meaning |
+Not yet assigned in the protocol: intensity buttons (14, 4) and any IMU data.
+Propose line formats through HDB-Protocol before using them.
+
+## Haptic cues (current)
+
+| Cue | Pattern |
 |---|---|
-| `T,<room angle>,<pattern>,<timeout ms>` | Point at this direction; the ESP32 picks the motor and updates it as the head turns. Send twice over Wi-Fi |
-| `C` | Clear the target |
-| `P,<motor>,<pattern>` | Play one pattern on one motor: tests, Teach a Sound, compass |
-| `M,<deaf\|blind\|demo>` | Change mode |
-| `K` | Fall acknowledged; stop buzzing |
+| Directional (object left/right, name direction) | 200 ms pulse on the motor for that direction |
+| Generic attention (direction unclear, weak or stale evidence) | 300 ms on the front motor (0) |
+| Centered / aligned | Two front pulses |
+| Lost target | One distinct cue, then no directional pulses until reacquired |
+| Test pulse | 150 ms |
 
-## Heading lock
+Measure mic levels in the quiet gaps between motor pulses.
 
-When a target is found at angle θ relative to the head while the BNO055 reads
-heading h, store the room angle W = h + θ. On every motion update, buzz motor
-round((W − h_now) / 45) mod 8. Within 22° of the front: double pulse, send
-`EV,FACED`.
+## Pin map (classic ESP-WROOM-32; confirm against your board's labels)
 
-Worked example (caller behind-left): ESP32 sends `L,51230,120,90,580,640,10,1`;
-Vosk hears the name; Python takes the median voiced direction (~225°), adds
-heading 10°, sends `T,235,NAME,8000`; ESP32 computes 235 − 10 = 225° → motor 5.
+| Motor | Position | GPIO | Motor | Position | GPIO |
+|---|---|---|---|---|---|
+| 0 | Front | 18 | 4 | Back | 26 |
+| 1 | Front-right | 19 | 5 | Back-left | 27 |
+| 2 | Right | 23 | 6 | Left | 16 |
+| 3 | Back-right | 25 | 7 | Front-left | 17 |
 
-## Haptic vocabulary
-
-| Meaning | Pattern |
+| Peripheral | Pins and notes |
 |---|---|
-| Someone called you (`NAME`) | One 400 ms pulse on the motor facing them, repeated until you turn |
-| Facing them / arrived | Double pulse on the front motor |
-| Alarm | Three fast pulses, repeated |
-| A taught sound | Its own pattern, chosen when taught |
-| Guiding to a place (`GUIDE`) | Pulses every 600 ms far away, down to every 100 ms within 1 m |
-| Conversation Compass | One soft 60 ms tick toward the current speaker |
-| Fall check | All 8 motors; nod or press to cancel |
+| 4 × MAX4466 mics | Front 32, right 33, back 34, left 35 (all ADC1). Power from ESP32 3.3 V, common ground |
+| 3 buttons | Action 13, intensity down 14, intensity up 4. To GND with internal pull-ups and debounce |
+| Optional IMU | I²C SDA 21, SCL 22. GY-521/MPU-6050 pictured; BNO055 was proposed. Confirm breakout and power |
+| Optional range | One forward HC-SR04 on 5 V, shared ground. TRIG 4 only if intensity-up moves to the laptop. ECHO to GPIO 39 through a divider: 10 kΩ Echo→input, 15 kΩ input→GND |
 
-Haptics priority (highest first): fall, alarm, name, guide, compass.
+## One motor channel (build motor 0 on GPIO 18 first)
 
-## Pin map (ESP32)
+```
+AA pack + → rocker switch → switched motor + rail
+Motor + → switched rail        Motor − → transistor C
+GPIO18 → 220 Ω → transistor B
+Transistor B → 10 kΩ → GND     Transistor E → GND
+Diode stripe → motor +         Diode other end → motor −
+104 ceramic (100 nF) across motor + and motor −
+100 µF shared: + → switched rail, − (stripe) → GND
+AA pack − → common GND ← ESP32 GND
+```
 
-| Part | Pin | Notes |
-|---|---|---|
-| Mics front, right, back, left (MAX4466 OUT) | GPIO 36, 39, 34, 35 | ADC1 only (ADC2 fails with Wi-Fi); power from 3.3 V; gain pot at mid |
-| Motors 0–7 (front, front-right, right, back-right, back, back-left, left, front-left) | GPIO 16, 17, 18, 19, 23, 25, 26, 27 | Each through 220 Ω to a 2N2222 base |
-| Motor driver, each channel | — | 10 kΩ base to GND; emitter GND; collector to motor −; motor + to battery 3 V; 1N4007 across motor (stripe to 3 V); 0.1 µF across motor |
-| BNO055 | SDA 21, SCL 22 | 3.3 V |
-| Buttons mode, action, teach | GPIO 32, 33, 13 | INPUT_PULLUP, other leg to GND |
-| Distance sensor | I2C 21/22 (VL53L0X) or HC-SR04 TRIG 4, ECHO 14 via 10k/10k divider | Divider keeps 5 V echo within 3.3 V |
-| Decoupling | — | 470 µF across battery rail; 100 µF across ESP32 3.3 V |
+Per channel: coin motor (1.5–3 V), 2N2222-family NPN (e.g. onsemi P2N2222A,
+TO-92; check the datasheet pinout for your exact marking), 220 Ω base resistor
+(red-red-brown), 10 kΩ pull-down (brown-black-orange), 1N4007/1N4001 flyback
+(stripe = cathode, to motor +), 100 nF ceramic ("104"). Shared: 2 × AA in
+series with a rocker in the positive lead, 100 µF electrolytic (470 µF is a
+bench alternative).
+
+Power and safety: tie pack − to ESP32 GND; keep the battery + rail separate
+from ESP32 USB and 3.3 V. Before power, check diode and electrolytic polarity,
+pack voltage, ground continuity and shorts. First test: short pulse, `STOP`,
+confirm the transistor stays cool, then repeat starts, one motor at a time.
+Keep motor wiring away from analog mic leads; watch for split breadboard rails.
+
+Mounting: camera above the forehead, four mic openings exposed outside the
+band, eight motors against the inside. Label both ends of every lead,
+insulate joints, add strain relief. The driver board can stay on the table for
+the first demo.
+
+## Name-direction estimator (laptop)
+
+1. The speech recognizer gives the name's start and end (e.g. 2.10–2.55 s →
+   450 ms of band mic frames).
+2. Align clocks: buffer ~5 s of `MIC` frames; timestamp audio capture and
+   serial receipt on the laptop's monotonic clock and estimate the ESP32
+   offset. Check alignment with a sharp test sound.
+3. Remove DC offset, match gains across channels. Per short window, compute
+   (right − left) and (front − back) normalized by total level; combine usable
+   vectors across the phrase; pick the nearest motor direction. Weak,
+   conflicting or stale evidence → generic attention pulse.
+
+## Replay format (HTML dashboard)
+
+```json
+{"frames":[{"ms":0,"levels":[20,18,90,101]},
+           {"ms":50,"levels":[19,20,91,100]}],
+ "alerts":[{"startMs":0,"endMs":100}]}
+```
+
+Levels are front/right/back/left. The back-left sample should light motor 5;
+the unclear sample should give the generic attention cue. The HTML dashboard's
+integration point is `headband.alert(startMs, endMs)`. The optional Python
+dashboard replays JSONL rows with `t_ms` and `levels`.

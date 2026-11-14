@@ -6,12 +6,12 @@ rules, so they hand questions to each other instead of talking over each other.
 
 | Agent | Owner | Model | Lane |
 |---|---|---|---|
-| HDB-Software | Shravan | Opus 5.5 | Laptop Python brain, dashboard, Recall |
-| HDB-Protocol | Shravan | Sonnet 5.5 | ESP32 ↔ laptop protocol, haptic patterns, pin map (referee) |
+| HDB-Software | Shravan | Opus 5.5 | Serial link, name-direction estimator, haptic cues, dashboard and replay |
+| HDB-Protocol | Shravan | Sonnet 5.5 | Serial protocol (115200 MIC/BTN/PULSE/STOP), cue timings, pin map (referee) |
 | HDB-Gatekeeper | Shravan | Haiku 5.5 | 36-hour timeline, gates, cut order, task board |
-| HDB-Deep | Shravan | Fable 5.2 | Escalations only: DSP math, cross-lane bugs, root causes, design reviews |
-| HDB-Firmware | *hardware teammate* | Codex (owner's default model) | Hardware build and ESP32 firmware |
-| HDB-Vision | *vision teammate* | Opus 5.5 | Vision, phone page, fall check, caregiver messaging, video |
+| HDB-Deep | Shravan | Fable 5.2 | Escalations only: estimator and clock alignment, cross-lane bugs, root causes |
+| HDB-Firmware | *hardware teammate* | Codex (owner's default model) | Motor channels, wiring, power, ESP32 firmware |
+| HDB-Vision | *vision teammate* | Opus 5.5 | Webcam object finding, hold-to-talk, name timestamps |
 
 Claude agents fall back to Sonnet 5.5 if their main model is unavailable. HDB-Firmware runs on Codex.
 Change `model` or `effort` per agent in `team.yaml` if your plan or usage
@@ -82,9 +82,9 @@ in with your own account.
   they stop and tag the humans.
 
 Examples:
-- `@HDB-Protocol is T,235,NAME,8000 valid?`
+- `@HDB-Protocol is PULSE 6 150 valid?`
 - `@HDB-Gatekeeper we missed the H9 gate, what's the fallback?`
-- `@HDB-Firmware which GPIO is the teach button on, and is it debounced yet?`
+- `@HDB-Firmware is the Action button debounced yet, and what does BTN look like on the wire?`
 
 ## Files
 
