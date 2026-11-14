@@ -58,6 +58,11 @@ def main(argv=None) -> int:
                     help="which logical motors exist, e.g. 0,2,4,6 for a 4-motor band (front, right, "
                          "back, left; env HDB_MOTORS). Diagonals play as their two neighbours back to "
                          "back; default: all 8")
+    ap.add_argument("--agent", action="store_true",
+                    help="the band agent: text the band (iMessage via Photon) 'status', 'what did I miss "
+                         "today', 'find my keys'; also texts the caregiver on a crash or alarm. Uses a "
+                         "LangChain deep agent when installed with a key, else a keyword router")
+    ap.add_argument("--agent-offline", action="store_true", help="with --agent: keyword router only")
     ap.add_argument("--lan", action="store_true",
                     help="also serve phones on this Wi-Fi/hotspot (binds 0.0.0.0). No accounts: "
                          "anyone with the printed URL (it carries a random ?k= token) can buzz the "
@@ -163,6 +168,13 @@ def main(argv=None) -> int:
     from .notify import caregiver_from_env
     caregiver = caregiver_from_env(app.settings, dry=a.dry_texts)
     app.attach_caregiver(caregiver)
+    agent_svc = None
+    if a.agent:
+        try:
+            from .band_agent import from_app
+            agent_svc = from_app(app, caregiver, vision, offline=a.agent_offline)
+        except Exception as e:
+            print(f"[hdb] band agent off ({type(e).__name__}: {e})")
     st = caregiver.status()
     print(f"[hdb] caregiver texts: off until toggled on the dashboard; via {st['sender']}, "
           f"to {st['to']}")
@@ -186,6 +198,8 @@ def main(argv=None) -> int:
             vision.stop()
             guide.close()
         caregiver.close()
+        if agent_svc:
+            agent_svc.close()
         link.close()  # sends STOP before releasing the port
     return 0
 

@@ -122,6 +122,18 @@ class PhotonSender:
         self._cv = threading.Condition()
         self._next = 1
         self.error: Optional[str] = None
+        self._on_message: list = []
+
+    def on_message(self, fn) -> None:
+        """fn(sender, text) for each incoming text (band agent). Starts the bridge now so
+        texts arrive even before the first outgoing one."""
+        self._on_message.append(fn)
+        try:
+            with self._lock:
+                if self._p is None or self._p.poll() is not None:
+                    self._start()
+        except Exception as e:
+            self.error = str(e)
 
     @staticmethod
     def available() -> bool:
@@ -148,6 +160,13 @@ class PhotonSender:
             try:
                 r = json.loads(line)
             except ValueError:
+                continue
+            if r.get("inbound"):
+                for fn in list(self._on_message):
+                    try:
+                        fn(str(r.get("from") or ""), str(r.get("text") or ""))
+                    except Exception as e:
+                        print(f"[photon] message handler error: {e}")
                 continue
             with self._cv:
                 self._replies[r.get("id")] = r

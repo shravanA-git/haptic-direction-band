@@ -5,6 +5,8 @@
 //   in : {"id": 3, "to": "+15551234567", "text": "..."}
 //   out: {"id": 3, "ok": true}   or   {"id": 3, "ok": false, "error": "..."}
 //   out: {"ready": true} once Spectrum is up, {"ready": false, "error": ...} if not
+//   out: {"inbound": true, "from": "+15551234567", "text": "status"}   a text arrived
+//        (band agent, app/band_agent.py; replies go back through the "in" lines above)
 //
 // Credentials come only from the environment (never the repo):
 //   SPECTRUM_PROJECT_ID, SPECTRUM_PROJECT_SECRET  (Photon dashboard -> project Settings)
@@ -42,6 +44,23 @@ async function send(to, text) {
   }
   await space.send(text);
 }
+
+// Incoming texts: handed to the laptop app as one JSON line each. Unanswered or
+// failing handlers never stop the loop; the app decides who is allowed a reply.
+(async () => {
+  try {
+    for await (const [space, message] of app.messages) {
+      try {
+        const c = message.content;
+        if (message.direction === "outbound" || !c || c.type !== "text") continue;
+        const from = (message.sender && (message.sender.id || message.sender.address)) || "";
+        out({ inbound: true, from: String(from), text: String(c.text || "").slice(0, 500) });
+      } catch (e) { /* skip one bad message */ }
+    }
+  } catch (e) {
+    out({ inbound: false, error: String(e && e.message ? e.message : e) });
+  }
+})();
 
 const rl = readline.createInterface({ input: process.stdin });
 let queue = Promise.resolve();       // one send at a time, in order
