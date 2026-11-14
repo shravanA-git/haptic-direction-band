@@ -20,7 +20,7 @@ import time
 from aiohttp import web
 
 from . import direction, trace
-from .link import Link, SerialPort, SimPort, find_esp32_port, load_motor_map
+from .link import Link, NullPort, SerialPort, SimPort, find_esp32_port, load_motor_map
 from .recall import AlertLog
 from .server import App, RECORDINGS
 
@@ -47,25 +47,28 @@ def main(argv=None) -> int:
                     help="Teach a Sound: laptop mic; teach from the dashboard, then it buzzes its own pattern")
     a = ap.parse_args(argv)
 
+    reopen = None
     if a.sim:
         frames = trace.load(a.trace)["frames"] if a.trace else None
         port = SimPort(frames, loop=a.loop)
     else:
-        dev = a.port or find_esp32_port()
-        if not dev:
-            print("No ESP32 serial port found. Plug it in, pass --port, or use --sim.")
-            return 1
+        def reopen():   # also used after an unplug: the device name can change
+            dev = a.port or find_esp32_port()
+            if not dev:
+                raise OSError(2, "no ESP32 serial port found (plugged in? data cable?)")
+            return SerialPort(dev)
         try:
-            port = SerialPort(dev)
+            port = reopen()
         except Exception as e:
-            print(f"Could not open {dev}: {e}\n"
-                  "Is the Arduino Serial Monitor (or another app) holding the port? Close it.")
-            return 1
+            print(f"[hdb] band not connected yet ({e}).\n"
+                  "      Starting anyway; it connects when the band is plugged in. "
+                  "(Close the Arduino Serial Monitor if it holds the port.)")
+            port = NullPort()
 
     motor_map = None if a.sim else load_motor_map()
     if motor_map:
         print(f"[hdb] motor map from app/motor_map.json: {motor_map}")
-    link = Link(port, motor_map=motor_map).start()
+    link = Link(port, motor_map=motor_map, reopen=reopen).start()
     alert_path = RECORDINGS / time.strftime("alerts-%Y%m%d-%H%M%S.jsonl")
     app = App(link, AlertLog(alert_path), recall_mode=a.recall)
     try:

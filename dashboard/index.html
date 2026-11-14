@@ -63,6 +63,7 @@
   <div id="ihdr">intensity –</div>
   <div id="btn">Action: up</div>
 </header>
+<div id="faults" style="display:none;background:var(--bad);color:#fff;font-size:20px;font-weight:700;padding:10px 24px"></div>
 <main>
   <section>
     <h2>Motor ring (click = 150 ms test pulse)</h2>
@@ -311,6 +312,11 @@ function connect() {
         }
         $("dev").textContent = m.device + (m.error ? " — " + m.error : "");
         $("frames").textContent = m.frames;
+        {
+          const fl = Object.values(m.faults || {});
+          $("faults").style.display = fl.length ? "block" : "none";
+          $("faults").textContent = fl.length ? "⚠ " + fl.join("  ·  ") : "";
+        }
         recording = m.recording;
         $("rec").textContent = recording ? "■ Stop & save" : "● Record";
         $("rec").classList.toggle("active", recording);

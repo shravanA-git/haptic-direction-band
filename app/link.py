@@ -113,6 +113,21 @@ def find_esp32_port() -> Optional[str]:
     return None
 
 
+class NullPort:
+    """Placeholder while no band is plugged in: every read fails, so Link keeps
+    trying its reopen factory until the ESP32 shows up."""
+    device = "no band"
+
+    def readline(self):
+        raise OSError(2, "no ESP32 serial port found")
+
+    def write_line(self, line: str) -> None:
+        raise OSError(2, "no ESP32 serial port found")
+
+    def close(self) -> None:
+        pass
+
+
 class SimPort:
     """Simulated ESP32. Emits MIC lines (from a trace, or quiet noise) on a
     real-time schedule, accepts PULSE/STOP and keeps a log of them so tests
@@ -132,10 +147,13 @@ class SimPort:
         self._t0 = time.monotonic()
         self._i = 0
         self._closed = False
+        self.broken = False           # test helper: simulate an unplugged cable
         self._lock = threading.Lock()
 
     # -- laptop side
     def readline(self) -> Optional[str]:
+        if self.broken:
+            raise OSError(6, "Device not configured (sim unplugged)")
         if self._closed:
             return None
         try:
@@ -156,6 +174,8 @@ class SimPort:
         return line + "\n"
 
     def write_line(self, line: str) -> None:
+        if self.broken:
+            raise OSError(6, "Device not configured (sim unplugged)")
         with self._lock:
             self.sent.append(line)
             now = time.monotonic()
@@ -167,6 +187,13 @@ class SimPort:
 
     def close(self) -> None:
         self._closed = True
+
+    def reopen(self) -> "SimPort":
+        """Reconnect factory for Link: fails while 'unplugged', else reopens."""
+        if self.broken:
+            raise OSError(2, "No such file or directory (sim unplugged)")
+        self._closed = False
+        return self
 
     # -- test helpers
     def inject(self, line: str) -> None:
@@ -236,8 +263,15 @@ class Link:
     """
 
     def __init__(self, port, on_sent: Optional[Callable[[str], None]] = None,
-                 motor_map: Optional[Sequence[int]] = None):
+                 motor_map: Optional[Sequence[int]] = None,
+                 reopen: Optional[Callable[[], object]] = None, retry_s: float = 1.0):
+        """reopen: called (every retry_s) after the port fails, to get a fresh
+        port, e.g. lambda: SerialPort(find_esp32_port()). Without it a failed
+        port stays failed."""
         self.port = port
+        self.reopen, self.retry_s = reopen, retry_s
+        self.reconnects = 0
+        self.dropped_writes = 0
         self.device = getattr(port, "device", "?")
         if motor_map is not None:
             validate_motor_map(motor_map)
@@ -303,8 +337,16 @@ class Link:
         return self._send(format_stop())
 
     def _send(self, wire: str, logical: Optional[str] = None) -> str:
+        """Never raises for a dead port: the line is dropped and the error shown
+        (firmware stops all motors by itself when the USB link is lost)."""
         with self._wlock:
-            self.port.write_line(wire)
+            try:
+                self.port.write_line(wire)
+            except Exception as e:
+                self.dropped_writes += 1
+                self.error = self.error or f"{type(e).__name__}: {e}"
+                print(f"[link] not sent ({self.error}): {wire}")
+                return wire
         for fn in self._sent_listeners:
             _safe(fn, logical or wire)
         return wire
@@ -332,10 +374,38 @@ class Link:
             "mic_gap_ms": round(median(gaps), 1) if gaps else None,
             "mic_gap_max_ms": max(gaps) if gaps else None,
             "mapped": self.motor_map is not None,
+            "reconnects": self.reconnects, "dropped_writes": self.dropped_writes,
+            "error": self.error,
         }
 
     def connected(self, stale_s: float = 1.0) -> bool:
         return self.error is None and (time.monotonic() - self.last_rx) < stale_s
+
+    def _reconnect(self) -> None:
+        """Close the dead port and retry the reopen factory until it works."""
+        with self._wlock:
+            try:
+                self.port.close()
+            except Exception:
+                pass
+        while not self._stop.is_set():
+            if self.reopen is None:
+                self._stop.wait(0.5)
+                return
+            try:
+                port = self.reopen()
+            except Exception as e:
+                self.error = f"waiting for band: {type(e).__name__}: {e}"
+                self._stop.wait(self.retry_s)
+                continue
+            with self._wlock:
+                self.port = port
+                self.device = getattr(port, "device", self.device)
+            self.error = None
+            self.reconnects += 1
+            self._last_mic_ms = None
+            print(f"[link] reconnected to {self.device}")
+            return
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -343,7 +413,7 @@ class Link:
                 line = self.port.readline()
             except Exception as e:  # unplugged, etc.
                 self.error = f"{type(e).__name__}: {e}"
-                time.sleep(0.5)
+                self._reconnect()
                 continue
             if not line or not line.strip():
                 continue

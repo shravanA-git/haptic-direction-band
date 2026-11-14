@@ -21,7 +21,7 @@ server -> page:
   {"type":"mic","ms":..,"levels":[f,r,b,l],"replay":bool}
   {"type":"pulse","motor":k,"ms":..,"dry":bool}   {"type":"stop"}
   {"type":"btn","name":"ACTION","down":bool}      {"type":"raw","text":..}
-  {"type":"status",...}  {"type":"estimate",...}  {"type":"traces","items":[..]}
+  {"type":"status",...,"faults":{"serial"|"camera"|"mic"|"speech": text}}  {"type":"estimate",...}  {"type":"traces","items":[..]}
   {"type":"state","object":..,"name":..,"heard":..,"sound":..}  {"type":"log","text":..}
   {"type":"settings",...Settings.snapshot()}  {"type":"caregiver",...Caregiver.status()}  {"type":"recall","q":..,"a":..,"via":..,"actions":[..]}
   {"type":"alert",...AlertLog record}  {"type":"label",...}  {"type":"alerts","items":[..]}
@@ -62,6 +62,14 @@ class App:
         self.recall_mode = recall_mode
         self._recall: Optional[RecallBot] = None
         self.caregiver = None
+        # Watchdog (check_health, every 0.5 s): what is broken right now, for the
+        # dashboard banner. The app keeps running whatever fails.
+        self.faults: dict = {}
+        self._action_down = False
+        self._vision_stall_since: Optional[float] = None
+        self._vision_restart_at = 0.0
+        self._restarting = False
+        self._mic_seen: dict = {}          # listener name -> (sample count, since)
         self.alerts.subscribe(self.emit)
         self.clients: set[web.WebSocketResponse] = set()
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -117,9 +125,12 @@ class App:
         """Hold-to-talk result. The wearer may not see the dashboard, so every
         outcome also buzzes: "got it, searching" or "can't look for that"."""
         if getattr(r, "error", None):
+            if str(r.error).startswith("mic"):
+                self.faults["speech"] = f"hold-to-talk {r.error}"
             self.emit({"type": "log", "text": f"speech: {r.error} (typed Find box still works)"})
             self.notify.cue("find", "unknown", reason=r.error)
             return
+        self.faults.pop("speech", None)
         self.state["heard"] = r.text or "–"
         self.emit({"type": "state", **self.state})
         if not r.target:
@@ -249,6 +260,7 @@ class App:
     def _action(self, down: bool) -> None:
         """Action button (board or dashboard): alert window while recording,
         no cues while held, hold-to-talk speech."""
+        self._action_down = down
         if self.recorder.active:
             (self.recorder.alert_down if down else self.recorder.alert_up)()
         if self.vision:
@@ -456,7 +468,102 @@ class App:
         return {"type": "status", "device": self.link.device,
                 "connected": self.link.connected(), "error": self.link.error,
                 "frames": self.link.frames_rx, "recording": self.recorder.active,
-                "health": self.link.health()}
+                "health": self.link.health(), "faults": dict(self.faults)}
+
+    # ------------------------------------------------------------- watchdog
+    VISION_STALL_S = 2.0      # no camera frame this long -> fault, target treated as lost
+    VISION_RETRY_S = 8.0      # then restart the camera this often until frames return
+    MIC_STALL_S = 2.5         # a live mic listener got no audio this long -> restart it
+
+    def check_health(self, now: Optional[float] = None) -> dict:
+        """One watchdog pass. Never raises; returns the current faults."""
+        now = time.monotonic() if now is None else now
+        f = {}
+        try:
+            if self.link.error:
+                f["serial"] = f"band link: {self.link.error} (reconnecting; firmware stops motors)"
+            if self.vision is not None:
+                self._check_vision(now, f)
+            for name, lst in (("names", self.names), ("sound", self.sound)):
+                if lst is not None:
+                    self._check_mic(name, lst, now, f)
+            if self.faults.get("speech"):
+                f["speech"] = self.faults["speech"]
+        except Exception as e:      # the watchdog itself must never take the app down
+            f["watchdog"] = f"{type(e).__name__}: {e}"
+        changed = f != self.faults
+        self.faults = f
+        if changed:
+            self.emit({"type": "log", "text": "faults: " + ("; ".join(f.values()) or "none")})
+        return f
+
+    def _check_vision(self, now: float, f: dict) -> None:
+        v = self.vision
+        last = getattr(v.latest(), "t", None) if hasattr(v, "latest") else None
+        running = getattr(v, "_running", True)
+        stalled = (not self._action_down and not getattr(v, "_paused", False)
+                   and (not running or last is None or now - last > self.VISION_STALL_S))
+        if not stalled:
+            self._vision_stall_since = None
+            if getattr(v, "error", None) and not running:
+                f["camera"] = f"camera: {v.error}"
+            return
+        if self._vision_stall_since is None:
+            self._vision_stall_since = now
+            self._vision_restart_at = now + self.VISION_RETRY_S
+            if self.guide is not None:   # stop directional repeats from a frozen decision
+                from types import SimpleNamespace
+                self.guide.on_decision(SimpleNamespace(
+                    state="lost", target=getattr(v.latest(), "target", None), t=now,
+                    confidence=0.0, offset=None, changed=True))
+        age = now - (last if last is not None else self._vision_stall_since)
+        f["camera"] = (f"camera: no frames for {age:.0f} s"
+                       + (f" ({v.error})" if getattr(v, "error", None) else "")
+                       + "; find-an-object paused, retrying")
+        if now >= self._vision_restart_at and not self._restarting:
+            self._vision_restart_at = now + self.VISION_RETRY_S
+            self._restarting = True
+
+            def restart():
+                try:
+                    v.stop()
+                    ok = v.start()
+                    self.emit({"type": "log", "text": "camera restarted" if ok else
+                               f"camera restart failed: {getattr(v, 'error', '?')}"})
+                except Exception as e:
+                    self.emit({"type": "log", "text": f"camera restart failed: {e}"})
+                finally:
+                    self._restarting = False
+            threading.Thread(target=restart, name="camera-restart", daemon=True).start()
+
+    def _check_mic(self, name: str, lst, now: float, f: dict) -> None:
+        if not getattr(lst, "live", True) or getattr(lst, "_stream", 1) is None \
+                or getattr(lst, "paused", False) or self._action_down:
+            self._mic_seen.pop(name, None)
+            return
+        n = getattr(lst, "_n", None)
+        if n is None:
+            return
+        seen = self._mic_seen.get(name)
+        if seen is None or seen[0] != n:
+            self._mic_seen[name] = (n, now)
+            return
+        if now - seen[1] < self.MIC_STALL_S:
+            return
+        f["mic"] = f"mic: no audio for {now - seen[1]:.0f} s ({name} listener); restarting"
+        self._mic_seen[name] = (n, now)          # retry at most every MIC_STALL_S
+        try:
+            lst.stop()
+            lst.start()
+        except Exception as e:
+            f["mic"] = f"mic: {name} listener can't open the mic ({type(e).__name__}: {e})"
+
+    def start_watchdog(self, every_s: float = 0.5) -> None:
+        def run():
+            while True:
+                self.check_health()
+                time.sleep(every_s)
+        threading.Thread(target=run, name="watchdog", daemon=True).start()
 
     # ---------------------------------------------------------------- web
     async def ws_handler(self, request):
@@ -497,6 +604,9 @@ class App:
         async def on_startup(_):
             self.loop = asyncio.get_running_loop()
             self._task = asyncio.ensure_future(self._status_loop())
+            if not getattr(self, "_watchdog_started", False):
+                self._watchdog_started = True
+                self.start_watchdog()
 
         async def on_cleanup(_):
             self._task.cancel()
