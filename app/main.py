@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 
 from aiohttp import web
 
 from . import trace
 from .link import Link, SerialPort, SimPort, find_esp32_port, load_motor_map
-from .server import App
+from .recall import AlertLog
+from .server import App, RECORDINGS
 
 
 def main(argv=None) -> int:
@@ -57,7 +59,8 @@ def main(argv=None) -> int:
     if motor_map:
         print(f"[hdb] motor map from app/motor_map.json: {motor_map}")
     link = Link(port, motor_map=motor_map).start()
-    app = App(link)
+    alert_path = RECORDINGS / time.strftime("alerts-%Y%m%d-%H%M%S.jsonl")
+    app = App(link, AlertLog(alert_path))
     vision = guide = None
     if a.target is not None or a.vision:
         from . import haptics
@@ -89,6 +92,7 @@ def main(argv=None) -> int:
             names = None
             print(f"[hdb] name listener off: {e}")
     print(f"[hdb] serial: {link.device}  dashboard: http://localhost:{a.http}")
+    print(f"[hdb] alert log: {alert_path.relative_to(RECORDINGS.parent)}")
     try:
         web.run_app(app.make_app(), host="127.0.0.1", port=a.http, print=None)
     finally:

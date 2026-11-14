@@ -38,6 +38,12 @@
   #log { font:13px/1.5 ui-monospace, monospace; color:var(--dim); height:150px; overflow:auto; white-space:pre-wrap; }
   .kv { display:grid; grid-template-columns:110px 1fr; gap:4px 12px; }
   .kv b { font-size:22px; }
+  #alerts { width:100%; border-collapse:collapse; font-size:15px; font-variant-numeric:tabular-nums; }
+  #alerts td, #alerts th { padding:3px 6px; text-align:left; border-bottom:1px solid #2a2f3a; }
+  #alerts th { color:var(--dim); font-weight:400; font-size:13px; }
+  #alerts tr.dry td { color:var(--dim); }
+  #alerts .ok { color:var(--ok); } #alerts .bad { color:var(--bad); }
+  .alertbox { max-height:260px; overflow:auto; }
   .legend span { margin-right:14px; font-size:14px; color:var(--dim); }
   .legend i { display:inline-block; width:12px; height:12px; border-radius:50%; margin-right:5px; vertical-align:-1px; }
 </style>
@@ -59,6 +65,7 @@
       <button data-cue="generic">Generic (300 ms front)</button>
       <button data-cue="centered">Centered (2× front)</button>
       <button data-cue="lost">Lost</button>
+      <button data-cue="sound">Taught sound</button>
     </div>
     <div class="row">
       <span style="color:var(--dim);font-size:15px">Bench:</span>
@@ -102,6 +109,21 @@
         <button id="halt">■</button>
       </div>
       <div id="est"></div>
+    </section>
+    <section>
+      <h2>Alert log <span style="text-transform:none;letter-spacing:0" id="acount"></span></h2>
+      <div class="alertbox"><table id="alerts"><thead><tr><th>#</th><th>time</th><th>source</th><th>cue</th><th>direction</th><th>conf</th><th>latency</th><th>truth</th></tr></thead><tbody></tbody></table></div>
+      <div class="row" style="margin-top:10px">
+        <span style="color:var(--dim);font-size:15px">Caller was at</span>
+        <select id="truth">
+          <option value="0">front</option><option value="1">front-right</option><option value="2">right</option>
+          <option value="3">back-right</option><option value="4">back</option><option value="5">back-left</option>
+          <option value="6">left</option><option value="7">front-left</option>
+          <option value="none">no clear direction</option><option value="false">nobody (false alert)</option>
+        </select>
+        <button id="labelbtn" title="label the newest unlabelled alert">Label latest</button>
+        <button id="missedbtn" title="a call that got no cue">Missed call</button>
+      </div>
     </section>
     <section>
       <h2>Log</h2>
@@ -174,6 +196,30 @@ $("talk").onpointerup = $("talk").onpointerleave = () => {
 };
 $("setnm").onclick = () => send({cmd: "name", name: $("nm").value});
 $("nm").onkeydown = e => { if (e.key === "Enter") $("setnm").onclick(); };
+$("labelbtn").onclick = () => send({cmd: "label", truth: $("truth").value});
+$("missedbtn").onclick = () => send({cmd: "missed", truth: $("truth").value});
+const alertRows = new Map();
+function truthText(t) { return t === undefined ? "" : t === "false" ? "false alert" : t === null ? "none" : NAMES[t].toLowerCase(); }
+function verdict(a) {
+  if (a.truth === undefined) return "";
+  if (a.truth === "false") return "bad";
+  if (a.motor === null || a.motor === undefined) return "ok";
+  if (a.truth === null) return "bad";
+  const d = Math.min((a.motor - a.truth + 8) % 8, (a.truth - a.motor + 8) % 8);
+  return d === 0 ? "ok" : d === 1 ? "" : "bad";
+}
+function addAlert(a) {
+  const tb = $("alerts").tBodies[0];
+  let tr = alertRows.get(a.id);
+  if (!tr) { tr = tb.insertRow(0); alertRows.set(a.id, tr); while (tb.rows.length > 30) { alertRows.delete(+tb.rows[tb.rows.length - 1].dataset.id); tb.deleteRow(-1); } }
+  tr.dataset.id = a.id; tr.className = a.dry ? "dry" : "";
+  tr._a = a;
+  const cells = [a.id, a.time, a.source + (a.dry ? " (dry)" : "") + (a.repeat ? " ↻" : ""), a.cue,
+    a.direction ?? "–", a.confidence ?? "–", a.latency_ms != null ? a.latency_ms + " ms" : "–", truthText(a.truth)];
+  tr.innerHTML = cells.map(c => `<td>${c}</td>`).join("");
+  tr.cells[7].className = verdict(a);
+  $("acount").textContent = `(${alertRows.size} shown)`;
+}
 $("halt").onclick = () => send({cmd: "replay_stop"});
 
 // ---- websocket
@@ -218,6 +264,9 @@ function connect() {
         break;
       case "state": $("obj").textContent = m.object ?? "–"; $("name").textContent = m.name ?? "–"; $("heard").textContent = m.heard ?? "–"; break;
       case "log": log(m.text); break;
+      case "alerts": $("alerts").tBodies[0].innerHTML = ""; alertRows.clear(); m.items.forEach(addAlert); break;
+      case "alert": addAlert(m); break;
+      case "label": { const tr = alertRows.get(m.ref); if (tr) addAlert({...tr._a, truth: m.truth}); break; }
     }
   };
 }

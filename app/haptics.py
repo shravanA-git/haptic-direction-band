@@ -22,6 +22,8 @@ TEST_MS = 150
 CENTERED_PULSE_MS = 100   # PROVISIONAL
 CENTERED_GAP_MS = 100     # PROVISIONAL (HDB-Protocol suggestion, not agreed)
 LOST_STEPS = [(0, FRONT, 600)]  # PROVISIONAL (HDB-Protocol suggestion, not agreed)
+# Teach a Sound: a sweep around the cardinals, so it can't be read as a side.
+SOUND_STEPS = [(0, 0, 80), (120, 2, 80), (240, 4, 80), (360, 6, 80)]  # PROVISIONAL
 
 # A cue is a list of (offset_ms, motor, duration_ms).
 Cue = list
@@ -42,6 +44,10 @@ def centered() -> Cue:
 
 def lost() -> Cue:
     return list(LOST_STEPS)
+
+
+def taught_sound() -> Cue:
+    return list(SOUND_STEPS)
 
 
 def test_pulse(motor: int) -> Cue:

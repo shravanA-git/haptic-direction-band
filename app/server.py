@@ -11,12 +11,15 @@ WebSocket, page -> server (JSON):
   {"cmd":"action","down":bool}       (dashboard hold-to-talk = BTN ACTION DOWN/UP)
   {"cmd":"name","name":"Shravan"}    (name to listen for; comma-separated ok)
   {"cmd":"bench","name":"gate|walk|cardinals"}   (gate checks by feel; STOP cancels)
+  {"cmd":"label","truth":k|null|"false","id":n?}  (ground truth for the latest/given alert)
+  {"cmd":"missed","truth":k}         (a call the band gave no cue for)
 server -> page:
   {"type":"mic","ms":..,"levels":[f,r,b,l],"replay":bool}
   {"type":"pulse","motor":k,"ms":..,"dry":bool}   {"type":"stop"}
   {"type":"btn","name":"ACTION","down":bool}      {"type":"raw","text":..}
   {"type":"status",...}  {"type":"estimate",...}  {"type":"traces","items":[..]}
   {"type":"state","object":..,"name":..}          {"type":"log","text":..}
+  {"type":"alert",...AlertLog record}  {"type":"label",...}  {"type":"alerts","items":[..]}
 """
 from __future__ import annotations
 
@@ -31,6 +34,8 @@ from aiohttp import WSMsgType, web
 
 from . import direction, haptics, trace
 from .link import ButtonEvent, Link, MicFrame, RawLine
+from .notify import Notifier
+from .recall import AlertLog
 
 ROOT = Path(__file__).resolve().parent.parent
 DASH = ROOT / "dashboard"
@@ -39,8 +44,11 @@ RECORDINGS = ROOT / "recordings"
 
 
 class App:
-    def __init__(self, link: Link):
+    def __init__(self, link: Link, alert_log: Optional[AlertLog] = None):
         self.link = link
+        self.alerts = alert_log or AlertLog()        # memory-only unless main gives a path
+        self.notify = Notifier(link.pulse, self.alerts, dry_send=self._dry_pulse)
+        self.alerts.subscribe(self.emit)
         self.clients: set[web.WebSocketResponse] = set()
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.recorder = trace.Recorder()
@@ -77,6 +85,12 @@ class App:
         pause/resume); guide: app.guide.ObjectGuide driving the band."""
         self.vision, self.guide = vision, guide
         vision.on_change(self._on_vision)
+        if getattr(guide, "on_cue", ...) is None:   # log find cues the guide plays
+            guide.on_cue = self._on_find_cue
+
+    def _on_find_cue(self, kind, motor, info) -> None:
+        self.notify.cue("find", kind, motor, info.get("confidence"), info.get("latency_ms"),
+                        play=False, target=info.get("target"), repeat=info.get("repeat") or None)
 
     def attach_speech(self, speech) -> None:
         """speech: app.speech.Speech (or anything with on_button and an
@@ -108,7 +122,11 @@ class App:
         """Name heard at hit.start..hit.end (laptop monotonic seconds):
         estimate direction from the band mics over that window and buzz."""
         e, win = self.live.estimate(hit.start, hit.end)
-        haptics.play(haptics.name_alert(e.motor), self.link.pulse)
+        latency_ms = (time.monotonic() - hit.end) * 1000    # end of the name -> cue sent
+        self.notify.cue("name", "generic" if e.motor is None else "directional", e.motor,
+                        e.consistency if e.motor is not None else None, latency_ms,
+                        reason=e.reason, window=list(win) if win else None,
+                        heard=getattr(hit, "heard", None), strength=e.strength)
         where = (f"{haptics.MOTOR_NAMES[e.motor]} (motor {e.motor})" if e.motor is not None
                  else f"generic: {e.reason}")
         self.state["name"] = f"{hit.name} → {where}"
@@ -174,10 +192,10 @@ class App:
             self.link.pulse(int(m["motor"]), int(m.get("ms", haptics.TEST_MS)))
         elif cmd == "cue":
             name = m.get("name")
-            cue = {"generic": haptics.generic_attention, "centered": haptics.centered,
-                   "lost": haptics.lost}.get(name)
-            cue = cue() if cue else haptics.directional(int(m.get("motor", 0)))
-            haptics.play(cue, self.link.pulse)
+            if name in ("generic", "centered", "lost", "sound"):
+                self.notify.cue("manual", name)
+            else:
+                self.notify.cue("manual", "directional", int(m.get("motor", 0)))
         elif cmd == "action":
             down = bool(m.get("down"))
             self.emit({"type": "btn", "name": "ACTION", "down": down})
@@ -189,6 +207,13 @@ class App:
             return {"type": "log", "text": f"listening for: {', '.join(self.names.names) or 'nothing'}"}
         elif cmd == "bench":
             return self.bench(m.get("name"))
+        elif cmd == "label":
+            return self.label(m.get("truth"), m.get("id"))
+        elif cmd == "missed":
+            self.alerts.label(None, self._truth(m.get("truth")), missed=True)
+            return {"type": "log", "text": "logged a missed call"}
+        elif cmd == "alerts":
+            return {"type": "alerts", "items": self.alerts.recent(30)}
         elif cmd == "record_start":
             self.recorder.start()
             return {"type": "log", "text": "recording…"}
@@ -239,6 +264,25 @@ class App:
         return {"type": "log", "text": f"{name}: motors {list(motors)} in order, 0.7 s apart; "
                                        "each should buzz where the ring lights up"}
 
+    @staticmethod
+    def _truth(v):
+        if v in (None, "none", "generic", ""):
+            return None
+        return "false" if v == "false" else int(v)
+
+    def label(self, truth, ref=None) -> dict:
+        """Ground truth for an alert (default: the newest unlabelled one)."""
+        if ref is None:
+            a = self.alerts.latest()
+            if a is None:
+                return {"type": "log", "text": "no unlabelled alert to label"}
+            ref = a["id"]
+        rec = self.alerts.label(int(ref), self._truth(truth))
+        t = rec["truth"]
+        what = ("false alert" if t == "false" else "no clear direction" if t is None
+                else haptics.MOTOR_NAMES[t])
+        return {"type": "log", "text": f"alert #{ref} labelled: {what}"}
+
     def traces_msg(self) -> dict:
         items = [f"fixtures/{p.name}" for p in sorted(FIXTURES.glob("*.json"))]
         items += [f"recordings/{p.name}" for p in sorted(RECORDINGS.glob("*.json"))]
@@ -267,7 +311,10 @@ class App:
                 self.emit({"type": "estimate", "trace": name, "motor": e.motor,
                            "angle": e.angle_deg, "consistency": round(e.consistency, 2),
                            "strength": round(e.strength, 2), "reason": e.reason})
-                haptics.play(haptics.name_alert(e.motor), self._dry_pulse)
+                self.notify.cue("replay", "generic" if e.motor is None else "directional",
+                                e.motor, e.consistency if e.motor is not None else None,
+                                dry=True, trace=name, window=[a["startMs"], a["endMs"]],
+                                reason=e.reason)
 
         self.replayer = trace.Replayer(t, on_frame, speed, on_done).start()
         return {"type": "log", "text": f"replaying {name} (dry run, motors not driven)"}
@@ -285,6 +332,7 @@ class App:
         self.clients.add(ws)
         await ws.send_str(json.dumps(self.status()))
         await ws.send_str(json.dumps(self.traces_msg()))
+        await ws.send_str(json.dumps({"type": "alerts", "items": self.alerts.recent(30)}))
         async for msg in ws:
             if msg.type != WSMsgType.TEXT:
                 continue
