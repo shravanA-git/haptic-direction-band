@@ -640,6 +640,12 @@ class App:
             self.route.play()
         elif cmd == "route_next" and self.route is not None:
             self.route.next()
+        elif cmd == "route_speed" and self.route is not None:
+            try:
+                v = self.route.set_speed(m.get("speed", "normal"))
+            except (TypeError, ValueError):
+                return {"type": "log", "text": "route: speed is slow, normal, demo or m/s"}
+            return {"type": "log", "text": f"route: walking speed {v:g} m/s"}
         elif cmd == "route_stop" and self.route is not None:
             self.route.stop()
             if self.speaker is not None:
@@ -875,6 +881,7 @@ class App:
             "mode": "live" if self.nav_live else ("route" if self.route is not None else "export"),
             "starts": [label for label, _ in self.route.starts()] if self.route else [],
             "start": self.route_start, "brief": brief,
+            "speed": self.route.speed if self.route else None,
             "yaw_sign": self.nav.yaw_sign if self.nav is not None else None,
             "export_only": self.nav is None and self.route is None,
             "error": self.nav_info.get("error")})

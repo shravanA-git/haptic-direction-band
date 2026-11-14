@@ -219,7 +219,14 @@ def _dist(twin: Twin, u: str, v: str) -> float:
 
 # ====================================================================== route play
 # "Plan once, play the route": no tour position needed (no Showcase SDK key).
-STEP_S = 3.0            # Play: one step every STEP_S (PROVISIONAL)
+# Timing (ALL PROVISIONAL, see docs/costar_nav_cue_questions.md):
+WALK_MPS = 0.8          # assumed walking speed; the /nav page picks slow / normal / demo
+SPEEDS = {"slow": 0.6, "normal": 0.8, "demo": 1.5}
+MIN_LEG_S = 2.5         # no leg shorter than this
+PRE_TURN_S = 1.5        # 'in N metres, turn right' this long before a leg ends (spoken, no buzz)
+KEEP_GOING_S = 4.0      # on long legs, a short front pulse this often = 'still straight'
+KEEP_GOING = [(0, haptics.FRONT, 80)]   # PULSE 0 80 (not in the cue table yet)
+PROGRESS_S = 0.25       # progress updates to the page
 
 
 class Speaker:
@@ -247,47 +254,71 @@ class Speaker:
             p.terminate()
 
 
-def step_text(step, prev_room: Optional[str], last: bool) -> str:
-    metres = max(1, int(round(step.metres)))
-    words = {"ahead": "ahead", "ahead-right": "ahead right", "right": "right",
-             "behind-right": "turn around, right", "behind": "turn around",
-             "behind-left": "turn around, left", "left": "left", "ahead-left": "ahead left"}
-    t = f"{words.get(step.turn, step.turn)} {metres} metre{'s' if metres != 1 else ''}"
+_WORDS = {"ahead": "ahead", "ahead-right": "ahead right", "right": "right",
+          "behind-right": "turn around, right", "behind": "turn around",
+          "behind-left": "turn around, left", "left": "left", "ahead-left": "ahead left"}
+_TURN = {"ahead": "keep straight", "ahead-right": "bear right", "right": "turn right",
+         "behind-right": "turn sharp right", "behind": "turn around",
+         "behind-left": "turn sharp left", "left": "turn left", "ahead-left": "bear left"}
+
+
+def _m(metres: float) -> str:
+    n = max(1, int(round(metres)))
+    return f"{n} metre{'s' if n != 1 else ''}"
+
+
+def step_text(step, prev_room: Optional[str], last: bool = False) -> str:
+    t = f"{_WORDS.get(step.turn, step.turn)} {_m(step.metres)}"
     if step.room and step.room not in ("-", "Void") and step.room != prev_room:
         t += f", into the {step.room.lower()}"
     return t
 
 
 class RoutePlayer:
-    """Plans a route once (wearer facing the first leg) and plays it step by step:
-    PULSE toward each leg, the step spoken, then the arrival cue.
+    """Plans a route once (wearer facing the first leg) and plays it like GPS:
 
-        rp = RoutePlayer(twin, play=..., speak=Speaker(...).say, on_status=...)
-        rp.plan("Living Room", "kitchen"); rp.play()   # or rp.next() per step
-    Alerts win (hold), Action held pauses (and nothing is spoken)."""
+      leg starts      PULSE toward it + the leg spoken ('right 3 metres, into the kitchen')
+      during a leg    a short front pulse every KEEP_GOING_S on legs longer than that
+      1.5 s before    'in 1 metre, turn right' (spoken only)
+      leg ends        the next leg starts (its PULSE is the turn cue, at the turn)
+      last leg ends   two front pulses + 'You've arrived at the kitchen'
+
+    Each leg lasts max(MIN_LEG_S, metres / speed). Play runs the clock, Next skips
+    to the next leg now, Stop stops. Name/sound alerts (hold) and Action held
+    (pause) freeze the clock, so no cue fires and nothing is spoken until they end.
+
+        rp = RoutePlayer(twin, play=..., speak=..., on_status=...)
+        rp.plan("Living Room", "kitchen"); rp.play()
+    threaded=False: no background thread; call tick(now) yourself (tests)."""
 
     def __init__(self, twin: Twin, play: Callable[[list], object],
                  speak: Callable[[str], object] = lambda text: None,
-                 on_status: Optional[Callable[[dict], None]] = None, step_s: float = STEP_S):
+                 on_status: Optional[Callable[[dict], None]] = None,
+                 speed: float = WALK_MPS, threaded: bool = True):
         self.twin = twin
         self.play_cue = play
         self.speak = speak
         self.on_status = on_status
-        self.step_s = step_s
+        self.speed = speed
+        self.threaded = threaded
         self.steps: list = []
         self.texts: list = []
         self.intro = ""             # spoken once with the first step (arrival briefing)
         self._intro_due = False
         self.goal: Optional[str] = None
         self.start_pano: Optional[str] = None
-        self.index = 0              # next step to give; len(steps) = arrival next
+        self.leg = -1               # leg being walked; -1 = not started
+        self.leg_t = 0.0            # seconds into it (frozen while held/paused)
         self.done = False
         self.auto = False
         self.paused = False
         self._hold_until = 0.0
-        self._want = 0              # steps requested by Next / auto, not yet given
-        self._lock = threading.Lock()
-        self._wake = threading.Event()
+        self._last_t: Optional[float] = None
+        self._pre_turn_done = False
+        self._next_keep = KEEP_GOING_S
+        self._last_progress = -1e9
+        self._skip = 0              # Next presses not yet handled (held/paused)
+        self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -314,22 +345,21 @@ class RoutePlayer:
         if not goals:
             rooms = sorted({r.label for r in self.twin.rooms.values() if r.label != "Void"})
             return False, f"no room like '{goal}' (rooms: {', '.join(rooms) or 'none'})"
-        if a.id in goals:
-            steps = []
-        else:
+        steps = []
+        if a.id not in goals:
             path = shortest_path(self.twin, a.id, goals)
             if not path:
                 return False, f"no walkable route to {goal}"
             steps = route_steps(self.twin, path, None)
         here = self.twin.rooms[a.room].label if a.room else None
         texts, prev = [], here
-        for k, s in enumerate(steps):
-            texts.append(step_text(s, prev, k == len(steps) - 1))
+        for s in steps:
+            texts.append(step_text(s, prev))
             prev = s.room
         with self._lock:
             self.steps, self.texts, self.goal = steps, texts, goal
-            self.start_pano, self.index, self.done, self._want = a.id, 0, False, 0
-            self._intro_due = True          # the briefing goes with the first thing said
+            self.start_pano, self.leg, self.leg_t, self.done = a.id, -1, 0.0, False
+            self._intro_due, self._skip = True, 0
         self._status("planned")
         total = sum(s.metres for s in steps)
         return True, f"{len(steps)} steps, {total:.0f} m to the {goal}"
@@ -338,29 +368,36 @@ class RoutePlayer:
         room = self.steps[-1].room if self.steps else self.goal
         return f"You've arrived at the {str(room or self.goal).lower()}."
 
-    # --------------------------------------------------------------- play
-    def play(self) -> None:
+    def leg_seconds(self, i: int) -> float:
+        return max(MIN_LEG_S, self.steps[i].metres / max(0.1, self.speed))
+
+    def set_speed(self, speed) -> float:
+        self.speed = SPEEDS.get(speed, None) or float(speed)
+        return self.speed
+
+    # ------------------------------------------------------------- controls
+    def play(self, now: Optional[float] = None) -> None:
         with self._lock:
             if not self.goal or self.done:
                 return
             self.auto = True
-            self._want = max(self._want, 1)
+            self._last_t = None
         self._ensure_thread()
-        self._wake.set()
+        self.tick(now)
 
-    def next(self) -> None:
+    def next(self, now: Optional[float] = None) -> None:
+        """Skip to the next leg now (the first press starts the route)."""
         with self._lock:
             if not self.goal or self.done:
                 return
-            self.auto = False
-            self._want += 1
+            self._skip += 1
         self._ensure_thread()
-        self._wake.set()
+        self.tick(now)
 
     def stop(self) -> None:
         with self._lock:
-            playing = self.auto or self._want > 0
-            self.auto, self._want = False, 0
+            playing = self.auto
+            self.auto, self._skip = False, 0
         if playing and self.goal and not self.done:
             self._status("stopped")
 
@@ -374,35 +411,66 @@ class RoutePlayer:
 
     def resume(self) -> None:
         self.paused = False
-        self._wake.set()
 
     def close(self) -> None:
         self._stop.set()
-        self._wake.set()
 
-    def _ensure_thread(self) -> None:
-        if self._thread is None or not self._thread.is_alive():
-            self._thread = threading.Thread(target=self._run, name="route", daemon=True)
-            self._thread.start()
+    # --------------------------------------------------------------- clock
+    def tick(self, now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
+        events = []
+        with self._lock:
+            last, self._last_t = self._last_t, now
+            frozen = self.paused or now < self._hold_until
+            if not self.goal or self.done or frozen:
+                return
+            if self._skip:
+                self._skip -= 1
+                events += self._advance()
+            elif self.auto:
+                if self.leg < 0:
+                    events += self._advance()
+                else:
+                    self.leg_t += max(0.0, now - last) if last is not None else 0.0
+                    dur = self.leg_seconds(self.leg)
+                    if dur > KEEP_GOING_S and self.leg_t >= self._next_keep \
+                            and self.leg_t < dur - PRE_TURN_S:
+                        self._next_keep += KEEP_GOING_S
+                        events.append(("cue", list(KEEP_GOING)))
+                    if not self._pre_turn_done and self.leg + 1 < len(self.steps) \
+                            and self.leg_t >= dur - PRE_TURN_S:
+                        self._pre_turn_done = True
+                        nxt = self.steps[self.leg + 1]
+                        left = max(0.0, (dur - self.leg_t) / dur * self.steps[self.leg].metres)
+                        events.append(("say", f"in {_m(left)}, {_TURN.get(nxt.turn, nxt.turn)}"))
+                    if self.leg_t >= dur:
+                        events += self._advance()
+            progress = self.auto and self.leg >= 0 and not self.done \
+                and now - self._last_progress >= PROGRESS_S
+            if progress:
+                self._last_progress = now
+        for kind, arg in events:
+            if kind == "cue":
+                self.play_cue(arg)
+            elif kind == "say":
+                self._say(arg)
+            elif kind == "status":
+                self._status(*arg)
+        if progress and not any(k == "status" for k, _ in events):
+            self._status("walking", self.leg)
 
-    def _run(self) -> None:
-        next_at = 0.0
-        while not self._stop.is_set():
-            self._wake.wait(0.05)
-            self._wake.clear()
-            now = time.monotonic()
-            with self._lock:
-                ready = (self._want > 0 and not self.done and not self.paused
-                         and now >= self._hold_until and now >= next_at)
-                if not ready:
-                    continue
-                self._want -= 1
-                i = self.index
-                self.index += 1
-                if self.auto and i < len(self.steps):
-                    self._want = max(self._want, 1)      # keep going
-            self._give(i)
-            next_at = time.monotonic() + (self.step_s if self.auto else 0.3)
+    def _advance(self) -> list:
+        """Start the next leg (its pulse is the turn cue) or arrive. Lock held."""
+        self.leg += 1
+        self.leg_t, self._pre_turn_done, self._next_keep = 0.0, False, KEEP_GOING_S
+        if self.leg < len(self.steps):
+            s = self.steps[self.leg]
+            return [("cue", haptics.directional(s.motor)), ("say", self.texts[self.leg]),
+                    ("status", ("step", self.leg))]
+        self.auto, self._skip = False, 0
+        self.done = True
+        return [("cue", haptics.centered()), ("say", self.arrival_text()),
+                ("status", ("arrived", self.leg))]
 
     def _say(self, text: str) -> None:
         if self.paused:
@@ -413,36 +481,40 @@ class RoutePlayer:
                 text = f"{self.intro} {text}"
         self.speak(text)
 
-    def _give(self, i: int) -> None:
-        if i < len(self.steps):
-            s = self.steps[i]
-            self.play_cue(haptics.directional(s.motor))
-            self._say(self.texts[i])
-            self._status("step", i)
-        else:
-            with self._lock:
-                self.auto, self._want = False, 0
-            self.play_cue(haptics.centered())
-            self._say(self.arrival_text())
-            with self._lock:
-                self.done = True             # only after the arrival cue and words
-            self._status("arrived", i)
+    def _ensure_thread(self) -> None:
+        if not self.threaded or (self._thread is not None and self._thread.is_alive()):
+            return
+
+        def run():
+            while not self._stop.wait(0.05):
+                try:
+                    self.tick()
+                except Exception as e:
+                    print(f"[route] {e}")
+        self._thread = threading.Thread(target=run, name="route", daemon=True)
+        self._thread.start()
+
+    @property
+    def index(self) -> int:
+        """Next leg to start (compat): leg + 1."""
+        return self.leg + 1
 
     def _status(self, event: Optional[str], i: Optional[int] = None) -> None:
         if not self.on_status:
             return
         st = {"event": event, "goal": self.goal, "start": self.start_pano,
-              "index": self.index, "done": self.done, "auto": self.auto,
+              "index": self.leg + 1, "done": self.done, "auto": self.auto, "speed": self.speed,
               "steps": [{"n": k + 1, "turn": s.turn, "motor": s.motor, "metres": round(s.metres, 1),
-                         "room": s.room, "pano": s.to_pano, "text": self.texts[k]}
+                         "room": s.room, "pano": s.to_pano, "text": self.texts[k],
+                         "seconds": round(self.leg_seconds(k), 1)}
                         for k, s in enumerate(self.steps)]}
-        if event == "step" and i is not None:
-            st["current"] = i
-            st["motor"] = self.steps[i].motor
-            st["text"] = self.texts[i]
+        if event in ("step", "walking") and i is not None and 0 <= i < len(self.steps):
+            dur = self.leg_seconds(i)
+            st.update(current=i, motor=self.steps[i].motor, text=self.texts[i],
+                      walked=round(min(1.0, self.leg_t / dur) * self.steps[i].metres, 1),
+                      of=round(self.steps[i].metres, 1))
         elif event == "arrived":
-            st["current"] = len(self.steps)
-            st["text"] = self.arrival_text()
+            st.update(current=len(self.steps), text=self.arrival_text())
         try:
             self.on_status(st)
         except Exception:

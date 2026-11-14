@@ -18,6 +18,9 @@
   /* fixed heights: wrapping text must never move the buttons under the cursor */
   #step { height:2.6em; line-height:1.3em; overflow:hidden; font-size:24px; }
   #where { height:2.8em; overflow:hidden; }
+  #prog { height:10px; background:#2a2f3a; border-radius:5px; overflow:hidden; }
+  #bar { height:100%; width:0; background:var(--acc); transition:width .25s linear; }
+  #progtxt { height:1.4em; }
   .dim { color:var(--dim); font-size:15px; }
   .row { display:flex; gap:8px; margin:8px 0; flex-wrap:wrap; align-items:center; }
   input, button, select { font:inherit; background:#2a2f3a; color:var(--ink); border:1px solid #454c5c;
@@ -68,6 +71,7 @@
   <h1 id="name">Visit before you go</h1>
   <div class="dim" id="where">connecting…</div>
   <div class="big" id="step">–</div>
+  <div class="route"><div id="prog"><div id="bar"></div></div><div class="dim" id="progtxt"></div></div>
   <svg id="ring" width="180" height="180" viewBox="-90 -90 180 180"></svg>
 
   <div class="route">
@@ -77,6 +81,10 @@
       <button id="go">Plan</button>
     </div>
     <div class="row" id="rooms"></div>
+    <div class="row"><span class="dim">Speed</span>
+      <select id="speed"><option value="slow">slow · 0.6 m/s</option>
+        <option value="normal" selected>normal · 0.8 m/s</option>
+        <option value="demo">demo · 1.5 m/s</option></select></div>
     <div class="row">
       <button id="play" class="primary">▶ Play</button>
       <button id="next">Next step</button>
@@ -164,13 +172,22 @@ async function showView(pano) {
   viewKey = key;
 }
 
+function showProgress(m) {
+  if (m.walked == null || !m.of) { $("bar").style.width = "0"; $("progtxt").textContent = ""; return; }
+  $("bar").style.width = `${Math.min(100, 100 * m.walked / m.of)}%`;
+  $("progtxt").textContent = `walking… ${m.walked.toFixed(1)} of ${m.of.toFixed(1)} m`;
+}
+
 function showRoute(m) {
+  if (m.event === "walking") { showProgress(m); return; }
+  showProgress(m.event === "step" ? m : {});
+  if (m.event === "arrived") { $("bar").style.width = "100%"; $("progtxt").textContent = "arrived"; }
   route = m;
   $("routetitle").textContent = m.goal ? `Route to the ${m.goal}` : "Route";
   const ol = $("steps"); ol.innerHTML = "";
   m.steps.forEach((s, k) => {
     const li = document.createElement("li");
-    li.textContent = `${s.turn}, ${s.metres} m → ${s.room}`;
+    li.textContent = `${s.turn}, ${s.metres} m → ${s.room} (${s.seconds} s)`;
     if (m.current === k) li.className = "cur"; else if (m.current > k) li.className = "done";
     ol.appendChild(li);
   });
@@ -209,6 +226,7 @@ $("start").onchange = () => send({cmd: "route_start", start: $("start").value});
 $("go").onclick = () => send({cmd: "route_plan", start: $("start").value, to: $("to").value.trim()});
 $("to").onkeydown = e => { if (e.key === "Enter") $("go").onclick(); };
 $("play").onclick = () => send({cmd: "route_play"});
+$("speed").onchange = () => send({cmd: "route_speed", speed: $("speed").value});
 $("next").onclick = () => send({cmd: "route_next"});
 $("rstop").onclick = () => send({cmd: "route_stop"});
 
@@ -329,6 +347,8 @@ async function main() {
     const o = document.createElement("option"); o.value = o.textContent = s; $("start").appendChild(o);
   }
   if (cfg.start) $("start").value = cfg.start;
+  const sp = {0.6: "slow", 0.8: "normal", 1.5: "demo"}[cfg.speed];
+  if (sp) $("speed").value = sp;
   for (const r of cfg.rooms || []) {
     const b = document.createElement("button"); b.textContent = r;
     b.onclick = () => send({cmd: "route_plan", start: $("start").value, to: r}); $("rooms").appendChild(b);
