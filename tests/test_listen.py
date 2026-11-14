@@ -119,3 +119,112 @@ def test_app_teach_detect_buzzes_pattern_and_logs(tmp_path):
     assert a["confidence"] >= 0.8 and a["duration_ms"] == pytest.approx(300, abs=80)
     want = [f"PULSE {m} {ms}" for _, m, ms in haptics.taught_sound()]
     assert port.sent[:len(want)] == want
+
+
+# ---------------------------------------------------------------- pitch + pattern
+def room(s, hum=0.004):
+    """Quiet room with mains hum and its harmonic (stationary, so it is subtracted)."""
+    t = np.arange(int(s * SR)) / SR
+    return (quiet(s) * 3 + hum * np.sin(2 * np.pi * 120 * t)
+            + 0.5 * hum * np.sin(2 * np.pi * 240 * t)).astype(np.float32)
+
+
+def bell(hz, s, amp, decay=0.5):
+    t = np.arange(int(s * SR)) / SR
+    x = sum(a * np.sin(2 * np.pi * hz * m * t) for m, a in ((1, 1), (2.76, 0.4), (5.4, 0.2)))
+    return (amp * x * np.exp(-t / decay) * np.minimum(1, t / 0.004)).astype(np.float32)
+
+
+def ding_dong(amp=0.15, hi=659, lo=523):
+    out = bell(hi, 1.4, amp)
+    b = bell(lo, 1.0, amp, 0.6)
+    k = int(0.45 * SR)
+    out[k:k + len(b)] += b[:len(out) - k]
+    return out
+
+
+def beeps(hz=2000, n=3, on=0.15, off=0.15, amp=0.1):
+    b = tone(hz, on, amp)
+    return np.concatenate([np.concatenate([b, quiet(off)]) for _ in range(n)])
+
+
+def clap(amp=0.3):
+    n = int(0.06 * SR)
+    return (amp * rng.standard_normal(n) * np.exp(-np.arange(n) / SR / 0.012)).astype(np.float32)
+
+
+def in_room(x, before=1.0, after=1.5):
+    return np.concatenate([room(before), room(len(x) / SR) + x, room(after)])
+
+
+def teach_in_room(sl, sound, label=None, add=False):
+    msgs = []
+    sl.on_taught = lambda tpl, m: msgs.append(m)
+    sl.feed(room(1.0))
+    sl.teach(len(sound) / SR + 1.0, label, add)
+    sl.feed(in_room(sound, 0.3, 2.0))
+    assert msgs and "taught" in msgs[-1], msgs
+    return msgs[-1]
+
+
+def test_doorbell_is_two_tone_falling_despite_hum():
+    [(t0, sig)] = listen.analyze(in_room(ding_dong()))
+    assert sig.category == "two-tone" and "falling" in sig.description
+    hz = listen._distinct_pitches(sig.notes)
+    assert hz[0] == pytest.approx(659, rel=0.02) and hz[1] == pytest.approx(523, rel=0.02)
+    assert sig.duration_s > 1.0                    # the decaying ring stays one event
+
+
+def test_categories_by_frequency_and_pattern():
+    cases = {"repeating": beeps(), "percussive": clap(), "tone": tone(1000, 0.6, 0.1)}
+    for want, x in cases.items():
+        evs = listen.analyze(in_room(x))
+        assert [s.category for _, s in evs] == [want], (want, [s.description for _, s in evs])
+    [(_, s)] = listen.analyze(in_room(beeps()))
+    assert "x3" in s.description and s.pitch_hz == pytest.approx(2000, rel=0.02)
+
+
+def test_clap_and_reversed_chime_do_not_fire_a_taught_doorbell(tmp_path):
+    sl = listen.SoundListener(template_file=tmp_path / "t.json")
+    teach_in_room(sl, ding_dong(), "doorbell")
+    hits, scores = [], []
+    sl.on_detect = hits.append
+    sl.on_event = lambda s, d: scores.append(round(s, 2))
+    for x in (clap(), clap(0.6), ding_dong(0.15, 523, 659), beeps(659)):
+        sl.feed(in_room(x, 0.5, 2.0))
+    assert hits == [], scores
+    sl.feed(in_room(ding_dong(0.05), 0.5, 2.0))   # quieter ring still matches
+    assert [h.label for h in hits] == ["doorbell"] and hits[0].category == "two-tone"
+
+
+def test_several_labelled_sounds_saved_grouped_and_forgotten(tmp_path):
+    f = tmp_path / "t.json"
+    sl = listen.SoundListener(template_file=f)
+    teach_in_room(sl, ding_dong(), "doorbell")
+    teach_in_room(sl, beeps(), "microwave")
+    teach_in_room(sl, ding_dong(0.08), "doorbell", add=True)
+    assert len(sl.sounds["doorbell"]) == 2 and sl.template.label == "doorbell"
+    hits = []
+    sl.on_detect = hits.append
+    sl.cooldown_s = 0.0            # fed faster than real time: wall-clock stamps bunch up
+    sl.feed(in_room(beeps(), 0.5, 2.0))
+    sl.feed(in_room(ding_dong(), 0.5, 2.0))
+    assert [h.label for h in hits] == ["microwave", "doorbell"]
+    cats = sl.categories()
+    assert set(cats) == {"two-tone", "repeating"} and cats["repeating"][0][0] == "microwave"
+    assert "doorbell" in sl.summary() and "[2 examples]" in sl.summary()
+    again = listen.SoundListener(template_file=f)            # v2 file round trip
+    assert set(again.sounds) == {"doorbell", "microwave"} and again.sounds["doorbell"][0].sig
+    again.forget("microwave")
+    assert set(listen.SoundListener(template_file=f).sounds) == {"doorbell"}
+    again.forget()
+    assert not f.exists() and listen.SoundListener(template_file=f).template is None
+
+
+def test_v1_template_file_still_loads(tmp_path):
+    import json
+    v1 = {"fp": [0.0] * listen.NBANDS, "duration_s": 0.064, "level": 0.03, "taught_at": 1.0,
+          "bands": listen.NBANDS, "frame": listen.FRAME, "rate": SR}
+    (tmp_path / "t.json").write_text(json.dumps(v1))
+    sl = listen.SoundListener(template_file=tmp_path / "t.json")
+    assert sl.template is not None and sl.template.sig is None and sl.template.label == "sound"

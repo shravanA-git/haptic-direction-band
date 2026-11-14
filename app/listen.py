@@ -1,23 +1,43 @@
-"""Teach a Sound (prototype): record one sound on the laptop mic, then buzz
-its own pattern (haptics.taught_sound, no direction) whenever it happens.
+"""Teach a Sound: record sounds on the laptop mic (a doorbell, a microwave beep),
+then buzz a pattern (haptics.taught_sound, no direction) whenever one happens.
 
     sl = SoundListener(on_detect=cb)      # cb(SoundHit), from the audio thread
     sl.start()                            # laptop mic via sounddevice
-    sl.teach(2.5)                         # next 2.5 s: make the sound once
+    sl.teach(2.5)                         # next 2.5 s: make the sound once (slot "sound")
+    sl.teach(2.5, label="doorbell")       # named sound; teaching a name again replaces it
+    sl.teach(2.5, label="doorbell", add=True)   # ...or adds another example of it
+    sl.forget("doorbell"); sl.forget()    # one sound / all of them
+    sl.summary()                          # taught sounds grouped by category and pitch
     sl.feed(samples)                      # or push float32 16 kHz audio yourself (tests)
 
+SoundHit: score, start/end (laptop monotonic s), level, label, category, pitch_hz.
+
 How it works (numpy only, no model):
-  * 32 ms frames. A sound "event" is a run of frames louder than
-    RATIO x the noise floor (20th percentile of the last ~3 s), closed by
-    END_QUIET quiet frames or MAX_EVENT_S.
-  * Each event becomes a fingerprint: the mean log energy in NBANDS
-    log-spaced bands (100 Hz-7 kHz), mean-removed and unit length, so it
-    describes the *shape* of the spectrum, not how loud it was.
-  * Teaching keeps the loudest event in the teach window. Detection scores a
-    new event by cosine similarity with the taught fingerprint, times a
-    duration factor; >= threshold (default 0.80) fires, with a cooldown.
-Direction is not estimated yet (timeline: add it once recognition is
-reliable in noise). The taught fingerprint is saved to recordings/taught_sound.json.
+  * 32 ms frames. An event starts when a frame is louder than RATIO x the noise
+    floor (20th percentile of the last ~3 s) and continues while frames stay
+    above HOLD_RATIO x the floor (hysteresis), so a ringing chime stays one event
+    while it decays. Gaps shorter than END_QUIET frames (~220 ms) are kept inside
+    the event, so "beep-beep-beep" is one pattern. MAX_EVENT_S caps it.
+  * Every event gets a Signature:
+      - pitch: per frame, the strongest spectral peak (2048-point zero-padded
+        FFT, parabolic interpolation). A frame is tonal when its 3 strongest
+        peaks hold >= TONAL_PEAK_FRAC of the energy; claps, knocks and hiss don't.
+      - notes: runs of tonal frames at a steady pitch (within NOTE_CENTS), e.g.
+        a ding-dong is two notes, 659 Hz then 523 Hz.
+      - onsets: frames where the level jumps (a new strike or beep).
+      - category, from frequency and pattern: tone, two-tone, melody, repeating
+        (beeps), percussive (clap/knock), noise. See categorize().
+    plus the old fingerprint (mean log energy in NBANDS bands, mean-removed, unit
+    length: the spectrum's shape, not its loudness).
+  * Matching an event against each taught example:
+      tonal template:  0.5 pitch + 0.2 pattern + 0.3 spectrum, and an untuned
+                       event (a clap) is capped far below threshold;
+      untuned template: 0.75 spectrum + 0.25 pattern, capped if the event is tonal;
+    all times a duration factor. The best sound >= threshold (default 0.80) fires,
+    with a cooldown.
+Direction is not estimated yet. Taught sounds are saved to
+recordings/taught_sound.json (v2: a list of labelled sounds; a v1 single
+fingerprint still loads, as label "sound", spectrum-only).
 """
 from __future__ import annotations
 
@@ -26,7 +46,7 @@ import math
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -36,11 +56,29 @@ SAMPLE_RATE = 16000
 FRAME = 512                    # 32 ms
 NBANDS = 20
 FMIN, FMAX = 100.0, 7000.0
-RATIO = 4.0                    # event = frame RMS above RATIO x noise floor
-MIN_RMS = 0.004                # ... and above this absolute floor
-END_QUIET = 3                  # quiet frames that close an event (~96 ms)
-MIN_EVENT_FRAMES = 2
-MAX_EVENT_S = 1.5
+RATIO = 4.0                    # event starts: frame RMS above RATIO x noise floor
+HOLD_RATIO = 1.5               # ... and continues while above HOLD_RATIO x floor,
+HOLD_ROOM = 1.25               # HOLD_ROOM x the room's 90th-percentile level
+HOLD_PEAK = 0.08               # and HOLD_PEAK x the event's peak (-22 dB)
+MIN_RMS = 0.004                # start also needs this absolute level
+END_QUIET = 7                  # quiet frames that close an event (~224 ms)
+MIN_EVENT_FRAMES = 1           # a clap can be a single 32 ms frame
+MAX_EVENT_S = 3.0
+DEFAULT_LABEL = "sound"
+MAX_EXAMPLES = 5               # per label, with teach(add=True)
+
+# pitch analysis
+NFFT = 2048                    # zero-padded: 7.8 Hz bins
+PITCH_MIN, PITCH_MAX = 150.0, 6000.0
+PEAK_HALF_BINS = 8             # +-62 Hz: a Hann main lobe at 512 samples
+TONAL_PEAK_FRAC = 0.5          # 3 strongest peaks hold this share of the energy
+TONAL_EVENT_FRAC = 0.35        # share of tonal frames for a "tonal" event
+NOTE_CENTS = 60                # same note if within this many cents
+ONSET_JUMP = 1.8               # level jump over the recent minimum that marks an onset
+NOISE_SUB = 2.0                # subtract this x the room spectrum before pitch picking
+NOISE_ALPHA = 0.05             # room-spectrum update rate (quiet frames)
+PITCH_RMS_RATIO = 2.5          # only frames this far above the floor get a pitch
+
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE_FILE = ROOT / "recordings" / "taught_sound.json"
 
@@ -48,6 +86,9 @@ _EDGES = np.geomspace(FMIN, FMAX, NBANDS + 1)
 _FREQS = np.fft.rfftfreq(FRAME, 1 / SAMPLE_RATE)
 _BAND = np.digitize(_FREQS, _EDGES) - 1        # FFT bin -> band (out of range: -1/NBANDS)
 _WINDOW = np.hanning(FRAME).astype(np.float32)
+_PFREQS = np.fft.rfftfreq(NFFT, 1 / SAMPLE_RATE)
+_PLO, _PHI = int(np.searchsorted(_PFREQS, PITCH_MIN)), int(np.searchsorted(_PFREQS, PITCH_MAX))
+_NOTE_NAMES = "C C# D D# E F F# G G# A A# B".split()
 
 
 def band_energies(frame: np.ndarray) -> np.ndarray:
@@ -59,6 +100,51 @@ def band_energies(frame: np.ndarray) -> np.ndarray:
     return np.log10(out + 1e-10)
 
 
+def pitch_spectrum(frame: np.ndarray) -> np.ndarray:
+    """Power spectrum over PITCH_MIN..PITCH_MAX (zero-padded NFFT)."""
+    return np.abs(np.fft.rfft(frame * _WINDOW, n=NFFT))[_PLO:_PHI] ** 2
+
+
+def frame_pitch(frame: np.ndarray, noise_psd: Optional[np.ndarray] = None,
+                spec: Optional[np.ndarray] = None) -> tuple:
+    """(pitch_hz or None, tonality 0..1) for one frame. Tonality = share of the
+    150 Hz-6 kHz energy held by the 3 strongest spectral peaks. With noise_psd
+    (the room's average spectrum), the room is subtracted first, so steady hum,
+    fans and HVAC don't count as the sound's pitch."""
+    raw = pitch_spectrum(frame) if spec is None else spec
+    p = raw if noise_psd is None else np.maximum(raw - NOISE_SUB * noise_psd, 0.0)
+    total = float(p.sum())
+    if total <= 1e-12 or total < 0.2 * float(raw.sum()):
+        return None, 0.0        # nothing clearly above the room
+    work = p.copy()
+    held, top = 0.0, None
+    for i in range(3):
+        k = int(np.argmax(work))
+        lo, hi = max(0, k - PEAK_HALF_BINS), k + PEAK_HALF_BINS + 1
+        held += float(work[lo:hi].sum())
+        if i == 0:
+            top = k
+        work[lo:hi] = 0.0
+    tonality = held / total
+    if tonality < TONAL_PEAK_FRAC:
+        return None, tonality
+    k = top
+    if 0 < k < len(p) - 1:   # parabolic interpolation on log power
+        a, b, c = np.log(p[k - 1] + 1e-20), np.log(p[k] + 1e-20), np.log(p[k + 1] + 1e-20)
+        den = a - 2 * b + c
+        k = k + (0.5 * (a - c) / den if abs(den) > 1e-12 else 0.0)
+    return float((_PLO + k) * SAMPLE_RATE / NFFT), tonality
+
+
+def cents(a: float, b: float) -> float:
+    return 1200.0 * math.log2(max(a, 1e-6) / max(b, 1e-6))
+
+
+def note_name(hz: float) -> str:
+    m = int(round(69 + 12 * math.log2(max(hz, 1e-6) / 440.0)))
+    return f"{_NOTE_NAMES[m % 12]}{m // 12 - 1}"
+
+
 def fingerprint(bands: list) -> np.ndarray:
     """Mean band log-energies over an event -> mean-removed unit vector."""
     v = np.mean(np.asarray(bands), axis=0)
@@ -67,14 +153,175 @@ def fingerprint(bands: list) -> np.ndarray:
     return v / n if n > 1e-9 else v
 
 
-def similarity(fp: np.ndarray, dur_s: float, tpl: "Template") -> float:
-    """Cosine of the spectral shapes x a duration factor (1.0 within 2x of
-    the taught length, falling off beyond)."""
-    cos = float(np.dot(fp, tpl.fp))
-    ratio = max(dur_s, 1e-3) / max(tpl.duration_s, 1e-3)
-    dur = min(1.0, 2.0 / max(ratio, 1 / ratio))
-    return max(0.0, cos) * dur
+def _dur_factor(a: float, b: float) -> float:
+    """1.0 within 2x of each other, falling off beyond."""
+    ratio = max(a, 1e-3) / max(b, 1e-3)
+    return min(1.0, 2.0 / max(ratio, 1 / ratio))
 
+
+# --------------------------------------------------------------------------
+# Signature: pitch + pattern + category
+# --------------------------------------------------------------------------
+
+@dataclass
+class Signature:
+    duration_s: float
+    tonal: float                                # share of loud frames with a clear pitch
+    notes: list = field(default_factory=list)   # [(hz, start_s, dur_s)]
+    onsets: list = field(default_factory=list)  # [start_s] of each strike / beep
+    category: str = ""
+    description: str = ""
+
+    @property
+    def is_tonal(self) -> bool:
+        return self.tonal >= TONAL_EVENT_FRAC and bool(self.notes)
+
+    @property
+    def pitch_hz(self) -> Optional[float]:
+        """Main pitch: the longest note."""
+        return max(self.notes, key=lambda n: n[2])[0] if self.notes else None
+
+    def to_json(self) -> dict:
+        return {"duration_s": round(self.duration_s, 3), "tonal": round(self.tonal, 3),
+                "notes": [[round(h, 1), round(s, 3), round(d, 3)] for h, s, d in self.notes],
+                "onsets": [round(t, 3) for t in self.onsets],
+                "category": self.category, "description": self.description}
+
+    @classmethod
+    def from_json(cls, d: dict) -> "Signature":
+        return cls(float(d["duration_s"]), float(d["tonal"]),
+                   [tuple(n) for n in d.get("notes", [])], list(d.get("onsets", [])),
+                   d.get("category", ""), d.get("description", ""))
+
+
+def _distinct_pitches(notes: list) -> list:
+    """Note pitches merged within NOTE_CENTS, in order of first appearance."""
+    out: list = []
+    for hz, _, _ in notes:
+        if not any(abs(cents(hz, o)) <= NOTE_CENTS for o in out):
+            out.append(hz)
+    return out
+
+
+def categorize(sig: Signature) -> tuple:
+    """(category, description) from pitch and pattern.
+
+    tone        one steady pitch, one strike            "single mid tone 1000 Hz (B5)"
+    repeating   one pitch, several beeps                "repeating beep x3 at 2000 Hz, every 250 ms"
+    two-tone    two pitches (doorbell ding-dong)        "two-tone falling 659->523 Hz (E5->C5)"
+    melody      three or more pitches                   "4-note melody 523-659-784-1047 Hz"
+    voice       low gliding pitch (speech, singing)     "voice-like, gliding 150-210 Hz"
+    percussive  untuned or low short strikes            "2 untuned hits (knocking)", "low thump x2"
+    noise       untuned and sustained (hiss, voice)     "untuned noise, 900 ms"
+    """
+    ms = round(sig.duration_s * 1000)
+    hits = max(1, len(sig.onsets))
+    if not sig.is_tonal:
+        if sig.duration_s <= 0.35 * hits:
+            return "percussive", ("short untuned hit (clap/knock)" if hits == 1
+                                  else f"{hits} untuned hits (knocking)")
+        return "noise", f"untuned noise, {ms} ms"
+    pitches = _distinct_pitches(sig.notes)
+    if max(pitches) < 400 and max(d for _, _, d in sig.notes) < 0.13 \
+            and sig.duration_s <= 0.35 * hits:
+        return "percussive", (f"low thump x{hits} (~{pitches[0]:.0f} Hz, knocking)" if hits > 1
+                              else f"low thump (~{pitches[0]:.0f} Hz)")
+    if max(pitches) < 350 and len(sig.notes) >= 3:
+        return "voice", f"voice-like, gliding {min(pitches):.0f}-{max(pitches):.0f} Hz, {ms} ms"
+    if len(pitches) == 1:
+        hz = pitches[0]
+        strikes = max(hits, len(sig.notes))
+        if strikes >= 2:
+            gaps = np.diff(sig.onsets) if len(sig.onsets) >= 2 else \
+                np.diff([n[1] for n in sig.notes])
+            every = f", every {round(float(np.median(gaps)) * 1000)} ms" if len(gaps) else ""
+            return "repeating", f"repeating beep x{strikes} at {hz:.0f} Hz ({note_name(hz)}){every}"
+        band = "low" if hz < 400 else ("high" if hz > 2000 else "mid")
+        return "tone", f"single {band} tone {hz:.0f} Hz ({note_name(hz)}), {ms} ms"
+    if len(pitches) == 2:
+        a, b = pitches
+        way = "falling" if b < a else "rising"
+        return "two-tone", (f"two-tone {way} {a:.0f}->{b:.0f} Hz "
+                            f"({note_name(a)}->{note_name(b)}), {ms} ms")
+    return "melody", (f"{len(pitches)}-note melody "
+                      + "-".join(f"{p:.0f}" for p in pitches[:6]) + " Hz")
+
+
+def describe_frames(rms: list, pitches: list, on: list) -> Signature:
+    """Signature from per-frame RMS, (pitch or None) and loud flags of one event."""
+    dt = FRAME / SAMPLE_RATE
+    loud = [i for i, o in enumerate(on) if o]
+    last = loud[-1] if loud else 0
+    dur = (last + 1) * dt
+    tonal = sum(1 for i in loud if pitches[i] is not None) / max(1, len(loud))
+    # onsets: first frame, then level jumps over the recent minimum after a dip
+    onsets = [0.0]
+    for i in range(2, last + 1):
+        recent = min(rms[max(0, i - 4):i - 1])
+        if on[i] and rms[i] > ONSET_JUMP * recent and rms[i] > rms[i - 1] * 1.3 \
+                and i * dt - onsets[-1] >= 0.08:
+            onsets.append(i * dt)
+    onset_frames = {int(round(t / dt)) for t in onsets[1:]}
+    # notes: runs of tonal frames at a steady pitch (1-frame dropouts tolerated)
+    notes, cur, gap = [], None, 0
+
+    def close(c):
+        if c and len(c["p"]) >= 2:
+            notes.append((float(np.median(c["p"])), c["i0"] * dt, (c["i1"] - c["i0"] + 1) * dt))
+
+    for i in range(last + 1):
+        p = pitches[i]
+        if p is None:
+            gap += 1
+            if gap > 1 and cur:
+                close(cur)
+                cur = None
+            continue
+        gap = 0
+        if cur and abs(cents(p, float(np.median(cur["p"][-4:])))) <= NOTE_CENTS \
+                and i not in onset_frames:
+            cur["p"].append(p)
+            cur["i1"] = i
+        else:
+            close(cur)
+            cur = {"p": [p], "i0": i, "i1": i}
+    close(cur)
+    sig = Signature(dur, tonal, notes, onsets)
+    sig.category, sig.description = categorize(sig)
+    return sig
+
+
+def pitch_score(t: Signature, e: Signature) -> float:
+    """How well the event's notes match the template's (duration-weighted),
+    with penalties for a different note order or count."""
+    if not t.notes or not e.notes:
+        return 0.0
+    total = sum(d for _, _, d in t.notes)
+    s = 0.0
+    for hz, _, d in t.notes:
+        c = min(abs(cents(eh, hz)) for eh, _, _ in e.notes)
+        s += d / total * math.exp(-(c / 100.0) ** 2)     # 100 cents (a semitone) -> 0.37
+    td, ed = _distinct_pitches(t.notes), _distinct_pitches(e.notes)
+    # order of the distinct pitches (ding-dong vs dong-ding); repeats of one pitch don't count
+    order = [min(range(len(ed)), key=lambda j: abs(cents(ed[j], hz))) for hz in td]
+    if order != sorted(order):
+        s *= 0.4                  # same notes, other order: a different chime
+    return s * math.sqrt(min(len(td), len(ed)) / max(len(td), len(ed)))
+
+
+def pattern_score(t: Signature, e: Signature) -> float:
+    """Same number of strikes, at similar spacing."""
+    nt, ne = len(t.onsets), len(e.onsets)
+    s = min(nt, ne) / max(nt, ne)
+    if nt >= 2 and ne >= 2:
+        gt, ge = float(np.median(np.diff(t.onsets))), float(np.median(np.diff(e.onsets)))
+        s *= _dur_factor(gt, ge) ** 0.5
+    return s
+
+
+# --------------------------------------------------------------------------
+# Templates (one example of a taught sound)
+# --------------------------------------------------------------------------
 
 @dataclass
 class Template:
@@ -82,18 +329,53 @@ class Template:
     duration_s: float
     level: float
     taught_at: float = 0.0
+    label: str = DEFAULT_LABEL
+    sig: Optional[Signature] = None      # None: a v1 template (spectrum-only matching)
 
     def to_json(self) -> dict:
-        return {"fp": [round(float(x), 5) for x in self.fp], "duration_s": round(self.duration_s, 3),
-                "level": round(self.level, 5), "taught_at": self.taught_at,
-                "bands": NBANDS, "frame": FRAME, "rate": SAMPLE_RATE}
+        d = {"fp": [round(float(x), 5) for x in self.fp], "duration_s": round(self.duration_s, 3),
+             "level": round(self.level, 5), "taught_at": self.taught_at,
+             "bands": NBANDS, "frame": FRAME, "rate": SAMPLE_RATE}
+        if self.sig is not None:
+            d["sig"] = self.sig.to_json()
+        return d
 
     @classmethod
-    def from_json(cls, d: dict) -> "Template":
+    def from_json(cls, d: dict, label: str = DEFAULT_LABEL) -> "Template":
         if d.get("bands") != NBANDS or d.get("frame") != FRAME or d.get("rate") != SAMPLE_RATE:
             raise ValueError("taught sound was saved with different settings; teach it again")
+        sig = Signature.from_json(d["sig"]) if d.get("sig") else None
         return cls(np.asarray(d["fp"], dtype=float), float(d["duration_s"]),
-                   float(d["level"]), float(d.get("taught_at", 0.0)))
+                   float(d["level"]), float(d.get("taught_at", 0.0)), label, sig)
+
+    @property
+    def category(self) -> str:
+        return self.sig.category if self.sig else "unknown"
+
+    @property
+    def description(self) -> str:
+        return self.sig.description if self.sig else f"{self.duration_s * 1000:.0f} ms sound"
+
+
+def similarity(fp: np.ndarray, dur_s: float, tpl: Template,
+               sig: Optional[Signature] = None) -> float:
+    """Match score 0..1 of an event (fingerprint, duration, signature) against one
+    template. Without signatures: spectral cosine x duration factor (v1)."""
+    spectral = max(0.0, float(np.dot(fp, tpl.fp)))
+    dur = _dur_factor(dur_s, tpl.duration_s)
+    t = tpl.sig
+    if t is None or sig is None:
+        return spectral * dur
+    pat = pattern_score(t, sig)
+    if t.is_tonal:
+        if sig.tonal < 0.6 * TONAL_EVENT_FRAC or not sig.notes:
+            return min(spectral, 0.5) * 0.6 * dur      # a clap can't be a chime
+        s = 0.5 * pitch_score(t, sig) + 0.2 * pat + 0.3 * spectral
+    else:
+        s = 0.75 * spectral + 0.25 * pat
+        if sig.is_tonal and sig.tonal > 0.7:
+            s = min(s, 0.6)                           # a chime isn't a knock
+    return s * dur
 
 
 @dataclass(frozen=True)
@@ -102,13 +384,19 @@ class SoundHit:
     start: float      # laptop time.monotonic() seconds
     end: float
     level: float
+    label: str = DEFAULT_LABEL
+    category: str = ""
+    pitch_hz: Optional[float] = None
 
 
 @dataclass
 class _Event:
     start_n: int
-    bands: list
+    bands: list                      # band energies of loud frames (fingerprint)
     peak: float
+    rms: list = field(default_factory=list)
+    pitches: list = field(default_factory=list)
+    on: list = field(default_factory=list)
     quiet: int = 0
 
 
@@ -119,30 +407,53 @@ class SoundListener:
         self.on_detect = on_detect
         self.on_taught: Optional[Callable[[Optional[Template], str], None]] = None
         self.on_event: Optional[Callable[[float, float], None]] = None   # debug: (score, dur)
+        # debug: (Signature, best label or None, best score) for every event
+        self.on_classified: Optional[Callable[[Signature, Optional[str], float], None]] = None
         self.threshold = threshold
         self.cooldown_s = cooldown_s
         self.device = device
         self.template_file = Path(template_file) if template_file else None
-        self.template: Optional[Template] = None
+        self.sounds: dict = {}            # label -> [Template] (examples)
         self.paused = False
         self.last: Optional[SoundHit] = None
+        self.last_event_start = 0.0       # monotonic start of the last closed event
+        self._latest: Optional[Template] = None
         self._levels: deque = deque(maxlen=int(3 * SAMPLE_RATE / FRAME))
+        self._noise_psd: Optional[np.ndarray] = None   # room spectrum (quiet frames)
         self._buf = np.zeros(0, dtype=np.float32)
         self._n = 0                       # samples consumed
         self._offset: Optional[float] = None
         self._ev: Optional[_Event] = None
         self._teach_until: Optional[int] = None   # sample index where teaching ends
+        self._teach_label = DEFAULT_LABEL
+        self._teach_add = False
         self._teach_events: list = []
         self._last_hit = -1e9
         self._lock = threading.Lock()
         self._stream = None
         if self.template_file and self.template_file.exists():
             try:
-                self.template = Template.from_json(json.loads(self.template_file.read_text()))
-            except (ValueError, KeyError) as e:
+                self._load(json.loads(self.template_file.read_text()))
+            except (ValueError, KeyError, TypeError) as e:
                 print(f"[listen] ignoring {self.template_file.name}: {e}")
 
     # ------------------------------------------------------------- public
+    @property
+    def template(self) -> Optional[Template]:
+        """The most recently taught example (None if nothing is taught)."""
+        if self._latest is not None and self._latest.label in self.sounds:
+            return self._latest
+        allt = [t for ex in self.sounds.values() for t in ex]
+        return max(allt, key=lambda t: t.taught_at) if allt else None
+
+    @template.setter
+    def template(self, tpl: Optional[Template]) -> None:
+        if tpl is None:
+            self.sounds.clear()
+        else:
+            self.sounds[tpl.label] = [tpl]
+        self._latest = tpl
+
     @property
     def noise_floor(self) -> float:
         return float(np.percentile(self._levels, 20)) if self._levels else 0.0
@@ -171,20 +482,49 @@ class SoundListener:
         self._ev = None
         self.paused = False
 
-    def teach(self, seconds: float = 2.5) -> None:
-        """Make the sound once within the next `seconds`; the loudest event wins."""
+    def teach(self, seconds: float = 2.5, label: Optional[str] = None, add: bool = False) -> None:
+        """Make the sound once within the next `seconds`; the loudest event wins.
+        Same label again: replaces it, or adds an example with add=True."""
         with self._lock:
             self._teach_events = []
+            self._teach_label = (label or DEFAULT_LABEL).strip() or DEFAULT_LABEL
+            self._teach_add = add
             self._teach_until = self._n + len(self._buf) + int(seconds * SAMPLE_RATE)
 
     @property
     def teaching(self) -> bool:
         return self._teach_until is not None
 
-    def forget(self) -> None:
-        self.template = None
-        if self.template_file and self.template_file.exists():
-            self.template_file.unlink()
+    def forget(self, label: Optional[str] = None) -> None:
+        """Forget one taught sound, or all of them."""
+        if label is None:
+            self.sounds.clear()
+        else:
+            self.sounds.pop(label, None)
+        self._latest = None
+        self._save()
+
+    def categories(self) -> dict:
+        """category -> [(label, main pitch Hz or None, description)], sorted by pitch."""
+        out: dict = {}
+        for label, ex in self.sounds.items():
+            t = max(ex, key=lambda x: x.taught_at)
+            pitch = t.sig.pitch_hz if t.sig else None
+            out.setdefault(t.category, []).append((label, pitch, t.description))
+        for v in out.values():
+            v.sort(key=lambda r: (r[1] is None, r[1] or 0))
+        return dict(sorted(out.items()))
+
+    def summary(self) -> str:
+        if not self.sounds:
+            return "no sounds taught"
+        lines = []
+        for cat, rows in self.categories().items():
+            lines.append(f"{cat}:")
+            for label, pitch, desc in rows:
+                n = len(self.sounds[label])
+                lines.append(f"  {label}: {desc}" + (f"  [{n} examples]" if n > 1 else ""))
+        return "\n".join(lines)
 
     def feed(self, samples, t_first: Optional[float] = None) -> None:
         """Push float32 mono 16 kHz audio; t_first = monotonic time of samples[0]."""
@@ -212,46 +552,87 @@ class SoundListener:
         self._n += FRAME
         rms = float(math.sqrt(float(np.mean(f * f))) + 1e-9)
         floor = self.noise_floor
-        loud = rms > max(MIN_RMS, RATIO * floor) and len(self._levels) >= 5
-        if self._ev is None or not loud:
+        ready = len(self._levels) >= 5
+        start = ready and rms > max(MIN_RMS, RATIO * floor)
+        hold = ready and rms > self._hold_level(floor)
+        ev = self._ev
+        spec = pitch_spectrum(f)
+        if (ev is None and not start) or (ev is not None and not hold):
             self._levels.append(rms)            # floor tracks the room, not the event
+            self._noise_psd = spec if self._noise_psd is None else \
+                (1 - NOISE_ALPHA) * self._noise_psd + NOISE_ALPHA * spec
         if self.paused and not self.teaching:
             return
-        ev = self._ev
         if ev is None:
-            if loud:
-                self._ev = _Event(n0, [band_energies(f)], rms)
-        elif loud:
-            ev.bands.append(band_energies(f))
+            if start:
+                ev = self._ev = _Event(n0, [], rms)
+                self._add(ev, f, rms, True, spec)
+        elif hold:
+            self._add(ev, f, rms, True, spec)
             ev.peak = max(ev.peak, rms)
             ev.quiet = 0
-            if len(ev.bands) * FRAME >= MAX_EVENT_S * SAMPLE_RATE:
+            if len(ev.on) * FRAME >= MAX_EVENT_S * SAMPLE_RATE:
                 self._close(self._n)
         else:
+            self._add(ev, f, rms, False)
             ev.quiet += 1
             if ev.quiet >= END_QUIET:
                 self._close(self._n - END_QUIET * FRAME)
         if self._teach_until is not None and self._n >= self._teach_until and self._ev is None:
             self._finish_teach()
 
+    def _hold_level(self, floor: float) -> float:
+        """An open event continues while frames stay above this: above the room's
+        usual ups and downs (HOLD_ROOM x its 90th percentile, and HOLD_RATIO x the
+        floor) and above HOLD_PEAK x the event's own peak (a decaying chime ends
+        when it fades into the room, not on its first dip)."""
+        room = float(np.percentile(self._levels, 90)) if self._levels else 0.0
+        peak = self._ev.peak if self._ev is not None else 0.0
+        return max(0.5 * MIN_RMS, HOLD_RATIO * floor, HOLD_ROOM * room, HOLD_PEAK * peak)
+
+    def _add(self, ev: _Event, f: np.ndarray, rms: float, on: bool,
+             spec: Optional[np.ndarray] = None) -> None:
+        ev.rms.append(rms)
+        ev.on.append(on)
+        if on:
+            ev.bands.append(band_energies(f))
+            clear = rms >= PITCH_RMS_RATIO * self.noise_floor   # well above the room
+            ev.pitches.append(frame_pitch(f, self._noise_psd, spec)[0] if clear else None)
+        else:
+            ev.pitches.append(None)
+
     def _close(self, end_n: int) -> None:
         ev, self._ev = self._ev, None
         if ev is None or len(ev.bands) < MIN_EVENT_FRAMES:
             return
-        dur = (end_n - ev.start_n) / SAMPLE_RATE
+        sig = describe_frames(ev.rms, ev.pitches, ev.on)
+        self.last_event_start = self._t(ev.start_n)
+        dur = sig.duration_s
         fp = fingerprint(ev.bands)
         if self._teach_until is not None:
-            self._teach_events.append(Template(fp, dur, ev.peak, time.time()))
+            self._teach_events.append(Template(fp, dur, ev.peak, time.time(),
+                                               self._teach_label, sig))
             return
-        if self.template is None:
+        if not self.sounds:
+            if self.on_classified:
+                self.on_classified(sig, None, 0.0)
             return
-        score = similarity(fp, dur, self.template)
+        best, best_label = 0.0, None
+        for label, examples in self.sounds.items():
+            for tpl in examples:
+                s = similarity(fp, dur, tpl, sig)
+                if s > best:
+                    best, best_label = s, label
         if self.on_event:
-            self.on_event(score, dur)
+            self.on_event(best, dur)
+        if self.on_classified:
+            self.on_classified(sig, best_label, best)
+        end_n = ev.start_n + int(round(dur * SAMPLE_RATE))
         end_t = self._t(end_n)
-        if score >= self.threshold and end_t - self._last_hit >= self.cooldown_s:
+        if best >= self.threshold and end_t - self._last_hit >= self.cooldown_s:
             self._last_hit = end_t
-            hit = SoundHit(round(score, 3), self._t(ev.start_n), end_t, ev.peak)
+            hit = SoundHit(round(best, 3), self._t(ev.start_n), end_t, ev.peak,
+                           best_label, sig.category, sig.pitch_hz)
             self.last = hit
             if self.on_detect:
                 try:
@@ -261,44 +642,112 @@ class SoundListener:
 
     def _finish_teach(self) -> None:
         events, self._teach_events, self._teach_until = self._teach_events, [], None
+        label = self._teach_label
         if not events:
             msg = "no sound heard while teaching; make it louder or closer to the laptop"
             tpl = None
         else:
             tpl = max(events, key=lambda e: e.level)
-            self.template = tpl
-            msg = f"taught a {tpl.duration_s * 1000:.0f} ms sound"
-            if self.template_file:
-                try:
-                    self.template_file.parent.mkdir(parents=True, exist_ok=True)
-                    self.template_file.write_text(json.dumps(tpl.to_json()) + "\n")
-                except OSError as e:
-                    msg += f" (not saved: {e})"
+            ex = self.sounds.get(label, []) if self._teach_add else []
+            self.sounds[label] = (ex + [tpl])[-MAX_EXAMPLES:]
+            self._latest = tpl
+            n = len(self.sounds[label])
+            msg = (f"taught a {tpl.duration_s * 1000:.0f} ms sound '{label}': {tpl.description}"
+                   f" [{tpl.category}]" + (f" ({n} examples)" if n > 1 else ""))
+            if tpl.duration_s < 0.15:
+                msg += "; very short, so try louder or closer for the whole sound"
+            err = self._save()
+            if err:
+                msg += f" (not saved: {err})"
         if self.on_taught:
             try:
                 self.on_taught(tpl, msg)
             except Exception as e:
                 print(f"[listen] on_taught error: {e}")
 
+    def _save(self) -> Optional[str]:
+        if not self.template_file:
+            return None
+        try:
+            if not self.sounds:
+                if self.template_file.exists():
+                    self.template_file.unlink()
+                return None
+            self.template_file.parent.mkdir(parents=True, exist_ok=True)
+            data = {"version": 2, "sounds": [
+                {"label": label, "examples": [t.to_json() for t in ex]}
+                for label, ex in self.sounds.items()]}
+            self.template_file.write_text(json.dumps(data) + "\n")
+        except OSError as e:
+            return str(e)
+        return None
+
+    def _load(self, d: dict) -> None:
+        if "fp" in d:                                  # v1: one fingerprint
+            t = Template.from_json(d)
+            self.sounds = {t.label: [t]}
+        else:
+            self.sounds = {s["label"]: [Template.from_json(x, s["label"]) for x in s["examples"]]
+                           for s in d.get("sounds", [])}
+
+
+def analyze(samples, sr: int = SAMPLE_RATE) -> list:
+    """Every event in a clip -> [(start_s, Signature)] (no teaching, no matching).
+    For tuning and for checking what a recording looks like."""
+    if sr != SAMPLE_RATE:
+        raise ValueError(f"need {SAMPLE_RATE} Hz audio")
+    out = []
+    sl = SoundListener(template_file=None)
+    sl.on_classified = lambda sig, label, score: out.append((sl.last_event_start, sig))
+    sl.feed(samples, t_first=0.0)
+    sl.feed(np.zeros(SAMPLE_RATE, np.float32))
+    return out
+
 
 def main(argv=None) -> int:
-    """python -m app.listen [--teach] [--seconds 20]: try it in the terminal."""
+    """python -m app.listen [--teach [--label doorbell] [--add]] [--seconds 20]
+    [--list] [--forget LABEL|all] [--analyze clip.wav]"""
     import argparse
     ap = argparse.ArgumentParser(description=main.__doc__)
-    ap.add_argument("--teach", action="store_true", help="teach a new sound first")
+    ap.add_argument("--teach", action="store_true", help="teach a sound first")
+    ap.add_argument("--label", default=None, help="name for the taught sound, e.g. doorbell")
+    ap.add_argument("--add", action="store_true", help="with --teach: add another example")
     ap.add_argument("--seconds", type=float, default=30.0, help="listen this long")
     ap.add_argument("--threshold", type=float, default=0.80)
+    ap.add_argument("--list", action="store_true", help="print taught sounds by category")
+    ap.add_argument("--forget", metavar="LABEL", help="forget one sound (or 'all')")
+    ap.add_argument("--analyze", metavar="FILE", help="describe every sound in a wav/npy clip")
     a = ap.parse_args(argv)
+    if a.analyze:
+        if a.analyze.endswith(".npy"):
+            x = np.load(a.analyze).astype(np.float32)
+        else:
+            from faster_whisper import decode_audio
+            x = decode_audio(a.analyze, sampling_rate=SAMPLE_RATE)
+        for t0, sig in analyze(x):
+            print(f"  {t0:6.2f}s  {sig.duration_s * 1000:5.0f} ms  [{sig.category}] "
+                  f"{sig.description}  (tonal {sig.tonal:.2f}, {len(sig.onsets)} onsets)")
+        return 0
     done = threading.Event()
-    sl = SoundListener(lambda h: print(f"  DETECTED score {h.score:.2f}"), threshold=a.threshold)
+    sl = SoundListener(lambda h: print(f"  DETECTED '{h.label}' score {h.score:.2f}"),
+                       threshold=a.threshold)
+    if a.forget:
+        sl.forget(None if a.forget == "all" else a.forget)
+        print(f"[listen] forgot {a.forget}")
+    if a.list:
+        print(sl.summary())
+        return 0
     sl.on_taught = lambda tpl, msg: (print(f"[listen] {msg}"), done.set())
-    sl.on_event = lambda s, d: print(f"  event {d * 1000:.0f} ms, score {s:.2f}")
+    sl.on_classified = lambda sig, label, s: print(
+        f"  event {sig.duration_s * 1000:.0f} ms [{sig.category}] {sig.description}"
+        + (f" -> best '{label}' score {s:.2f}" if label else ""))
     sl.start()
     time.sleep(1.0)                       # learn the room's noise floor
     if a.teach or sl.template is None:
         print("[listen] make the sound now (2.5 s)...")
-        sl.teach(2.5)
-        done.wait(5)
+        sl.teach(2.5, a.label, a.add)
+        done.wait(6)
+    print(sl.summary())
     print(f"[listen] listening {a.seconds:.0f} s (Ctrl-C to stop)")
     try:
         time.sleep(a.seconds)

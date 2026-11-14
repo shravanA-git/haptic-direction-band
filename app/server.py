@@ -256,7 +256,10 @@ class App:
         latency_ms = (time.monotonic() - hit.end) * 1000      # end of the sound -> cue sent
         self.notify.cue("sound", "sound", None, hit.score, latency_ms,
                         duration_ms=round((hit.end - hit.start) * 1000))
-        self.state["sound"] = f"heard it (match {hit.score:.2f})"
+        what = getattr(hit, "label", "") or "it"
+        cat = getattr(hit, "category", "")
+        self.state["sound"] = f"heard {what}" + (f" [{cat}]" if cat else "") + \
+            f" (match {hit.score:.2f})"
         self.emit({"type": "state", **self.state})
 
     def _on_taught(self, tpl, msg: str) -> None:
