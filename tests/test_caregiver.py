@@ -78,7 +78,7 @@ def test_rate_limit_merges_into_digest_and_caps_per_hour():
 
 def test_unconfigured_phone_fails_clearly():
     s = Settings()
-    cg = Caregiver(s, DryRunSender(), phone="5551234")   # not E.164
+    cg = Caregiver(s, DryRunSender(), phone="5551234")   # neither E.164 nor an email
     r = cg.send_test()
     assert not r["ok"] and "CAREGIVER_PHONE" in r["error"] and cg.status()["to"] != "5551234"
 

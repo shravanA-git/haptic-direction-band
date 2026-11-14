@@ -37,8 +37,9 @@ Running it
     python -m app.main --vision --agent          # the band app + the texting agent
     python -m app.band_agent --chat              # talk to it in the terminal (no texts)
     python -m app.band_agent --chat --offline    # same, keyword router only
-Env (.env, gitignored): SPECTRUM_PROJECT_ID, SPECTRUM_PROJECT_SECRET (Photon),
-WEARER_PHONE, CAREGIVER_PHONE (E.164), ANTHROPIC_API_KEY (optional).
+Env (.env, gitignored): PHOTON_PROJECT_ID, PHOTON_API_KEY (Photon 2.0 beta),
+WEARER_PHONE, CAREGIVER_PHONE (a +E.164 number or the iMessage email), ANTHROPIC_API_KEY
+(optional). Shared line: the person must text the agent first; see tools/photon/README.md.
 """
 from __future__ import annotations
 
@@ -475,8 +476,7 @@ class BandAgent:
 # Service: texts in, replies out, urgent alerts out
 # ---------------------------------------------------------------------------
 
-def digits(p: Optional[str]) -> str:
-    return re.sub(r"\D", "", p or "")
+from .notify import norm_handle        # noqa: E402  (phones by digits, emails lowercased)
 
 
 class AgentService:
@@ -486,7 +486,7 @@ class AgentService:
                  caregiver_on: Callable[[], bool] = lambda: True,
                  clock: Callable[[], float] = time.time, urgent_gap_s: float = 60.0, max_urgent_per_hour: int = 6):
         self.agent, self.sender = agent, sender
-        self.allow = {digits(p) for p in allow if digits(p)}
+        self.allow = {norm_handle(p) for p in allow if norm_handle(p)}
         self.caregiver_phone, self.caregiver_on, self.clock = caregiver_phone, caregiver_on, clock
         self.urgent_gap_s, self.max_urgent = urgent_gap_s, max_urgent_per_hour
         self._q: queue.Queue = queue.Queue(maxsize=20)
@@ -502,7 +502,7 @@ class AgentService:
 
     # -- inbound
     def on_text(self, sender: str, text: str) -> None:
-        if digits(sender) not in self.allow:
+        if norm_handle(sender) not in self.allow:
             self.ignored += 1                         # not on the list: no reply, not even "no"
             return
         try:

@@ -264,3 +264,19 @@ def test_plugin_tools_plug_in_without_editing_the_agent(monkeypatch):
     monkeypatch.setitem(sys.modules, "fake_bad", mod3)
     assert tools.load_plugins(["fake_bad", "fake_factory"]) == ["band_mood"]
     assert "connected" in tools.extra[-1]()
+
+
+def test_allowlist_accepts_phones_and_iMessage_emails_in_any_format():
+    from app.notify import mask_phone, norm_handle, valid_handle
+    assert norm_handle("Sam@Example.COM ") == norm_handle("sam@example.com") != ""
+    assert norm_handle("+1 (555) 000-0001") == norm_handle("15550000001") and norm_handle("") == ""
+    assert valid_handle("+15550000001") and valid_handle("sam@example.com") and not valid_handle("5551234")
+    assert "sam" not in mask_phone("sam@example.com") and mask_phone("sam@example.com").endswith("@example.com")
+    log, tools = seeded()
+    snd = FakeSender()
+    svc = B.AgentService(B.BandAgent(tools, offline=True), snd, ["Sam@Example.com"], log).start()
+    snd.handlers[0]("sam@example.COM", "status")
+    snd.handlers[0]("eve@example.com", "status")
+    assert svc.drain() and svc.handled == 1 and svc.ignored == 1
+    assert snd.sent[0][0] == "sam@example.COM"                  # answered at the address it came from
+    svc.close()

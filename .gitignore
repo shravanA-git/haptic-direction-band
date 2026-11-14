@@ -22,3 +22,6 @@ recordings/
 build/
 # caregiver texting bridge (npm install in tools/photon)
 node_modules/
+
+# Photon bridge resume cursor
+tools/photon/.cursor.json

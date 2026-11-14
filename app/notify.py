@@ -72,6 +72,21 @@ class Notifier:
 ROOT = Path(__file__).resolve().parent.parent
 BRIDGE = ROOT / "tools" / "photon" / "bridge.mjs"
 E164 = re.compile(r"^\+[1-9]\d{6,14}$")
+EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")      # an iMessage identity can be an email
+
+
+def valid_handle(h: Optional[str]) -> bool:
+    """A phone in E.164 (+15551234567) or an iMessage email address."""
+    return bool(h and (E164.match(h) or EMAIL.match(h)))
+
+
+def norm_handle(h: Optional[str]) -> str:
+    """One comparable form: emails lowercased, phones by digits ('' if neither)."""
+    s = (h or "").strip()
+    if "@" in s:
+        return "mail:" + s.lower()
+    d = re.sub(r"\D", "", s)
+    return "tel:" + d if d else ""
 
 
 def load_env(path=ROOT / ".env") -> None:
@@ -89,6 +104,8 @@ def load_env(path=ROOT / ".env") -> None:
 
 
 def mask_phone(p: Optional[str]) -> str:
+    if p and "@" in p:
+        return f"{p[0]}\u2022\u2022\u2022@{p.split('@', 1)[1]}"
     return f"{p[:2]}\u2022\u2022\u2022{p[-2:]}" if p and len(p) > 4 else "not set"
 
 
@@ -109,9 +126,11 @@ class DryRunSender:
 
 
 class PhotonSender:
-    """Sends through tools/photon/bridge.mjs (Photon Spectrum, iMessage).
-    Credentials are read by the bridge from SPECTRUM_PROJECT_ID/SECRET in the
-    environment. The bridge is started on first use and restarted if it dies."""
+    """Sends and receives through tools/photon/bridge.mjs (Photon 2.0 beta, iMessage).
+    Credentials are read by the bridge from PHOTON_PROJECT_ID / PHOTON_API_KEY in the
+    environment. The bridge is started on first use and restarted if it dies.
+    Shared line: a handle can only be texted after it texted us first (the bridge
+    answers 'no conversation yet' otherwise)."""
     name = "Photon"
 
     def __init__(self, node: str = "node", bridge: Path = BRIDGE, timeout_s: float = 30.0):
@@ -137,8 +156,8 @@ class PhotonSender:
 
     @staticmethod
     def available() -> bool:
-        return bool(os.environ.get("SPECTRUM_PROJECT_ID") and os.environ.get("SPECTRUM_PROJECT_SECRET")
-                    and (BRIDGE.parent / "node_modules" / "spectrum-ts").exists())
+        return bool(os.environ.get("PHOTON_PROJECT_ID") and os.environ.get("PHOTON_API_KEY")
+                    and (BRIDGE.parent / "node_modules" / "@photon-ai" / "api").exists())
 
     def _start(self) -> None:
         self._p = subprocess.Popen([self.node, str(self.bridge)], stdin=subprocess.PIPE,
@@ -237,7 +256,7 @@ class Caregiver:
 
     @property
     def configured(self) -> bool:
-        return bool(self.phone and E164.match(self.phone))
+        return valid_handle(self.phone)
 
     def status(self) -> dict:
         return {"on": self.settings.caregiver_texts, "configured": self.configured,
@@ -315,7 +334,7 @@ class Caregiver:
 
     def _send(self, text: str) -> dict:
         if not self.configured:
-            ok, err = False, "caregiver phone not set (CAREGIVER_PHONE in .env, E.164)"
+            ok, err = False, "caregiver handle not set (CAREGIVER_PHONE in .env: +E.164 number or iMessage email)"
         else:
             try:
                 ok, err = self.sender.send(self.phone, text)

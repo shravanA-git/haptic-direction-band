@@ -2,8 +2,9 @@
   "name": "hdb-photon-bridge",
   "private": true,
   "type": "module",
-  "description": "Caregiver texting bridge: app/notify.py writes JSON lines, this sends them via Photon Spectrum (iMessage).",
+  "description": "Photon 2.0 beta bridge: app/notify.py writes JSON lines, this sends and receives iMessage via @photon-ai/api.",
   "dependencies": {
-    "spectrum-ts": "*"
+    "@photon-ai/api": "0.6.0",
+    "socket.io-client": "4.8.4"
   }
 }
