@@ -29,15 +29,22 @@ detector + TargetTracker + ObjectGuide on the clip's own timeline (frame / fps),
 so the numbers don't depend on how fast this laptop is.
 
 Metrics (in-view = left/center/right/sweep):
-  seen          % of in-view frames with a tracked box
+  seen_coco / seen_open   % of in-view frames with a tracked box, COCO
+                targets vs open-vocabulary (YOLO-World) targets
   side_acc      % of held-still frames whose side state matches the label
                 (among frames where the tracker reports a side)
-  detect_s      median delay from entering view to the first box
+  cue_s         median delay from entering (segment start) to the first ObjectGuide
+                cue; includes the human's reaction to the recorder's prompt
+  detect_s      same, to the first box (info)
+  det_fps       detector frames per second on this machine
   false_out     % of out frames with a box
   flips_min     tracker state changes per minute while held still
   lost_s        median delay from the last box after leaving to "lost"
                 (never = end of segment)
   wrong_cue     % of directional cues on the opposite motor while held left/right
+Part A also counts wrong_target: answers naming the wrong thing (a miss -> the
+"can't look for that" cue is acceptable, a wrong target is not), including any
+answer to a NEGATIVES phrase ("hello there").
   stale_cues    directional cues after the object left (info, no target)
 GRACE_S at each segment start is excused from side_acc, flips, false_out and
 wrong_cue: the recorder's segments are timed prompts and the object is still
@@ -64,16 +71,20 @@ GRACE_S = 1.5   # recorder segments are timed prompts; people take ~1-1.5 s to m
 VOICES = ("Samantha", "Daniel", "Fred")
 
 # Thresholds (PASS if value meets them). Override with --targets file.json.
+# HDB-Supervisor's targets for Shravan, Nov 14.
 TARGETS = {
     "text_acc": (">=", 95.0),
     "spoken_acc": (">=", 90.0),
-    "seen": (">=", 80.0),
-    "side_acc": (">=", 90.0),
-    "detect_s": ("<=", 1.0),
-    "false_out": ("<=", 5.0),
-    "flips_min": ("<=", 2.0),
-    "lost_s": ("<=", 3.0),
-    "wrong_cue": ("<=", 5.0),
+    "wrong_target": ("<=", 0),        # a wrong object is worse than "can't look for that"
+    "seen_coco": (">=", 80.0),
+    "seen_open": (">=", 60.0),
+    "side_acc": (">=", 95.0),
+    "wrong_cue": ("<=", 2.0),
+    "cue_s": ("<=", 0.5),
+    "lost_s": ("<=", 2.5),
+    "flips_min": ("<=", 6.0),
+    "false_out": ("<=", 0.0),
+    "det_fps": (">=", 9.0),
 }
 
 TEMPLATES = [
@@ -100,6 +111,10 @@ OBJECTS = [
     "headphones", "keys", "wallet", "charger", "glasses", "AirPods", "sunglasses", "earbuds",
     "pen", "hat", "watch", "hearing aid", "pill bottle", "slippers", "ID card",
 ]
+
+# Nothing asked for: must give None (the "can't look for that" cue), never a target.
+NEGATIVES = ["hello there", "um", "uh never mind", "what time is it", "thank you",
+             "okay", "stop", "can you hear me", "hmm", "I'm fine"]
 
 # Other answers that still find the thing (the COCO detector sees a pill bottle).
 ALSO_OK = {"pill bottle": {"bottle"}}
@@ -140,10 +155,13 @@ def is_match(got: Optional[str], want: str, obj: Optional[str] = None) -> bool:
 
 
 def score_text(templates=TEMPLATES, objects=OBJECTS,
-               match: Optional[Callable[[str], Optional[str]]] = None) -> dict:
+               match: Optional[Callable[[str], Optional[str]]] = None,
+               negatives: bool = True) -> dict:
+    """Accuracy over templates x objects; "wrong" counts answers that name the
+    wrong thing (including any answer to a NEGATIVES phrase), not misses."""
     if match is None:
         from app.speech import match_target as match
-    n = ok = 0
+    n = ok = wrong = 0
     by_tpl, by_obj, fails = {}, {}, []
     for tpl in templates:
         for obj in objects:
@@ -160,8 +178,14 @@ def score_text(templates=TEMPLATES, objects=OBJECTS,
             by_obj[obj][0] += good
             by_obj[obj][1] += 1
             if not good:
+                wrong += got is not None
                 fails.append({"text": text, "want": want, "got": got})
-    return {"n": n, "ok": ok, "acc": _pct(ok, n),
+    for text in (NEGATIVES if negatives else []):
+        got = match(text)
+        if got is not None:
+            wrong += 1
+            fails.append({"text": text, "want": None, "got": got})
+    return {"n": n, "ok": ok, "acc": _pct(ok, n), "wrong": wrong,
             "worst_templates": _worst(by_tpl), "worst_objects": _worst(by_obj),
             "fails": fails}
 
@@ -206,7 +230,7 @@ def score_spoken(limit: int = 40, voices=None, transcriber=None) -> dict:
         tr.load()
     except Exception as e:
         return {"skip": f"faster-whisper unavailable ({type(e).__name__}: {e})"}
-    n = ok = 0
+    n = ok = wrong = 0
     by_voice, fails, secs = {}, [], []
     with tempfile.TemporaryDirectory() as d:
         wav = os.path.join(d, "p.wav")
@@ -226,9 +250,10 @@ def score_spoken(limit: int = 40, voices=None, transcriber=None) -> dict:
                 by_voice[v][0] += good
                 by_voice[v][1] += 1
                 if not good:
+                    wrong += got is not None
                     fails.append({"said": phrase, "voice": v, "heard": text, "want": want,
                                   "got": got})
-    return {"n": n, "ok": ok, "acc": _pct(ok, n), "voices": voices,
+    return {"n": n, "ok": ok, "acc": _pct(ok, n), "wrong": wrong, "voices": voices,
             "by_voice": {v: _pct(a, b) for v, (a, b) in by_voice.items()},
             "decode_median_s": round(median(secs), 3) if secs else None, "fails": fails}
 
@@ -317,12 +342,14 @@ def run_clip(frames: Iterable, fps: float, target: str, detect: Callable,
     for i, width, frame in frames:
         t = i / fps
         now[0] = t
+        t_det = time.perf_counter()
         boxes = detect(frame, target)
+        dt = time.perf_counter() - t_det
         d = tracker.update(boxes, width, t, mirror)
         if d.changed:
             guide.on_decision(d, now=t)
         guide.tick(now=t)
-        recs.append({"i": i, "t": t, "state": d.state, "box": d.bbox is not None})
+        recs.append({"i": i, "t": t, "state": d.state, "box": d.bbox is not None, "dt": dt})
     return recs, cues
 
 
@@ -355,7 +382,7 @@ def score_clip(recs: list, cues: list, segments: list, fps: float,
 
     # Entering: segment start (the recorder's prompt) -> first box. Leaving: last
     # box in the out segment (the object actually gone) -> "lost".
-    detect, lost, stale = [], [], 0
+    detect, lost, cue_d, stale = [], [], [], 0
     gone_at = {}
     for k, (label, a, b) in enumerate(segments):
         prev_label = segments[k - 1][0] if k else None
@@ -363,6 +390,8 @@ def score_clip(recs: list, cues: list, segments: list, fps: float,
         if label in IN_VIEW and prev_label in (None, "out"):
             hit = next((r for r in rows if r["box"]), None)
             detect.append((hit["i"] - a) / fps if hit else (b - a + 1) / fps)
+            first = next((t for t, _, _ in cues if a / fps <= t <= (b + 1) / fps), None)
+            cue_d.append(first - a / fps if first is not None else (b - a + 1) / fps)
         if label == "out" and prev_label in IN_VIEW:
             lost_r = next((r for r in rows if r["state"] == "lost"), None)
             upto = lost_r["i"] if lost_r else b + 1
@@ -385,20 +414,37 @@ def score_clip(recs: list, cues: list, segments: list, fps: float,
     return {
         "frames": len(recs), "seen": seen, "side_acc": _pct(side_ok, side_n),
         "detect_s": round(median(detect), 2) if detect else None,
+        "cue_s": round(median(cue_d), 2) if cue_d else None,
         "false_out": _pct(out_box, out_n),
         "flips_min": round(flips / (held_s / 60), 2) if held_s else None,
         "lost_s": round(median(lost), 2) if lost else None,
         "wrong_cue": _pct(dir_bad, dir_n) if dir_n else None,
         "stale_cues": stale,
-        "_counts": {"inview": len(inview), "seen": sum(r["box"] for r in inview),
+        "det_fps": _fps(recs),
+        "_counts": {"cue": cue_d, "det_s": sum(r.get("dt", 0) for r in recs), "n": len(recs),"inview": len(inview), "seen": sum(r["box"] for r in inview),
                     "side_n": side_n, "side_ok": side_ok, "flips": flips, "held_s": held_s,
                     "out_n": out_n, "out_box": out_box, "detect": detect, "lost": lost,
                     "dir_n": dir_n, "dir_bad": dir_bad, "stale": stale},
     }
 
 
-def combine(per_clip: list) -> dict:
-    """Pool counts across clips (frame-weighted, not a mean of percentages)."""
+def _fps(recs) -> Optional[float]:
+    total = sum(r.get("dt", 0) for r in recs)
+    return round(len(recs) / total, 1) if total > 0 else None
+
+
+def combine(per_clip: list, is_open: Optional[list] = None) -> dict:
+    """Pool counts across clips (frame-weighted, not a mean of percentages).
+    is_open[k]: clip k is an open-vocabulary (YOLO-World) target."""
+    is_open = is_open or [False] * len(per_clip)
+    split = {}
+    for kind, flag in (("seen_coco", False), ("seen_open", True)):
+        cs = [s["_counts"] for s, o in zip(per_clip, is_open) if o == flag]
+        split[kind] = _pct(sum(c["seen"] for c in cs), sum(c["inview"] for c in cs))
+    det_s = sum(s["_counts"]["det_s"] for s in per_clip)
+    split["det_fps"] = round(sum(s["_counts"]["n"] for s in per_clip) / det_s, 1) if det_s else None
+    cue = [x for s in per_clip for x in s["_counts"]["cue"]]
+    split["cue_s"] = round(median(cue), 2) if cue else None
     c = {k: 0 for k in ("inview", "seen", "side_n", "side_ok", "flips", "held_s", "out_n",
                         "out_box", "dir_n", "dir_bad")}
     detect, lost = [], []
@@ -413,7 +459,7 @@ def combine(per_clip: list) -> dict:
             "flips_min": round(c["flips"] / (c["held_s"] / 60), 2) if c["held_s"] else None,
             "lost_s": round(median(lost), 2) if lost else None,
             "wrong_cue": _pct(c["dir_bad"], c["dir_n"]) if c["dir_n"] else None,
-            "stale_cues": sum(s["_counts"]["stale"] for s in per_clip)}
+            "stale_cues": sum(s["_counts"]["stale"] for s in per_clip), **split}
 
 
 LIVE_FPS = 10.0   # the app runs detection at ~9-10 fps on the demo laptop
@@ -479,9 +525,9 @@ def score_clips(labels: Path = LABELS, mirror: Optional[bool] = None, detector=N
         detector = detector or _VisionDetect()
     except Exception as e:
         return {"skip": f"detector unavailable ({type(e).__name__}: {e})"}
-    from app.vision import TrackerConfig
+    from app.vision import COCO_CLASSES, TrackerConfig
     cfg = TrackerConfig()
-    per, rows = [], []
+    per, rows, opens = [], [], []
     for c in clips:
         try:
             vfps, frames = frames_for(c["video"])
@@ -498,11 +544,14 @@ def score_clips(labels: Path = LABELS, mirror: Optional[bool] = None, detector=N
         recs, cues = run_clip(frames, fps, target, detector, cfg, m)
         s = score_clip(recs, cues, c["segments"], fps, grace_s)
         per.append(s)
+        opens.append(target not in COCO_CLASSES)
         rows.append({"object": c["object"], "target": target,
                      **{k: v for k, v in s.items() if not k.startswith("_")}})
     out = {"clips": rows}
     if per:
-        out["all"] = combine(per)
+        out["all"] = combine(per, opens)
+        out["device"] = getattr(getattr(getattr(detector, "vision", None), "detector", None),
+                                "device", None)
     return out
 
 
@@ -526,13 +575,15 @@ def verdict(metrics: dict, targets: dict = TARGETS) -> dict:
     return out
 
 
-UNITS = {"text_acc": "%", "spoken_acc": "%", "seen": "%", "side_acc": "%", "detect_s": " s",
-         "false_out": "%", "flips_min": "/min", "lost_s": " s", "wrong_cue": "%"}
+UNITS = {"text_acc": "%", "spoken_acc": "%", "wrong_target": "", "seen_coco": "%",
+         "seen_open": "%", "side_acc": "%", "wrong_cue": "%", "cue_s": " s", "lost_s": " s",
+         "flips_min": "/min", "false_out": "%", "det_fps": " fps"}
 LABEL = {"text_acc": "A  text match_target", "spoken_acc": "A  spoken (say+whisper)",
-         "seen": "B  seen (in-view frames)", "side_acc": "B  side accuracy (held)",
-         "detect_s": "B  first detect after entering", "false_out": "B  false detections (out)",
-         "flips_min": "B  flips/min (held still)", "lost_s": "B  lost after leaving",
-         "wrong_cue": "B  wrong-side cues"}
+         "wrong_target": "A  wrong targets (any)", "seen_coco": "B  seen, COCO (in-view)",
+         "seen_open": "B  seen, open-vocab (in-view)", "side_acc": "B  side correct (held)",
+         "wrong_cue": "B  wrong-side cues", "cue_s": "B  first cue after entering",
+         "lost_s": "B  lost cue after leaving", "flips_min": "B  flips/min (held still)",
+         "false_out": "B  false detections (out)", "det_fps": "B  detector fps"}
 
 
 def report(res: dict) -> str:
@@ -560,11 +611,14 @@ def report(res: dict) -> str:
     if "skip" in b:
         lines.append(f"clips: SKIP - {b['skip']}")
     else:
+        if b.get("device"):
+            lines.append(f"clips: detector on {b['device']} (fps target is for MPS; "
+                         "HDB_VISION_DEVICE=mps to measure it)")
         for r in b["clips"]:
             if "error" in r:
                 lines.append(f"  clip {r['object']}: ERROR {r['error']}")
             else:
-                lines.append("  clip {object:12} seen {seen}%  side {side_acc}%  detect {detect_s}s  "
+                lines.append("  clip {object:12} seen {seen}%  side {side_acc}%  cue {cue_s}s  "
                              "false {false_out}%  flips {flips_min}/min  lost {lost_s}s  "
                              "wrong {wrong_cue}%  stale cues {stale_cues}".format(**r))
     lines.append("")
@@ -577,7 +631,8 @@ def evaluate(spoken: int = 40, labels: Path = LABELS, mirror: Optional[bool] = N
     a = score_text()
     s = score_spoken(spoken) if spoken else {"skip": "disabled (--no-spoken)"}
     b = score_clips(labels, mirror, **kw)
-    metrics = {"text_acc": a["acc"], "spoken_acc": s.get("acc")}
+    metrics = {"text_acc": a["acc"], "spoken_acc": s.get("acc"),
+               "wrong_target": a["wrong"] + s.get("wrong", 0)}
     metrics.update(b.get("all", {}))
     v = verdict(metrics, targets)
     return {"metrics": metrics, "targets": targets, "verdict": v,

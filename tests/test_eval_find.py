@@ -57,11 +57,13 @@ def test_perfect_detector_passes_clip_metrics(tmp_path):
     segs = ef.parse_labels(LABELS, tmp_path)[0]["segments"]
     res = ef.score_clips(write(tmp_path), detector=Truth(segs), frames_for=frames_for)
     m = res["all"]
-    assert m["seen"] == 100.0 and m["false_out"] == 0.0 and m["detect_s"] == 0.0
+    assert m["seen_coco"] == 100.0 and m["seen_open"] is None
+    assert m["false_out"] == 0.0 and m["detect_s"] == 0.0 and m["cue_s"] == 0.0
     assert m["side_acc"] == 100.0 and m["wrong_cue"] == 0.0 and m["flips_min"] == 0.0
     assert 1.9 <= m["lost_s"] <= 2.2          # TrackerConfig.lost_after_s = 2.0
     v = ef.verdict(m)
-    assert all(v[k] == "PASS" for k in m if k in v), v
+    assert v["seen_open"] == "SKIP" and v["det_fps"] == "PASS"
+    assert all(v[k] == "PASS" for k in m if k in v and k != "seen_open"), v
 
 
 def test_swapped_sides_fail_side_and_cues(tmp_path):
@@ -70,7 +72,7 @@ def test_swapped_sides_fail_side_and_cues(tmp_path):
                        frames_for=frames_for)["all"]
     assert m["side_acc"] < 50 and m["wrong_cue"] == 100.0
     v = ef.verdict(m)
-    assert v["side_acc"] == "FAIL" and v["wrong_cue"] == "FAIL" and v["seen"] == "PASS"
+    assert v["side_acc"] == "FAIL" and v["wrong_cue"] == "FAIL" and v["seen_coco"] == "PASS"
 
 
 def test_text_scoring_and_match():
@@ -80,12 +82,17 @@ def test_text_scoring_and_match():
     assert ef.is_match("air pods", "airpods") and ef.is_match("bottle", "pill bottle", "pill bottle")
     assert not ef.is_match("roger", "charger") and not ef.is_match(None, "cup")
     real = ef.score_text(["find the {x}", "where is my {x}"], ["banana", "phone", "headphones"])
-    assert real["acc"] == 100.0, real["fails"]
+    assert real["acc"] == 100.0 and real["wrong"] == 0, real["fails"]
+    # a wrong answer counts as wrong; a miss doesn't; anything for a negative does
+    r = ef.score_text(["find the {x}"], ["cup", "keys"], negatives=False,
+                      match=lambda t: "bowl" if "cup" in t else None)
+    assert r["wrong"] == 1 and r["ok"] == 0
+    assert ef.score_text([], [], match=lambda t: "cup")["wrong"] == len(ef.NEGATIVES)
 
 
 def test_no_clips_skips_part_b(tmp_path, capsys):
     res = ef.evaluate(spoken=0, labels=tmp_path / "missing.json")
-    assert "skip" in res["clips"] and res["verdict"]["seen"] == "SKIP"
+    assert "skip" in res["clips"] and res["verdict"]["seen_coco"] == "SKIP"
     assert res["verdict"]["spoken_acc"] == "SKIP" and res["metrics"]["text_acc"] is not None
     assert "clips: SKIP" in ef.report(res)
     assert len(ef.TEMPLATES) >= 30 and len(ef.OBJECTS) >= 40
