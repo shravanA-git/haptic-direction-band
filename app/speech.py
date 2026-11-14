@@ -20,6 +20,13 @@ Interface for app/main.py / app/server.py
               clock (seconds), for name timestamps later
     t0        time.monotonic() of the first audio sample
     seconds   audio length
+    via       "keywords" or "langchain" (which one chose target)
+
+LangChain target picker: keywords run first ("find the banana" never waits on a
+network call). When they find no detector class ("I'm thirsty", "I need to sit
+down"), a LangChain tool call (agent_find.pick_target, Claude Haiku) picks one. On
+by default when ANTHROPIC_API_KEY is set; HDB_TARGET_LLM=0 turns it off, and any
+error or timeout falls back to the keyword result.
 
 Typical wiring (vision + guide are already paused while Action is held):
     sp = Speech(on_result=lambda r: r.target and vision.set_target(r.target))
@@ -88,6 +95,7 @@ def _singular(w: str) -> list[str]:
     return out
 
 
+_COCO = set(COCO_CLASSES)
 _VOCAB = {c: c for c in COCO_CLASSES}
 _VOCAB.update(SYNONYMS)
 # Common mishearings of short demo words.
@@ -159,6 +167,32 @@ class SpeechResult:
     t0: float = 0.0
     seconds: float = 0.0
     error: Optional[str] = None
+    via: str = "keywords"   # how target was chosen: "keywords" or "langchain"
+
+
+def resolve_spoken_target(text: str, picker=None) -> tuple:
+    """(target, via). Keywords first: instant, and a detector class wins outright.
+    Otherwise ask the LangChain picker (app/agent_find.py), if any; on an error or
+    an empty answer keep the keyword result (an open phrase or None)."""
+    kw = match_target(text)
+    if kw in _COCO or picker is None or not (text or "").strip():
+        return kw, "keywords"
+    try:
+        t = picker(text)
+    except Exception as e:
+        print(f"[speech] langchain picker failed ({type(e).__name__}: {e}); using keywords")
+        return kw, "keywords"
+    return (t, "langchain") if t else (kw, "keywords")
+
+
+def default_picker():
+    """LangChain picker if enabled and configured (see agent_find.target_picker)."""
+    try:
+        from .agent_find import target_picker
+        return target_picker()
+    except Exception as e:
+        print(f"[speech] langchain picker off ({type(e).__name__}: {e})")
+        return None
 
 
 class Transcriber:
@@ -214,9 +248,15 @@ PROMPT = None
 
 class Speech:
     def __init__(self, on_result: Optional[Callable[[SpeechResult], None]] = None,
-                 model: str = DEFAULT_MODEL, device=None, preload: bool = True):
+                 model: str = DEFAULT_MODEL, device=None, preload: bool = True,
+                 picker="auto"):
         self.on_result = on_result
         self.device = device            # sounddevice input device (None = default mic)
+        # LangChain target picker for requests keywords can't place ("I'm thirsty").
+        # "auto": on when an API key is set (agent_find.target_picker); None: off.
+        self.picker = default_picker() if picker == "auto" else picker
+        if self.picker:
+            print("[speech] langchain target picker on (keywords first)")
         self.transcriber = Transcriber(model)
         self._lock = threading.Lock()
         self._chunks: list = []
@@ -289,7 +329,8 @@ class Speech:
         self.busy = True
         try:
             text, words = self.transcriber.transcribe(audio, t0, PROMPT)
-            self._deliver(SpeechResult(text, match_target(text), words, t0, secs))
+            target, via = resolve_spoken_target(text, self.picker)
+            self._deliver(SpeechResult(text, target, words, t0, secs, via=via))
         except Exception as e:
             self._deliver(SpeechResult("", None, t0=t0, seconds=secs, error=str(e)))
         finally:
@@ -786,6 +827,7 @@ def _selftest(tts: bool = False) -> None:
         got = match_name(words, names)
         assert (got[0] if got else None) == want, (words, names, got)
     print("speech selftest (name matching): OK")
+    _selftest_langchain()
     if not tts:
         return
     import subprocess
@@ -805,6 +847,52 @@ def _selftest(tts: bool = False) -> None:
             assert words and all(100.0 <= w.start <= w.end for w in words), words
     print("speech selftest (tts round trip): OK")
     _selftest_names(tr)
+
+
+def _selftest_langchain() -> None:
+    """Hold-to-talk -> LangChain picker, with a scripted chat model (no API key).
+    Goes through the real bind_tools/tool-call path of agent_find.pick_target."""
+    try:
+        from langchain_core.messages import AIMessage
+        from .agent_find import _scripted_model, target_picker
+    except ImportError as e:
+        print(f"speech selftest (langchain picker): SKIPPED ({e})")
+        return
+
+    def call(target):
+        return AIMessage("", tool_calls=[{"name": "TargetChoice", "id": "c1",
+                                          "args": {"target": target, "reason": "test"}}])
+
+    model = _scripted_model([call("Bottle"), call("wallet"), call(None), call("chair")])
+    asked = []
+    pick = target_picker(model)
+    picker = lambda text: (asked.append(text), pick(text))[1]
+    cases = [
+        ("Find the banana.", "banana", "keywords"),            # keywords win, no LLM call
+        ("I'm really thirsty.", "bottle", "langchain"),       # normalized to the COCO class
+        ("Where did I put my wallet?", "wallet", "langchain"),   # open phrase
+        ("What time is it?", None, "keywords"),               # LLM says not a find request
+        ("I need to sit down somewhere", "chair", "langchain"),
+    ]
+    for text, want, via in cases:
+        got = resolve_spoken_target(text, picker)
+        assert got == (want, via), (text, got, (want, via))
+    assert len(asked) == 4 and "Find the banana." not in asked, asked
+
+    def broken(text):
+        raise TimeoutError("no network")
+    assert resolve_spoken_target("where are my headphones", broken) == ("headphones", "keywords")
+    assert resolve_spoken_target("I'm thirsty", None) == (None, "keywords")
+    prev = os.environ.get("HDB_TARGET_LLM")
+    os.environ["HDB_TARGET_LLM"] = "0"
+    try:
+        assert target_picker(model) is None
+    finally:
+        if prev is None:
+            del os.environ["HDB_TARGET_LLM"]
+        else:
+            os.environ["HDB_TARGET_LLM"] = prev
+    print("speech selftest (langchain picker): OK")
 
 
 def _selftest_names(tr) -> None:
@@ -864,7 +952,7 @@ def main(argv=None) -> None:
     def show(r: SpeechResult) -> None:
         if r.error:
             print(f"[speech] error: {r.error}")
-        print(f"[speech] {r.seconds:.1f}s  text={r.text!r}  target={r.target!r}")
+        print(f"[speech] {r.seconds:.1f}s  text={r.text!r}  target={r.target!r} (via {r.via})")
         for w in r.words:
             print(f"    {w.start:10.3f}-{w.end:10.3f}  {w.text}")
 
@@ -886,7 +974,8 @@ def main(argv=None) -> None:
     if a.file:
         tr = Transcriber(a.model)
         text, words = tr.transcribe(load_audio(a.file), time.monotonic(), PROMPT)
-        show(SpeechResult(text, match_target(text), words))
+        target, via = resolve_spoken_target(text, default_picker())
+        show(SpeechResult(text, target, words, via=via))
         return
     if a.hold:
         done = threading.Event()
