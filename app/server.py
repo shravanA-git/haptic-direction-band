@@ -281,6 +281,8 @@ class App:
         listener.on_taught = self._on_taught
         if hasattr(listener, "on_heard"):   # YAMNet's top classes for every sound (HDB_YAMNET=1)
             listener.on_heard = lambda text: self.emit({"type": "log", "text": f"sound: {text}"})
+        if hasattr(listener, "on_classified"):   # every event's best taught match: near-misses
+            listener.on_classified = self._on_classified
         self.state["sound"] = "taught, listening" if listener.template else "not taught yet"
         if getattr(listener, "yamnet", None) is not None:
             self.state["sound"] += " + YAMNet"
@@ -322,6 +324,18 @@ class App:
                        "reason": e.reason, "window": win})
         if win and self.recorder.active:
             self.recorder.mark_alert(*win)
+
+    def _on_classified(self, sig, label, score: float) -> None:
+        """Every sound event vs the taught sounds, so a near-miss is visible."""
+        thr = getattr(self.sound, "threshold", 0.8)
+        what = getattr(sig, "description", "") or "sound"
+        if label is None:
+            text = f"sound: event {what}; nothing taught to compare"
+        else:
+            text = (f"sound: event {what} -> best '{label}' {score:.2f} "
+                    f"({'match' if score >= thr else f'needs {thr:.2f}'})")
+        print(f"[sound] {text[7:]}", flush=True)
+        self.emit({"type": "log", "text": text})
 
     def _on_taught(self, tpl, msg: str) -> None:
         # a failed teach keeps the sounds taught before
