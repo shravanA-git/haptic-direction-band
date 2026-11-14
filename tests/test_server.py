@@ -215,3 +215,31 @@ def test_video_streams_mjpeg_of_annotated_frames():
         link.close()
 
     asyncio.run(run())
+
+
+def test_lan_token_cookie_manifest_and_icons():
+    async def run():
+        link = Link(SimPort()).start()
+        app = App(link)
+        app.token, app.local_ok = "s3cret", False          # act like a phone on the LAN
+        async with TestClient(TestServer(app.make_app())) as client:
+            assert (await client.get("/")).status == 403
+            assert (await client.get("/?k=wrong")).status == 403
+            r = await client.get("/?k=s3cret")
+            assert r.status == 200 and "hdb_k" in r.cookies
+            ws = await client.ws_connect("/ws")             # cookie rides along
+            await _collect(ws, lambda m: m["type"] == "status")
+            await ws.close()
+            m = await (await client.get("/manifest.webmanifest")).json()
+            assert m["display"] == "standalone" and m["start_url"] == "/"
+            m = await (await client.get("/manifest.webmanifest?k=s3cret")).json()
+            assert m["start_url"] == "/?k=s3cret"
+            client.session.cookie_jar.clear()
+            r = await client.get("/icon.svg")                # public, no token needed
+            assert r.status == 200 and "<svg" in await r.text()
+            r = await client.get("/icon-192.png")
+            assert r.status == 200 and (await r.read())[:4] == b"\x89PNG"
+            assert (await client.get("/video")).status == 403
+        link.close()
+
+    asyncio.run(run())

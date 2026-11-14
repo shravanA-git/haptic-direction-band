@@ -6,6 +6,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
 <meta name="theme-color" content="#121110">
+<link rel="manifest" id="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="HDB">
 <style>
   /* One accent (amber) on a warm neutral. Red is reserved for STOP and faults,
      which always carry words too. */
@@ -171,6 +177,22 @@
     .talkrow { grid-template-columns: minmax(260px, 1fr) minmax(0, 1.4fr); align-items: center; padding: 14px 28px 22px; }
     .block { padding: 18px 24px; }
   }
+  /* phone buzz fallback (no Vibration API, e.g. iPhone): flash the cue's side */
+  #flash { position: fixed; inset: 0; z-index: 30; pointer-events: none; display: none; }
+  #flash.show { display: block; }
+  #flash .edge { position: absolute; background: var(--accent); }
+  #flash.left .edge { left: 0; top: 0; bottom: 0; width: 28px; }
+  #flash.right .edge { right: 0; top: 0; bottom: 0; width: 28px; }
+  #flash.front .edge { left: 0; right: 0; top: 0; height: 28px; }
+  #flash.back .edge { left: 0; right: 0; bottom: 0; height: 28px; }
+  #flash.all .edge { inset: 0; opacity: .22; }
+  #flash.urgent { background: var(--bad); }
+  #flash.urgent .edge { display: none; }
+  #flash .word { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+                 font-size: 22vmin; font-weight: 800; color: var(--accent); text-shadow: 0 0 2px var(--bg); }
+  #flash.urgent .word { color: #fff; font-size: 14vmin; text-align: center; }
+  .codes { display: grid; grid-template-columns: auto 1fr; gap: 2px 14px; font-size: 14px; margin: 0 0 10px; }
+  .codes dt { color: var(--ink-3); } .codes dd { margin: 0; }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
@@ -187,6 +209,7 @@
   <button id="stop" type="button" title="Esc" aria-label="Stop: all motors off now">STOP</button>
 </header>
 <div id="faults" role="alert"></div>
+<div id="flash" aria-hidden="true"><div class="edge"></div><div class="word"></div></div>
 
 <main>
   <!-- the hero: what the camera sees and what it means -->
@@ -247,7 +270,7 @@
 
   <!-- everything else, folded -->
   <div class="more">
-    <details>
+    <details id="set">
       <summary>Settings <span class="sub" id="settings"></span></summary>
       <div class="fold">
         <div class="row"><span class="dim">Strength</span>
@@ -257,6 +280,10 @@
           <button type="button" class="toggle" data-mute="name_alerts">Names</button>
           <button type="button" class="toggle" data-mute="find_cues">Find</button>
           <button type="button" class="toggle" data-mute="sound_alerts">Sounds</button></div>
+        <div class="row"><span class="dim">Phone</span>
+          <button type="button" class="toggle" id="phonebuzz" aria-pressed="false">Buzz on this phone: off</button></div>
+        <p class="note" id="phonenote"></p>
+        <dl class="codes" id="phonecodes"></dl>
         <div class="row"><span class="dim">Look</span>
           <button id="theme" type="button" aria-label="Switch light or dark theme">Theme: auto</button></div>
         <div class="row"><input id="nm" placeholder="name to listen for" aria-label="Name to listen for"><button id="setnm" type="button">Listen</button></div>
@@ -328,6 +355,10 @@ const SHORT = ["F","FR","R","BR","B","BL","L","FL"];
 const MICS = ["Front","Right","Back","Left"];
 const $ = id => document.getElementById(id);
 let ws, recording = false;
+// LAN token from the printed URL: also sent on the WebSocket and camera URLs, so
+// they work even where the cookie isn't kept (home-screen app, embedded views).
+const KEY = new URLSearchParams(location.search).get("k");
+const withKey = (u, sep) => KEY ? `${u}${sep}k=${encodeURIComponent(KEY)}` : u;
 
 // ---- theme: auto (system) / light / dark, remembered on this device
 (function theme() {
@@ -342,6 +373,76 @@ let ws, recording = false;
   $("theme").onclick = () => { t = order[(order.indexOf(t) + 1) % 3]; localStorage.setItem("hdb-theme", t); apply(); };
   apply();
 })();
+
+// ---- phone as a backup buzzer: one vibration code per cue, retune here
+const PHONE_CODES = {          // [on, off, on, ...] in ms
+  front:   {ms: [120, 120, 120],           say: "front: short-short"},
+  right:   {ms: [120, 120, 400],           say: "right: short-long"},
+  left:    {ms: [400, 120, 120],           say: "left: long-short"},
+  back:    {ms: [400, 120, 400],           say: "back: long-long"},
+  urgent:  {ms: [400, 150, 400, 150, 400], say: "obstacle ahead: three long"},
+  nudge:   {ms: [200],                     say: "attention, no clear side: one 200 ms"},
+  ack:     {ms: [80],                      say: "got it, looking: one 80 ms"},
+  lost:    {ms: [300, 200, 300],           say: "lost the object: two 300 ms"},
+  unknown: {ms: [80, 80, 80, 80, 80],      say: "can't look for that: three quick"},
+};
+const ARROW = {front: "\u2191", right: "\u2192", left: "\u2190", back: "\u2193"};
+const canVibrate = typeof navigator.vibrate === "function";
+let phoneBuzz = localStorage.getItem("hdb-phonebuzz") === "on";
+function sideOf(motor) { return motor === 0 ? "front" : motor === 4 ? "back" : motor < 4 ? "right" : "left"; }
+function phoneCode(a) {          // an alert-log record -> PHONE_CODES key, or null
+  if (a.dry || a.muted) return null;
+  if (a.source === "avoid" && a.cue === "generic") return "urgent";
+  if (a.cue === "generic") return "nudge";
+  if (a.cue === "centered") return "front";
+  if (["ack", "lost", "unknown"].includes(a.cue)) return a.cue;
+  if (a.motor === null || a.motor === undefined) return "nudge";
+  return sideOf(a.motor);
+}
+let flashTimer = null;
+function phoneCue(a) {
+  if (!phoneBuzz) return;
+  const key = phoneCode(a);
+  if (!key) return;
+  try {
+    if (canVibrate && navigator.vibrate(PHONE_CODES[key].ms)) return;
+  } catch (e) { /* fall through to the flash */ }
+  const f = $("flash"), side = ARROW[key] ? key : key === "urgent" ? "urgent" : "all";
+  f.className = "show " + side;
+  f.querySelector(".word").textContent = key === "urgent" ? "Obstacle ahead" : (ARROW[key] || "");
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => { f.className = ""; }, key === "urgent" ? 1200 : 700);
+}
+function showPhone() {
+  $("phonebuzz").textContent = "Buzz on this phone: " + (phoneBuzz ? "on" : "off");
+  $("phonebuzz").classList.toggle("sel", phoneBuzz);
+  $("phonebuzz").setAttribute("aria-pressed", phoneBuzz);
+  $("phonenote").textContent = canVibrate
+    ? "When the band buzzes, this phone vibrates too. Keep the page open and the screen on."
+    : "This phone cannot vibrate from a web page (iPhone). It shows a flash on the cue's side instead.";
+}
+$("phonecodes").innerHTML = "";
+Object.values(PHONE_CODES).forEach(c => {
+  const [what, how] = c.say.split(": ");
+  const dt = document.createElement("dt"); dt.textContent = what;
+  const dd = document.createElement("dd"); dd.className = "mono"; dd.textContent = how;
+  $("phonecodes").append(dt, dd);
+});
+$("phonebuzz").onclick = () => {
+  phoneBuzz = !phoneBuzz;
+  localStorage.setItem("hdb-phonebuzz", phoneBuzz ? "on" : "off");
+  showPhone();
+  if (phoneBuzz) phoneCue({cue: "ack", motor: null});   // a tap counts as permission to vibrate
+};
+showPhone();
+{   // a link like /#set opens that folded section
+  const d = location.hash && document.getElementById(location.hash.slice(1));
+  if (d && d.tagName === "DETAILS") { d.open = true; d.scrollIntoView(); }
+}
+{   // Add to Home Screen keeps the LAN token in the start URL
+  const k = new URLSearchParams(location.search).get("k");
+  if (k) $("manifest").href = "/manifest.webmanifest?k=" + encodeURIComponent(k);
+}
 
 // ---- belt diagram: waist seen from above, motor 0 at the front, clockwise
 const svg = $("ring"), NS = "http://www.w3.org/2000/svg";
@@ -528,7 +629,7 @@ $("halt").onclick = () => send({cmd: "replay_stop"});
 
 // ---- websocket
 function connect() {
-  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws = new WebSocket(withKey(`ws://${location.host}/ws`, "?"));
   ws.onopen = () => { log("dashboard connected"); send({cmd: "state"}); };  // current object/name/sound
   ws.onclose = () => { $("conn").className = "dot"; $("dev").textContent = "App offline, reconnecting"; setTimeout(connect, 1000); };
   ws.onmessage = e => {
@@ -610,7 +711,7 @@ function connect() {
         break;
       }
       case "alerts": $("alerts").tBodies[0].textContent = ""; alertRows.clear(); m.items.forEach(addAlert); break;
-      case "alert": addAlert(m); break;
+      case "alert": addAlert(m); phoneCue(m); break;
       case "label": { const tr = alertRows.get(m.ref); if (tr) addAlert({...tr._a, truth: m.truth}); break; }
     }
   };
@@ -624,7 +725,7 @@ connect();
   let retry = null;
   function start() {
     retry = null;
-    img.src = "/video?t=" + Date.now();
+    img.src = withKey("/video?t=" + Date.now(), "&");
   }
   img.onload = () => { off.style.display = "none"; img.style.visibility = "visible"; };
   img.onerror = () => {

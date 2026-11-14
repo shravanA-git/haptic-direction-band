@@ -9,11 +9,14 @@
   python -m app.main --vision             # webcam + hold Action, say "find the banana"
   python -m app.main --sim --vision --mirror   # laptop's own camera facing you
   python -m app.main --name Shravan       # buzz toward whoever calls the name
+  python -m app.main --sim --vision --lan # phones on the same Wi-Fi can open the dashboard
 Then open http://localhost:8765
 """
 from __future__ import annotations
 
 import argparse
+import secrets
+import socket
 import sys
 import time
 
@@ -25,6 +28,24 @@ from .recall import AlertLog
 from .server import App, RECORDINGS
 
 
+def lan_ips() -> list:
+    """This laptop's IPv4 addresses a phone on the same network could reach."""
+    ips = set()
+    try:   # the interface the default route uses (UDP connect sends nothing)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    return sorted(ip for ip in ips if not ip.startswith(("127.", "169.254.")))
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", help="serial device (default: auto-detect)")
@@ -32,6 +53,10 @@ def main(argv=None) -> int:
     ap.add_argument("--trace", help="with --sim: stream this trace's MIC frames")
     ap.add_argument("--loop", action="store_true", help="with --trace: loop forever")
     ap.add_argument("--http", type=int, default=8765, help="dashboard port")
+    ap.add_argument("--lan", action="store_true",
+                    help="also serve phones on this Wi-Fi/hotspot (binds 0.0.0.0). No accounts: "
+                         "anyone with the printed URL (it carries a random ?k= token) can buzz the "
+                         "band, so use a trusted network or your own hotspot only")
     ap.add_argument("--vision", action="store_true", help="start the webcam (no target yet)")
     ap.add_argument("--target", help="start the webcam and find this object, e.g. banana")
     ap.add_argument("--camera", type=int, default=0, help="webcam index")
@@ -131,7 +156,14 @@ def main(argv=None) -> int:
     print(f"[hdb] serial: {link.device}  dashboard: http://localhost:{a.http}")
     print(f"[hdb] alert log: {alert_path.relative_to(RECORDINGS.parent)}")
     try:
-        web.run_app(app.make_app(), host="127.0.0.1", port=a.http, print=None)
+        host = "127.0.0.1"
+        if a.lan:
+            host, app.token = "0.0.0.0", secrets.token_urlsafe(6)
+            urls = [f"http://{ip}:{a.http}/?k={app.token}" for ip in lan_ips()]
+            print("[hdb] phone dashboard (same Wi-Fi/hotspot, no accounts, trusted network only):")
+            for u in urls or [f"http://<this laptop's IP>:{a.http}/?k={app.token}"]:
+                print(f"      {u}")
+        web.run_app(app.make_app(), host=host, port=a.http, print=None)
     finally:
         if names:
             names.stop()
