@@ -178,3 +178,40 @@ def test_action_drives_speech_and_spoken_target_reaches_vision():
         link.close()
 
     asyncio.run(run())
+
+
+def test_video_streams_mjpeg_of_annotated_frames():
+    import numpy as np
+    import pytest
+    pytest.importorskip("cv2")
+
+    class Cam(FakeVision):
+        def __init__(self):
+            super().__init__()
+            self.frame = np.zeros((48, 64, 3), np.uint8)
+
+        def latest_frame(self):
+            return self.frame
+
+    async def run():
+        link = Link(SimPort()).start()
+        app = App(link)
+        async with TestClient(TestServer(app.make_app())) as client:
+            r = await client.get("/video")
+            assert r.status == 503                      # no vision attached
+            r = await client.get("/")
+            assert 'id="cam"' in await r.text()
+            from app import haptics
+            from app.guide import ObjectGuide
+            app.attach_vision(Cam(), ObjectGuide(lambda cue: haptics.play(cue, link.pulse)))
+            r = await client.get("/video")
+            assert r.status == 200
+            assert r.headers["Content-Type"].startswith("multipart/x-mixed-replace")
+            chunk = b""
+            while chunk.count(b"\xff\xd9") < 1:
+                chunk += await asyncio.wait_for(r.content.read(4096), 3)
+            assert chunk.startswith(b"--frame\r\nContent-Type: image/jpeg") and b"\xff\xd8" in chunk
+            r.close()
+        link.close()
+
+    asyncio.run(run())
