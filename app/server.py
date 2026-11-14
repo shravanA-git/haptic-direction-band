@@ -263,7 +263,9 @@ class App:
         self.emit({"type": "state", **self.state})
 
     def _on_taught(self, tpl, msg: str) -> None:
-        self.state["sound"] = "taught, listening" if tpl else "not taught yet"
+        # a failed teach keeps the sounds taught before
+        known = tpl or getattr(self.sound, "template", None)
+        self.state["sound"] = "taught, listening" if known else "not taught yet"
         self.emit({"type": "state", **self.state})
         self.emit({"type": "log", "text": f"teach a sound: {msg}"})
 
