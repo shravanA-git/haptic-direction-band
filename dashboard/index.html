@@ -8,8 +8,9 @@
 <meta name="theme-color" content="#121110">
 <link rel="manifest" id="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="HDB">
 <style>
@@ -40,7 +41,8 @@
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; background: var(--bg); color: var(--ink); }
-  body { font: 17px/1.45 var(--sans); padding-bottom: calc(76px + env(safe-area-inset-bottom)); }
+  body { font: 17px/1.45 var(--sans); min-height: 100dvh;
+         padding: 0 env(safe-area-inset-right) calc(76px + env(safe-area-inset-bottom)) env(safe-area-inset-left); }
   :focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
   .mono, .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
   .dim { color: var(--ink-3); }
@@ -61,7 +63,8 @@
   .note { font-size: 14px; color: var(--ink-3); margin: 0 0 10px; }
 
   /* ---------- top bar ---------- */
-  header { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 18px; padding: 10px 16px;
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 18px;
+           padding: max(10px, env(safe-area-inset-top)) 16px 10px;
            border-bottom: 1px solid var(--line); }
   header .brand { font-weight: 700; font-size: 17px; margin-right: auto; }
   .link { display: flex; align-items: center; gap: 8px; font-size: 15px; }
@@ -69,7 +72,7 @@
   .dot.ok { background: var(--ok); }
   .dot.warn { background: var(--accent); }
   .readouts { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13px; color: var(--ink-3); width: 100%; }
-  #stop { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; border-radius: 0;
+  #stop { position: fixed; left: 0; right: 0; bottom: 0; z-index: 40; border-radius: 0;
           min-height: calc(64px + env(safe-area-inset-bottom)); padding-bottom: env(safe-area-inset-bottom);
           background: var(--bad); color: var(--bad-ink); border: 0; font-size: 22px; font-weight: 800; letter-spacing: .12em; }
   #stop:hover { filter: brightness(1.08); }
@@ -179,7 +182,7 @@
   }
   /* phone buzz fallback (no Vibration API, e.g. iPhone): flash the cue's side */
   #flash { position: fixed; inset: 0; z-index: 30; pointer-events: none; display: none; }
-  #flash.show { display: block; }
+  #flash.show { display: block; background: rgba(0, 0, 0, .6); }
   #flash .edge { position: absolute; background: var(--accent); }
   #flash.left .edge { left: 0; top: 0; bottom: 0; width: 28px; }
   #flash.right .edge { right: 0; top: 0; bottom: 0; width: 28px; }
@@ -189,7 +192,7 @@
   #flash.urgent { background: var(--bad); }
   #flash.urgent .edge { display: none; }
   #flash .word { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-                 font-size: 22vmin; font-weight: 800; color: var(--accent); text-shadow: 0 0 2px var(--bg); }
+                 font-size: 40vmin; font-weight: 800; color: var(--accent); }
   #flash.urgent .word { color: #fff; font-size: 14vmin; text-align: center; }
   .codes { display: grid; grid-template-columns: auto 1fr; gap: 2px 14px; font-size: 14px; margin: 0 0 10px; }
   .codes dt { color: var(--ink-3); } .codes dd { margin: 0; }
@@ -281,7 +284,7 @@
           <button type="button" class="toggle" data-mute="find_cues">Find</button>
           <button type="button" class="toggle" data-mute="sound_alerts">Sounds</button></div>
         <div class="row"><span class="dim">Phone</span>
-          <button type="button" class="toggle" id="phonebuzz" aria-pressed="false">Buzz on this phone: off</button></div>
+          <button type="button" class="toggle" id="phonebuzz" aria-pressed="false">Alert on this phone: off</button></div>
         <p class="note" id="phonenote"></p>
         <dl class="codes" id="phonecodes"></dl>
         <div class="row"><span class="dim">Look</span>
@@ -388,7 +391,55 @@ const PHONE_CODES = {          // [on, off, on, ...] in ms
 };
 const ARROW = {front: "\u2191", right: "\u2192", left: "\u2190", back: "\u2193"};
 const canVibrate = typeof navigator.vibrate === "function";
+// Tone per cue: pitch says what kind, stereo pan says which side. The iPhone
+// silent switch mutes these, so the flash is the primary signal there.
+const TONE_HZ = {front: 880, right: 660, left: 660, back: 440, urgent: 1250, nudge: 520,
+                 ack: 1000, lost: 330, unknown: 300};
+const PAN = {right: 1, left: -1};
 let phoneBuzz = localStorage.getItem("hdb-phonebuzz") === "on";
+let audio = null;
+function unlockAudio() {            // must run inside a tap (iOS rule)
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    audio = audio || new AC();
+    if (audio.state === "suspended") audio.resume();
+    const b = audio.createBuffer(1, 1, 22050), src = audio.createBufferSource();   // silent unlock
+    src.buffer = b; src.connect(audio.destination); src.start(0);
+  } catch (e) { audio = null; }
+  showPhone();
+}
+function tone(key) {
+  if (!audio || audio.state !== "running") return;
+  try {
+    let t = audio.currentTime + 0.01, on = true;
+    const pan = audio.createStereoPanner ? audio.createStereoPanner() : null;
+    if (pan) { pan.pan.value = PAN[key] || 0; pan.connect(audio.destination); }
+    for (const ms of PHONE_CODES[key].ms) {
+      if (on) {
+        const o = audio.createOscillator(), g = audio.createGain();
+        o.frequency.value = TONE_HZ[key] || 600;
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.25, t + 0.01);
+        g.gain.setValueAtTime(0.25, t + ms / 1000 - 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + ms / 1000);
+        o.connect(g); g.connect(pan || audio.destination);
+        o.start(t); o.stop(t + ms / 1000 + 0.02);
+      }
+      t += ms / 1000; on = !on;
+    }
+  } catch (e) { /* never break the page over a beep */ }
+}
+// keep the screen on while alerts are enabled (iOS 16.4+, Android Chrome)
+let wake = null;
+async function keepAwake() {
+  if (!phoneBuzz || !("wakeLock" in navigator) || document.visibilityState !== "visible") return;
+  try { wake = await navigator.wakeLock.request("screen"); wake.addEventListener?.("release", () => { wake = null; showPhone(); }); }
+  catch (e) { wake = null; }
+  showPhone();
+}
+document.addEventListener("visibilitychange", keepAwake);
+document.addEventListener("pointerdown", () => { if (phoneBuzz && (!audio || audio.state !== "running")) unlockAudio(); });
 function sideOf(motor) { return motor === 0 ? "front" : motor === 4 ? "back" : motor < 4 ? "right" : "left"; }
 function phoneCode(a) {          // an alert-log record -> PHONE_CODES key, or null
   if (a.dry || a.muted) return null;
@@ -404,9 +455,8 @@ function phoneCue(a) {
   if (!phoneBuzz) return;
   const key = phoneCode(a);
   if (!key) return;
-  try {
-    if (canVibrate && navigator.vibrate(PHONE_CODES[key].ms)) return;
-  } catch (e) { /* fall through to the flash */ }
+  try { if (canVibrate) navigator.vibrate(PHONE_CODES[key].ms); } catch (e) { /* flash still shows */ }
+  tone(key);
   const f = $("flash"), side = ARROW[key] ? key : key === "urgent" ? "urgent" : "all";
   f.className = "show " + side;
   f.querySelector(".word").textContent = key === "urgent" ? "Obstacle ahead" : (ARROW[key] || "");
@@ -414,12 +464,17 @@ function phoneCue(a) {
   flashTimer = setTimeout(() => { f.className = ""; }, key === "urgent" ? 1200 : 700);
 }
 function showPhone() {
-  $("phonebuzz").textContent = "Buzz on this phone: " + (phoneBuzz ? "on" : "off");
+  $("phonebuzz").textContent = "Alert on this phone: " + (phoneBuzz ? "on" : "off");
   $("phonebuzz").classList.toggle("sel", phoneBuzz);
   $("phonebuzz").setAttribute("aria-pressed", phoneBuzz);
-  $("phonenote").textContent = canVibrate
-    ? "When the band buzzes, this phone vibrates too. Keep the page open and the screen on."
-    : "This phone cannot vibrate from a web page (iPhone). It shows a flash on the cue's side instead.";
+  const parts = [canVibrate
+    ? "When the band buzzes, this phone vibrates, flashes the side of the screen and beeps."
+    : "This phone cannot vibrate from a web page, so it flashes the side of the screen and beeps (the silent switch mutes beeps)."];
+  if (phoneBuzz) {
+    parts.push(audio && audio.state === "running" ? "Sound on." : "Tap once anywhere to enable sound.");
+    parts.push(wake ? "Screen stays on." : "wakeLock" in navigator ? "" : "Keep the screen on yourself.");
+  }
+  $("phonenote").textContent = parts.filter(Boolean).join(" ");
 }
 $("phonecodes").innerHTML = "";
 Object.values(PHONE_CODES).forEach(c => {
@@ -431,10 +486,12 @@ Object.values(PHONE_CODES).forEach(c => {
 $("phonebuzz").onclick = () => {
   phoneBuzz = !phoneBuzz;
   localStorage.setItem("hdb-phonebuzz", phoneBuzz ? "on" : "off");
+  if (phoneBuzz) { unlockAudio(); keepAwake(); phoneCue({cue: "ack", motor: null}); }   // this tap unlocks sound
+  else if (wake) { wake.release?.(); wake = null; }
   showPhone();
-  if (phoneBuzz) phoneCue({cue: "ack", motor: null});   // a tap counts as permission to vibrate
 };
 showPhone();
+keepAwake();
 {   // a link like /#set opens that folded section
   const d = location.hash && document.getElementById(location.hash.slice(1));
   if (d && d.tagName === "DETAILS") { d.open = true; d.scrollIntoView(); }

@@ -237,8 +237,11 @@ def test_lan_token_cookie_manifest_and_icons():
             client.session.cookie_jar.clear()
             r = await client.get("/icon.svg")                # public, no token needed
             assert r.status == 200 and "<svg" in await r.text()
-            r = await client.get("/icon-192.png")
-            assert r.status == 200 and (await r.read())[:4] == b"\x89PNG"
+            for size in (180, 192, 512):                       # pure-Python PNGs (iOS needs PNG)
+                r = await client.get(f"/icon-{size}.png")
+                body = await r.read()
+                assert r.status == 200 and body[:4] == b"\x89PNG"
+                assert int.from_bytes(body[16:20], "big") == size
             assert (await client.get("/video")).status == 403
         link.close()
 

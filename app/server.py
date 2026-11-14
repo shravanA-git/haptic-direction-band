@@ -20,7 +20,7 @@ WebSocket, page -> server (JSON):
                                      add=true adds an example to that label)
   {"cmd":"forget_sound","label":"doorbell"?}   (no label: forget all)   {"cmd":"sounds"}
   {"cmd":"avoid","on":bool}          (obstacle avoidance on/off, with --avoid)
-HTTP GET /manifest.webmanifest, /icon.svg, /icon-192.png, /icon-512.png: "Add to
+HTTP GET /manifest.webmanifest, /icon.svg, /icon-{180,192,512}.png: "Add to
   Home Screen" (full-screen app on a phone). With a LAN token (main --lan), every
   other request from another device needs ?k=<token> once (then a cookie).
 HTTP GET /video: MJPEG (multipart/x-mixed-replace) of the vision camera's
@@ -55,6 +55,40 @@ from .settings import Settings
 
 ROOT = Path(__file__).resolve().parent.parent
 DASH = ROOT / "dashboard"
+
+
+def icon_png_bytes(size: int) -> bytes:
+    """The app icon (belt ring seen from above, front motor lit) as a PNG, drawn
+    pixel by pixel and compressed with zlib: no image libraries needed."""
+    import math
+    import struct
+    import zlib
+    bg, ring, pad, edge, lit = (18, 17, 16), (69, 66, 61), (46, 44, 41), (142, 136, 126), (240, 168, 48)
+    f = size / 512.0
+    cx, cy, rx, ry, half = 256, 276, 150, 125, 13
+    pads = [(256 + rx * math.sin(k * math.pi / 4), cy - ry * math.cos(k * math.pi / 4)) for k in range(8)]
+    rows = []
+    for py in range(size):
+        y = (py + 0.5) / f
+        row = bytearray(b"\x00")
+        for px in range(size):
+            x = (px + 0.5) / f
+            c = bg
+            d = math.hypot((x - cx) / rx, (y - cy) / ry)
+            if abs(d - 1) * min(rx, ry) <= half:
+                c = ring
+            if 88 <= y <= 124 and abs(x - 256) <= (y - 88) * 24 / 36:
+                c = lit
+            for k, (mx, my) in enumerate(pads):
+                if abs(x - mx) <= 22 and abs(y - my) <= 22:
+                    c = edge if (abs(x - mx) > 18 or abs(y - my) > 18) else (lit if k == 0 else pad)
+            row += bytes(c)
+        rows.append(bytes(row))
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
 FIXTURES = ROOT / "tests" / "fixtures"
 RECORDINGS = ROOT / "recordings"
 
@@ -744,7 +778,7 @@ class App:
     token: Optional[str] = None      # set by main --lan: phones need ?k=<token> once
     local_ok = True                  # this laptop itself never needs the token
 
-    PUBLIC = ("/manifest.webmanifest", "/icon.svg", "/icon-192.png", "/icon-512.png")
+    PUBLIC = ("/manifest.webmanifest", "/icon.svg", "/icon-180.png", "/icon-192.png", "/icon-512.png")
 
     @web.middleware
     async def _guard(self, request, handler):
@@ -795,37 +829,12 @@ class App:
         return web.Response(text=self._icon_svg(), content_type="image/svg+xml")
 
     async def icon_png(self, request):
-        """The same icon as PNG (iOS home screen ignores SVG), drawn with OpenCV."""
-        size = 512 if request.path.endswith("512.png") else 192
+        """The same icon as PNG (iOS home screen ignores SVG): pure Python + zlib."""
+        size = {"/icon-180.png": 180, "/icon-512.png": 512}.get(request.path, 192)
         cache = getattr(self, "_icons", {})
         if size not in cache:
-            try:
-                import math
-
-                import cv2
-                import numpy as np
-                f = size / 512
-                img = np.zeros((size, size, 3), np.uint8)
-                img[:] = (16, 17, 18)
-                c = (int(256 * f), int(276 * f))
-                cv2.ellipse(img, c, (int(150 * f), int(125 * f)), 0, 0, 360, (61, 66, 69), max(2, int(26 * f)),
-                            cv2.LINE_AA)
-                pts = (np.array([[256, 88], [232, 124], [280, 124]]) * f).astype(np.int32)
-                cv2.fillPoly(img, [pts], (48, 168, 240), cv2.LINE_AA)
-                for k in range(8):
-                    x = 256 + 150 * math.sin(k * math.pi / 4)
-                    y = 276 - 125 * math.cos(k * math.pi / 4)
-                    p1 = (int((x - 22) * f), int((y - 22) * f))
-                    p2 = (int((x + 22) * f), int((y + 22) * f))
-                    cv2.rectangle(img, p1, p2, (48, 168, 240) if k == 0 else (41, 44, 46), -1)
-                    cv2.rectangle(img, p1, p2, (126, 136, 142), max(1, int(4 * f)))
-                ok, buf = cv2.imencode(".png", img)
-                cache[size] = buf.tobytes() if ok else None
-            except Exception:
-                cache[size] = None
+            cache[size] = await asyncio.get_running_loop().run_in_executor(None, icon_png_bytes, size)
             self._icons = cache
-        if not cache[size]:
-            return web.Response(status=404)
         return web.Response(body=cache[size], content_type="image/png")
 
     def make_app(self) -> web.Application:
@@ -833,6 +842,7 @@ class App:
         app.router.add_get("/", self.index)
         app.router.add_get("/manifest.webmanifest", self.manifest)
         app.router.add_get("/icon.svg", self.icon_svg)
+        app.router.add_get("/icon-180.png", self.icon_png)
         app.router.add_get("/icon-192.png", self.icon_png)
         app.router.add_get("/icon-512.png", self.icon_png)
         app.router.add_get("/ws", self.ws_handler)
