@@ -131,6 +131,15 @@
       </div>
     </section>
     <section>
+      <h2>Ask Recall <span id="recallvia" style="text-transform:none;letter-spacing:0"></span></h2>
+      <div id="chat" style="font-size:16px;max-height:180px;overflow:auto;margin-bottom:8px"></div>
+      <div class="row">
+        <input id="askq" placeholder="who called me? · mute name alerts · stronger" style="font:inherit;background:#2a2f3a;color:var(--ink);border:1px solid #454c5c;border-radius:8px;padding:7px;flex:1">
+        <button id="askbtn">Ask</button>
+      </div>
+      <div id="settings" style="font-size:14px;color:var(--dim)"></div>
+    </section>
+    <section>
       <h2>Log</h2>
       <div id="log"></div>
     </section>
@@ -195,6 +204,15 @@ $("mark").onmouseup = () => send({cmd: "alert_up"});
 $("play").onclick = () => { $("est").textContent = ""; send({cmd: "replay", name: $("traces").value}); };
 $("find").onclick = () => send({cmd: "target", name: $("tgt").value});
 $("tgt").onkeydown = e => { if (e.key === "Enter") $("find").onclick(); };
+function ask() { const q = $("askq").value.trim(); if (!q) return; chat("you", q); $("askq").value = ""; send({cmd: "ask", text: q}); }
+function chat(who, text) {
+  const d = document.createElement("div");
+  d.innerHTML = `<b style="color:${who === "you" ? "var(--dim)" : "var(--ok)"}">${who}</b> `;
+  d.appendChild(document.createTextNode(text));
+  $("chat").appendChild(d); $("chat").scrollTop = $("chat").scrollHeight;
+}
+$("askbtn").onclick = ask;
+$("askq").onkeydown = e => { if (e.key === "Enter") ask(); };
 $("teach").onclick = () => send({cmd: "teach", seconds: 2.5});
 $("forget").onclick = () => send({cmd: "forget_sound"});
 $("talk").onpointerdown = () => { $("talk").classList.add("active"); send({cmd: "action", down: true}); };
@@ -271,6 +289,17 @@ function connect() {
         break;
       case "state": $("obj").textContent = m.object ?? "–"; $("name").textContent = m.name ?? "–"; $("heard").textContent = m.heard ?? "–"; $("sound").textContent = m.sound ?? "–"; break;
       case "log": log(m.text); break;
+      case "recall":
+        chat("recall", m.a);
+        $("recallvia").textContent = `(${m.via})`;
+        (m.actions || []).forEach(a => log(`recall used ${a.tool} ${JSON.stringify(a.input)}`));
+        break;
+      case "settings": {
+        const muted = ["name_alerts", "find_cues", "sound_alerts"].filter(k => m[k] === "off").map(k => k.replace("_", " "));
+        $("settings").textContent = `intensity ${m.intensity}` + (muted.length ? ` · muted: ${muted.join(", ")}` : "")
+          + (m.names ? ` · names: ${m.names}` : "");
+        break;
+      }
       case "alerts": $("alerts").tBodies[0].innerHTML = ""; alertRows.clear(); m.items.forEach(addAlert); break;
       case "alert": addAlert(m); break;
       case "label": { const tr = alertRows.get(m.ref); if (tr) addAlert({...tr._a, truth: m.truth}); break; }

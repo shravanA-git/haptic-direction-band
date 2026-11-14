@@ -13,6 +13,8 @@ WebSocket, page -> server (JSON):
   {"cmd":"bench","name":"gate|walk|cardinals"}   (gate checks by feel; STOP cancels)
   {"cmd":"label","truth":k|null|"false","id":n?}  (ground truth for the latest/given alert)
   {"cmd":"missed","truth":k}         (a call the band gave no cue for)
+  {"cmd":"ask","text":"who called me?"}   (Recall chatbot; reply {"type":"recall",..})
+  {"cmd":"setting","setting":"intensity","value":"high"}   {"cmd":"settings"}
   {"cmd":"teach","seconds":2.5}      (Teach a Sound: make the sound once)  {"cmd":"forget_sound"}
 server -> page:
   {"type":"mic","ms":..,"levels":[f,r,b,l],"replay":bool}
@@ -20,6 +22,7 @@ server -> page:
   {"type":"btn","name":"ACTION","down":bool}      {"type":"raw","text":..}
   {"type":"status",...}  {"type":"estimate",...}  {"type":"traces","items":[..]}
   {"type":"state","object":..,"name":..,"heard":..,"sound":..}  {"type":"log","text":..}
+  {"type":"settings",...Settings.snapshot()}  {"type":"recall","q":..,"a":..,"via":..,"actions":[..]}
   {"type":"alert",...AlertLog record}  {"type":"label",...}  {"type":"alerts","items":[..]}
 """
 from __future__ import annotations
@@ -37,6 +40,8 @@ from . import direction, haptics, trace
 from .link import ButtonEvent, Link, MicFrame, RawLine
 from .notify import Notifier
 from .recall import AlertLog
+from .recall_bot import RecallBot
+from .settings import Settings
 
 ROOT = Path(__file__).resolve().parent.parent
 DASH = ROOT / "dashboard"
@@ -45,10 +50,16 @@ RECORDINGS = ROOT / "recordings"
 
 
 class App:
-    def __init__(self, link: Link, alert_log: Optional[AlertLog] = None):
+    def __init__(self, link: Link, alert_log: Optional[AlertLog] = None,
+                 recall_mode: str = "offline"):
         self.link = link
         self.alerts = alert_log or AlertLog()        # memory-only unless main gives a path
-        self.notify = Notifier(link.pulse, self.alerts, dry_send=self._dry_pulse)
+        self.settings = Settings()
+        self.settings.on_change(self._on_setting)
+        self.notify = Notifier(link.pulse, self.alerts, dry_send=self._dry_pulse,
+                               settings=self.settings)
+        self.recall_mode = recall_mode
+        self._recall: Optional[RecallBot] = None
         self.alerts.subscribe(self.emit)
         self.clients: set[web.WebSocketResponse] = set()
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -118,6 +129,7 @@ class App:
         """listener: app.speech.NameListener (or anything with on_hit,
         pause/resume, set_names). A hit -> direction estimate -> cue."""
         self.names = listener
+        self.settings.names = ", ".join(getattr(listener, "names", []) or []) or None
         listener.on_hit = self.on_name_hit
 
     def on_name_hit(self, hit) -> None:
@@ -141,10 +153,38 @@ class App:
         if win and self.recorder.active:   # recorded traces get the alert window for replay
             self.recorder.mark_alert(*win)
 
+    # ------------------------------------------------------------- settings
+    def _on_setting(self, setting: str, value) -> None:
+        if setting == "names" and self.names:
+            self.names.set_names(value)
+        elif setting == "sound_threshold" and self.sound:
+            self.sound.threshold = float(value)
+        self.emit({"type": "settings", **self.settings.snapshot()})
+
+    @property
+    def recall(self) -> RecallBot:
+        if self._recall is None:
+            self._recall = RecallBot(self.alerts, self.settings, self.recall_mode)
+        return self._recall
+
+    def ask(self, text: str) -> None:
+        """Recall chatbot; answers on a thread (Claude calls take seconds)."""
+        def run():
+            try:
+                a = self.recall.ask(text)
+                msg = {"type": "recall", "q": text, "a": a.text, "via": a.via,
+                       "actions": [{"tool": n, "input": i} for n, i, _ in a.actions]}
+            except Exception as e:
+                msg = {"type": "recall", "q": text, "a": f"error: {e}", "via": "error",
+                       "actions": []}
+            self.emit(msg)
+        threading.Thread(target=run, name="recall", daemon=True).start()
+
     def attach_sound(self, listener) -> None:
         """listener: app.listen.SoundListener. A detection -> its own pattern
         (haptics.taught_sound, no direction), logged with source "sound"."""
         self.sound = listener
+        self.settings.sound_threshold = getattr(listener, "threshold", None)
         listener.on_detect = self.on_sound
         listener.on_taught = self._on_taught
         self.state["sound"] = "taught, listening" if listener.template else "not taught yet"
@@ -230,6 +270,15 @@ class App:
             return {"type": "log", "text": f"listening for: {', '.join(self.names.names) or 'nothing'}"}
         elif cmd == "bench":
             return self.bench(m.get("name"))
+        elif cmd == "ask":
+            self.ask(str(m.get("text", "")))
+        elif cmd == "setting":
+            try:
+                return {"type": "log", "text": self.settings.set(m.get("setting"), m.get("value"))}
+            except ValueError as e:
+                return {"type": "log", "text": f"setting: {e}"}
+        elif cmd == "settings":
+            return {"type": "settings", **self.settings.snapshot()}
         elif cmd == "teach":
             if not self.sound:
                 return {"type": "log", "text": "sound listener not running (start with --sound)"}
@@ -367,6 +416,7 @@ class App:
         await ws.send_str(json.dumps(self.status()))
         await ws.send_str(json.dumps(self.traces_msg()))
         await ws.send_str(json.dumps({"type": "alerts", "items": self.alerts.recent(30)}))
+        await ws.send_str(json.dumps({"type": "settings", **self.settings.snapshot()}))
         async for msg in ws:
             if msg.type != WSMsgType.TEXT:
                 continue

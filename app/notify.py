@@ -14,6 +14,7 @@ from typing import Callable, Optional
 
 from . import haptics
 from .recall import AlertLog
+from .settings import Settings
 
 
 def pattern(cue: str, motor: Optional[int] = None) -> list:
@@ -27,15 +28,20 @@ def pattern(cue: str, motor: Optional[int] = None) -> list:
 
 class Notifier:
     def __init__(self, send: Callable[[int, int], object], log: Optional[AlertLog] = None,
-                 dry_send: Optional[Callable[[int, int], object]] = None):
+                 dry_send: Optional[Callable[[int, int], object]] = None,
+                 settings: Optional[Settings] = None):
         self.send = send                      # Link.pulse
+        self.settings = settings or Settings()
         self.dry_send = dry_send or (lambda m, ms: None)
         self.log = log or AlertLog()
 
     def cue(self, source: str, cue: str, motor: Optional[int] = None,
             confidence: Optional[float] = None, latency_ms: Optional[float] = None,
             dry: bool = False, play: bool = True, **detail) -> dict:
-        """play=False logs a cue someone else already played (e.g. ObjectGuide)."""
+        """play=False logs a cue someone else already played (e.g. ObjectGuide).
+        A muted source is still logged (muted=True) but never buzzes."""
+        if not dry and self.settings.is_muted(source):
+            play, detail["muted"] = False, True
         if play:
             haptics.play(pattern(cue, motor), self.dry_send if dry else self.send)
         return self.log.add(source, cue, motor, confidence, latency_ms, dry, **detail)

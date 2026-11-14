@@ -39,6 +39,8 @@ def main(argv=None) -> int:
                     help="camera faces you (laptop webcam): swap left/right")
     ap.add_argument("--no-speech", action="store_true", help="with vision: typed target only")
     ap.add_argument("--name", help="listen for this name (comma-separated ok) and buzz its direction")
+    ap.add_argument("--recall", choices=("auto", "claude", "offline"), default="auto",
+                    help="Recall chatbot backend (auto: Claude if credentials exist, else offline)")
     ap.add_argument("--sound", action="store_true",
                     help="Teach a Sound: laptop mic; teach from the dashboard, then it buzzes its own pattern")
     a = ap.parse_args(argv)
@@ -63,13 +65,14 @@ def main(argv=None) -> int:
         print(f"[hdb] motor map from app/motor_map.json: {motor_map}")
     link = Link(port, motor_map=motor_map).start()
     alert_path = RECORDINGS / time.strftime("alerts-%Y%m%d-%H%M%S.jsonl")
-    app = App(link, AlertLog(alert_path))
+    app = App(link, AlertLog(alert_path), recall_mode=a.recall)
     vision = guide = None
     if a.target is not None or a.vision:
         from . import haptics
         from .guide import ObjectGuide
         from .vision import Vision  # heavy import (YOLO); only when asked
-        guide = ObjectGuide(lambda cue: haptics.play(cue, link.pulse)).start()
+        guide = ObjectGuide(lambda cue: None if app.settings.is_muted("find")
+                            else haptics.play(cue, link.pulse)).start()
         vision = Vision(camera=a.camera, mirror=a.mirror)
         app.attach_vision(vision, guide)
         vision.start()
