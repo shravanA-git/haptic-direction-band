@@ -25,7 +25,7 @@ from typing import Callable, Iterable, Optional
 
 from .haptics import MOTOR_NAMES
 
-SOURCES = ("name", "find", "sound", "manual", "replay")
+SOURCES = ("name", "find", "sound", "manual", "replay", "avoid")
 CUES = ("directional", "generic", "centered", "lost", "sound", "ack", "unknown")
 
 

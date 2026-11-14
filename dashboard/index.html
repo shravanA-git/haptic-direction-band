@@ -113,6 +113,7 @@
         <span>Name</span><b id="name">–</b>
         <span>Heard</span><b id="heard" style="font-size:18px">–</b>
         <span>Sound</span><b id="sound" style="font-size:18px">–</b>
+        <span>Path</span><b id="path" style="font-size:18px">–</b>
       </div>
       <div class="row" style="margin-top:10px">
         <input id="tgt" placeholder="target, e.g. banana" style="font:inherit;background:#2a2f3a;color:var(--ink);border:1px solid #454c5c;border-radius:8px;padding:7px;flex:1">
@@ -342,6 +343,13 @@ function connect() {
           : `→ motor ${m.motor} ${NAMES[m.motor]} (${Math.round(m.angle)}°, agreement ${m.consistency})`;
         log(`estimate ${m.trace}: ${$("est").textContent}`);
         break;
+      case "avoid": {
+        const bars = (m.sectors || []).map(s => s[1] === "blocked" ? "■" : s[1] === "near" ? "▪" : "·").join(" ");
+        const what = {clear: "clear", steer: m.motor === 7 ? "veer left" : "veer right",
+                      turn: m.motor === 6 ? "turn left" : "turn right", stop: "STOP"}[m.action] || m.action;
+        $("path").textContent = `${what}  ${bars}` + (m.nearest ? `  (${m.nearest.cls} ${m.nearest.m} m)` : "");
+        $("path").style.color = m.action === "stop" ? "var(--bad)" : "";
+        break; }
       case "state": $("obj").textContent = m.object ?? "–"; $("name").textContent = m.name ?? "–"; $("heard").textContent = m.heard ?? "–"; $("sound").textContent = m.sound ?? "–"; break;
       case "log": log(m.text); break;
       case "recall":
