@@ -330,3 +330,49 @@ def test_each_category_has_its_own_non_directional_pattern():
                                                       haptics.DIRECTIONAL_MS)]
     assert haptics.taught_sound(None) == haptics.taught_sound("unknown") == haptics.SOUND_STEPS
     assert notify.pattern("sound") == haptics.SOUND_STEPS
+
+
+class FakeYamNet:
+    """Stands in for YAMNet: 'Knock' for untuned sounds, 'Music' otherwise."""
+    def __init__(self):
+        self.calls = 0
+
+    def load(self):
+        return self
+
+    def top(self, audio, k=5):
+        self.calls += 1
+        loud = float(np.sqrt(np.mean(audio ** 2)))
+        return [("Knock", 0.6), ("Door", 0.4)] if loud > 0.02 else [("Music", 0.5)]
+
+
+def wait_for(cond, s=2.0):
+    import time
+    t = time.monotonic()
+    while not cond() and time.monotonic() - t < s:
+        time.sleep(0.02)
+    return cond()
+
+
+def test_yamnet_names_untaught_sounds_and_taught_ones_win(tmp_path):
+    y = FakeYamNet()
+    sl = listen.SoundListener(template_file=tmp_path / "t.json", yamnet=y)
+    hits, heard = [], []
+    sl.on_detect, sl.on_heard = hits.append, heard.append
+    sl.cooldown_s = 0.0
+    sl.feed(room(1.0))
+    sl.feed(in_room(burst(0.15, 0.3), 0.3, 1.0))             # untaught knock-like sound
+    assert wait_for(lambda: hits)
+    assert hits[0].label == "Knock" and hits[0].category == "yamnet" and hits[0].score == 0.6
+    assert heard and heard[0].startswith("YAMNet: Knock 0.60")
+    teach_in_room(sl, ding_dong(), "doorbell")
+    sl._last_hit = -1e9            # fed faster than real time: wall-clock stamps run backwards
+    n = y.calls
+    sl.feed(in_room(ding_dong(), 0.5, 2.0))                    # taught: no YAMNet call needed
+    assert [h.label for h in hits] == ["Knock", "doorbell"]
+    assert wait_for(lambda: True, 0.3) and y.calls == n
+
+
+def test_yamnet_off_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("HDB_YAMNET", raising=False)
+    assert listen.SoundListener(template_file=tmp_path / "t.json").yamnet is None

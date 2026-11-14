@@ -279,7 +279,11 @@ class App:
         self.settings.sound_threshold = getattr(listener, "threshold", None)
         listener.on_detect = self.on_sound
         listener.on_taught = self._on_taught
+        if hasattr(listener, "on_heard"):   # YAMNet's top classes for every sound (HDB_YAMNET=1)
+            listener.on_heard = lambda text: self.emit({"type": "log", "text": f"sound: {text}"})
         self.state["sound"] = "taught, listening" if listener.template else "not taught yet"
+        if getattr(listener, "yamnet", None) is not None:
+            self.state["sound"] += " + YAMNet"
 
     def sounds_msg(self) -> dict:
         """Taught sounds for the dashboard, grouped by category, low pitch first."""
