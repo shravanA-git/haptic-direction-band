@@ -8,6 +8,7 @@ WebSocket, page -> server (JSON):
   {"cmd":"record_start"}  {"cmd":"record_stop"}  {"cmd":"alert_down"} {"cmd":"alert_up"}
   {"cmd":"replay","name":"fixtures/back_left.json"}  {"cmd":"replay_stop"}
   {"cmd":"target","name":"banana"}   (typed target for vision)
+  {"cmd":"action","down":bool}       (dashboard hold-to-talk = BTN ACTION DOWN/UP)
   {"cmd":"bench","name":"gate|walk|cardinals"}   (gate checks by feel; STOP cancels)
 server -> page:
   {"type":"mic","ms":..,"levels":[f,r,b,l],"replay":bool}
@@ -44,9 +45,10 @@ class App:
         self.recorder = trace.Recorder()
         self.clock = direction.ClockSync()
         self.replayer: Optional[trace.Replayer] = None
-        self.state = {"object": None, "name": None}
+        self.state = {"object": None, "name": None, "heard": None}
         self.vision = None
         self.guide = None
+        self.speech = None
         link.subscribe(self._on_event)
         link.subscribe(self.recorder)
         link.on_sent(self._on_sent)
@@ -73,6 +75,40 @@ class App:
         self.vision, self.guide = vision, guide
         vision.on_change(self._on_vision)
 
+    def attach_speech(self, speech) -> None:
+        """speech: app.speech.Speech (or anything with on_button and an
+        on_result attribute). Action held = record; release = transcribe."""
+        self.speech = speech
+        speech.on_result = self._on_speech
+
+    def _on_speech(self, r) -> None:
+        if getattr(r, "error", None):
+            self.emit({"type": "log", "text": f"speech: {r.error} (typed Find box still works)"})
+            return
+        self.state["heard"] = r.text or "–"
+        self.emit({"type": "state", **self.state})
+        if not r.target:
+            self.emit({"type": "log", "text": f"heard \"{r.text}\": no known object; type it in Find"})
+        elif self.vision:
+            cls = self.vision.set_target(r.target)
+            self.emit({"type": "log", "text": f"heard \"{r.text}\" -> target {cls or r.target}"})
+        else:
+            self.emit({"type": "log", "text": f"heard target {r.target}, but vision isn't running"})
+
+    def _action(self, down: bool) -> None:
+        """Action button (board or dashboard): alert window while recording,
+        no cues while held, hold-to-talk speech."""
+        if self.recorder.active:
+            (self.recorder.alert_down if down else self.recorder.alert_up)()
+        if self.vision:
+            for obj in (self.vision, self.guide):
+                (obj.pause if down else obj.resume)()
+        if self.speech:
+            try:
+                self.speech.on_button(down)
+            except Exception as e:  # missing sounddevice, no mic permission...
+                self.emit({"type": "log", "text": f"speech: {e}"})
+
     def _on_vision(self, d) -> None:
         self.guide.on_decision(d)
         target = getattr(d, "target", None)
@@ -86,11 +122,8 @@ class App:
             self.emit({"type": "mic", "ms": ev.ms, "levels": list(ev.levels), "replay": False})
         elif isinstance(ev, ButtonEvent):
             self.emit({"type": "btn", "name": ev.name, "down": ev.down})
-            if ev.name == "ACTION" and self.recorder.active:
-                (self.recorder.alert_down if ev.down else self.recorder.alert_up)()
-            if ev.name == "ACTION" and self.vision:  # hold-to-talk: no cues while held
-                for obj in (self.vision, self.guide):
-                    (obj.pause if ev.down else obj.resume)()
+            if ev.name == "ACTION":
+                self._action(ev.down)
         elif isinstance(ev, RawLine):
             self.emit({"type": "raw", "text": ev.text[:200]})
 
@@ -118,6 +151,10 @@ class App:
                    "lost": haptics.lost}.get(name)
             cue = cue() if cue else haptics.directional(int(m.get("motor", 0)))
             haptics.play(cue, self.link.pulse)
+        elif cmd == "action":
+            down = bool(m.get("down"))
+            self.emit({"type": "btn", "name": "ACTION", "down": down})
+            self._action(down)
         elif cmd == "bench":
             return self.bench(m.get("name"))
         elif cmd == "record_start":
@@ -145,7 +182,7 @@ class App:
             cls = self.vision.set_target(m.get("name") or None)
             return {"type": "log", "text": f"target: {cls or 'none (not a known class)'}"}
         elif cmd == "state":  # vision/speech status from other code paths
-            self.state.update({k: m[k] for k in ("object", "name") if k in m})
+            self.state.update({k: m[k] for k in ("object", "name", "heard") if k in m})
             self.emit({"type": "state", **self.state})
         return None
 

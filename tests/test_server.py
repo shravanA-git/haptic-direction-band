@@ -133,3 +133,47 @@ def test_bench_sequences():
     h = app.status()["health"]
     assert h["state"] == "streaming" and h["mic"] > 0
     link.close()
+
+
+class FakeSpeech:
+    def __init__(self):
+        self.on_result, self.presses = None, []
+
+    def on_button(self, down):
+        self.presses.append(down)
+
+
+def test_action_drives_speech_and_spoken_target_reaches_vision():
+    from types import SimpleNamespace as R
+
+    from app import haptics
+    from app.guide import ObjectGuide
+
+    async def run():
+        port = SimPort()
+        link = Link(port).start()
+        app = App(link)
+        fv, sp = FakeVision(), FakeSpeech()
+        app.attach_vision(fv, ObjectGuide(lambda cue: haptics.play(cue, link.pulse)))
+        app.attach_speech(sp)
+        async with TestClient(TestServer(app.make_app())) as client:
+            ws = await client.ws_connect("/ws")
+            port.inject("BTN ACTION DOWN")               # board button
+            await _collect(ws, lambda m: m["type"] == "btn" and m["down"])
+            await ws.send_json({"cmd": "action", "down": False})   # dashboard button
+            await _collect(ws, lambda m: m["type"] == "btn" and not m["down"])
+            assert sp.presses == [True, False] and not fv.paused
+
+            sp.on_result(R(text="Find my phone.", target="cell phone", error=None))
+            st = await _collect(ws, lambda m: m["type"] == "state")
+            assert st["heard"] == "Find my phone." and fv.target == "cell phone"
+
+            sp.on_result(R(text="Hello there.", target=None, error=None))
+            m = await _collect(ws, lambda m: m["type"] == "log" and "no known object" in m["text"])
+            assert fv.target == "cell phone"             # typed/previous target kept
+            sp.on_result(R(text="", target=None, error="too short"))
+            await _collect(ws, lambda m: m["type"] == "log" and "too short" in m["text"])
+            await ws.close()
+        link.close()
+
+    asyncio.run(run())

@@ -5,6 +5,7 @@
   python -m app.main --sim                # simulated band (quiet room)
   python -m app.main --sim --trace tests/fixtures/back_left.json --loop
   python -m app.main --target banana      # webcam find-an-object cues on the band
+  python -m app.main --vision             # webcam + hold Action, say "find the banana"
 Then open http://localhost:8765
 """
 from __future__ import annotations
@@ -29,6 +30,7 @@ def main(argv=None) -> int:
     ap.add_argument("--vision", action="store_true", help="start the webcam (no target yet)")
     ap.add_argument("--target", help="start the webcam and find this object, e.g. banana")
     ap.add_argument("--camera", type=int, default=0, help="webcam index")
+    ap.add_argument("--no-speech", action="store_true", help="with vision: typed target only")
     a = ap.parse_args(argv)
 
     if a.sim:
@@ -62,6 +64,13 @@ def main(argv=None) -> int:
         vision.start()
         if a.target:
             vision.set_target(a.target)
+        if not a.no_speech:
+            try:
+                from .speech import Speech
+                app.attach_speech(Speech())
+                print("[hdb] hold-to-talk on Action (whisper loads on first use)")
+            except Exception as e:  # faster-whisper/sounddevice not installed
+                print(f"[hdb] speech off ({e}); typed Find box only")
     print(f"[hdb] serial: {link.device}  dashboard: http://localhost:{a.http}")
     try:
         web.run_app(app.make_app(), host="127.0.0.1", port=a.http, print=None)

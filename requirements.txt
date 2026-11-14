@@ -1,3 +1,6 @@
 pyserial>=3.5
 aiohttp>=3.9
 pytest>=8
+# speech (hold-to-talk); optional, app runs without them
+faster-whisper>=1.0
+sounddevice>=0.4
