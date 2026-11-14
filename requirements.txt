@@ -4,3 +4,5 @@ pytest>=8
 # speech (hold-to-talk); optional, app runs without them
 faster-whisper>=1.0
 sounddevice>=0.4
+# Teach a Sound (app/listen.py); also used by speech
+numpy>=1.24

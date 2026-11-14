@@ -5,6 +5,7 @@
   python -m app.main --sim                # simulated band (quiet room)
   python -m app.main --sim --trace tests/fixtures/back_left.json --loop
   python -m app.main --target banana      # webcam find-an-object cues on the band
+  python -m app.main --sim --sound        # Teach a Sound on the laptop mic (dashboard button)
   python -m app.main --vision             # webcam + hold Action, say "find the banana"
   python -m app.main --sim --vision --mirror   # laptop's own camera facing you
   python -m app.main --name Shravan       # buzz toward whoever calls the name
@@ -38,6 +39,8 @@ def main(argv=None) -> int:
                     help="camera faces you (laptop webcam): swap left/right")
     ap.add_argument("--no-speech", action="store_true", help="with vision: typed target only")
     ap.add_argument("--name", help="listen for this name (comma-separated ok) and buzz its direction")
+    ap.add_argument("--sound", action="store_true",
+                    help="Teach a Sound: laptop mic; teach from the dashboard, then it buzzes its own pattern")
     a = ap.parse_args(argv)
 
     if a.sim:
@@ -91,6 +94,17 @@ def main(argv=None) -> int:
         except Exception as e:  # no faster-whisper/sounddevice, or no mic permission
             names = None
             print(f"[hdb] name listener off: {e}")
+    sound = None
+    if a.sound:
+        try:
+            from .listen import SoundListener
+            sound = SoundListener()
+            app.attach_sound(sound)
+            sound.start()
+            print(f"[hdb] Teach a Sound: {'taught sound loaded' if sound.template else 'press Teach a sound on the dashboard'}")
+        except Exception as e:  # no numpy/sounddevice, or no mic permission
+            sound = None
+            print(f"[hdb] sound listener off: {e}")
     print(f"[hdb] serial: {link.device}  dashboard: http://localhost:{a.http}")
     print(f"[hdb] alert log: {alert_path.relative_to(RECORDINGS.parent)}")
     try:
@@ -98,6 +112,8 @@ def main(argv=None) -> int:
     finally:
         if names:
             names.stop()
+        if sound:
+            sound.stop()
         if vision:
             vision.stop()
             guide.close()

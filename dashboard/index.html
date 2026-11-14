@@ -86,13 +86,18 @@
         <span>Object</span><b id="obj">–</b>
         <span>Name</span><b id="name">–</b>
         <span>Heard</span><b id="heard" style="font-size:18px">–</b>
+        <span>Sound</span><b id="sound" style="font-size:18px">–</b>
       </div>
       <div class="row" style="margin-top:10px">
         <input id="tgt" placeholder="target, e.g. banana" style="font:inherit;background:#2a2f3a;color:var(--ink);border:1px solid #454c5c;border-radius:8px;padding:7px;flex:1">
         <button id="find">Find</button>
       </div>
       <div class="row">
-        <button id="talk" title="same as holding the band's Action button">Hold to talk</button>
+        <div class="row">
+          <button id="talk" title="same as holding the band's Action button">Hold to talk</button>
+          <button id="teach" title="Teach a Sound: make the sound once within 2.5 s">Teach a sound</button>
+          <button id="forget" title="forget the taught sound">Forget</button>
+        </div>
         <input id="nm" placeholder="name to listen for" style="font:inherit;background:#2a2f3a;color:var(--ink);border:1px solid #454c5c;border-radius:8px;padding:7px;flex:1">
         <button id="setnm">Listen</button>
       </div>
@@ -190,6 +195,8 @@ $("mark").onmouseup = () => send({cmd: "alert_up"});
 $("play").onclick = () => { $("est").textContent = ""; send({cmd: "replay", name: $("traces").value}); };
 $("find").onclick = () => send({cmd: "target", name: $("tgt").value});
 $("tgt").onkeydown = e => { if (e.key === "Enter") $("find").onclick(); };
+$("teach").onclick = () => send({cmd: "teach", seconds: 2.5});
+$("forget").onclick = () => send({cmd: "forget_sound"});
 $("talk").onpointerdown = () => { $("talk").classList.add("active"); send({cmd: "action", down: true}); };
 $("talk").onpointerup = $("talk").onpointerleave = () => {
   if ($("talk").classList.contains("active")) { $("talk").classList.remove("active"); send({cmd: "action", down: false}); }
@@ -262,7 +269,7 @@ function connect() {
           : `→ motor ${m.motor} ${NAMES[m.motor]} (${Math.round(m.angle)}°, agreement ${m.consistency})`;
         log(`estimate ${m.trace}: ${$("est").textContent}`);
         break;
-      case "state": $("obj").textContent = m.object ?? "–"; $("name").textContent = m.name ?? "–"; $("heard").textContent = m.heard ?? "–"; break;
+      case "state": $("obj").textContent = m.object ?? "–"; $("name").textContent = m.name ?? "–"; $("heard").textContent = m.heard ?? "–"; $("sound").textContent = m.sound ?? "–"; break;
       case "log": log(m.text); break;
       case "alerts": $("alerts").tBodies[0].innerHTML = ""; alertRows.clear(); m.items.forEach(addAlert); break;
       case "alert": addAlert(m); break;

@@ -13,12 +13,13 @@ WebSocket, page -> server (JSON):
   {"cmd":"bench","name":"gate|walk|cardinals"}   (gate checks by feel; STOP cancels)
   {"cmd":"label","truth":k|null|"false","id":n?}  (ground truth for the latest/given alert)
   {"cmd":"missed","truth":k}         (a call the band gave no cue for)
+  {"cmd":"teach","seconds":2.5}      (Teach a Sound: make the sound once)  {"cmd":"forget_sound"}
 server -> page:
   {"type":"mic","ms":..,"levels":[f,r,b,l],"replay":bool}
   {"type":"pulse","motor":k,"ms":..,"dry":bool}   {"type":"stop"}
   {"type":"btn","name":"ACTION","down":bool}      {"type":"raw","text":..}
   {"type":"status",...}  {"type":"estimate",...}  {"type":"traces","items":[..]}
-  {"type":"state","object":..,"name":..}          {"type":"log","text":..}
+  {"type":"state","object":..,"name":..,"heard":..,"sound":..}  {"type":"log","text":..}
   {"type":"alert",...AlertLog record}  {"type":"label",...}  {"type":"alerts","items":[..]}
 """
 from __future__ import annotations
@@ -55,7 +56,8 @@ class App:
         self.live = direction.LiveEstimator()   # MIC buffer + clock sync for name alerts
         self.names = None
         self.replayer: Optional[trace.Replayer] = None
-        self.state = {"object": None, "name": None, "heard": None}
+        self.state = {"object": None, "name": None, "heard": None, "sound": None}
+        self.sound = None
         self.vision = None
         self.guide = None
         self.speech = None
@@ -139,6 +141,26 @@ class App:
         if win and self.recorder.active:   # recorded traces get the alert window for replay
             self.recorder.mark_alert(*win)
 
+    def attach_sound(self, listener) -> None:
+        """listener: app.listen.SoundListener. A detection -> its own pattern
+        (haptics.taught_sound, no direction), logged with source "sound"."""
+        self.sound = listener
+        listener.on_detect = self.on_sound
+        listener.on_taught = self._on_taught
+        self.state["sound"] = "taught, listening" if listener.template else "not taught yet"
+
+    def on_sound(self, hit) -> None:
+        latency_ms = (time.monotonic() - hit.end) * 1000      # end of the sound -> cue sent
+        self.notify.cue("sound", "sound", None, hit.score, latency_ms,
+                        duration_ms=round((hit.end - hit.start) * 1000))
+        self.state["sound"] = f"heard it (match {hit.score:.2f})"
+        self.emit({"type": "state", **self.state})
+
+    def _on_taught(self, tpl, msg: str) -> None:
+        self.state["sound"] = "taught, listening" if tpl else "not taught yet"
+        self.emit({"type": "state", **self.state})
+        self.emit({"type": "log", "text": f"teach a sound: {msg}"})
+
     def _action(self, down: bool) -> None:
         """Action button (board or dashboard): alert window while recording,
         no cues while held, hold-to-talk speech."""
@@ -147,8 +169,9 @@ class App:
         if self.vision:
             for obj in (self.vision, self.guide):
                 (obj.pause if down else obj.resume)()
-        if self.names:   # hold-to-talk owns the mic while Action is held
-            (self.names.pause if down else self.names.resume)()
+        for lst in (self.names, self.sound):  # hold-to-talk owns the mic while held
+            if lst:
+                (lst.pause if down else lst.resume)()
         if self.speech:
             try:
                 self.speech.on_button(down)
@@ -207,6 +230,17 @@ class App:
             return {"type": "log", "text": f"listening for: {', '.join(self.names.names) or 'nothing'}"}
         elif cmd == "bench":
             return self.bench(m.get("name"))
+        elif cmd == "teach":
+            if not self.sound:
+                return {"type": "log", "text": "sound listener not running (start with --sound)"}
+            secs = min(max(float(m.get("seconds", 2.5)), 0.5), 10.0)
+            self.sound.teach(secs)
+            self.state["sound"] = f"teaching: make the sound now ({secs:g} s)"
+            self.emit({"type": "state", **self.state})
+        elif cmd == "forget_sound" and self.sound:
+            self.sound.forget()
+            self.state["sound"] = "not taught yet"
+            self.emit({"type": "state", **self.state})
         elif cmd == "label":
             return self.label(m.get("truth"), m.get("id"))
         elif cmd == "missed":
@@ -239,7 +273,7 @@ class App:
             cls = self.vision.set_target(m.get("name") or None)
             return {"type": "log", "text": f"target: {cls or 'none (not a known class)'}"}
         elif cmd == "state":  # vision/speech status from other code paths
-            self.state.update({k: m[k] for k in ("object", "name", "heard") if k in m})
+            self.state.update({k: m[k] for k in ("object", "name", "heard", "sound") if k in m})
             self.emit({"type": "state", **self.state})
         return None
 
