@@ -1,0 +1,22 @@
+# secrets and per-person config (never commit)
+.env
+.env.*
+!.env.example
+agents/local.yaml
+agents/agent_config.yaml
+# environments and caches
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+.pytest_cache/
+.band-workspaces/
+uv.lock
+.DS_Store
+# big files: download at runtime instead of committing
+*.pt
+*.onnx
+*.tflite
+models/
+recordings/
+build/
