@@ -20,6 +20,18 @@ Safety, by construction:
   * the buzz path never waits on this: texts run on their own worker thread, the
     alert listener only queues, and every failure ends in silence or a short sorry
 
+Adding tools without editing this file
+--------------------------------------
+Put a module on the path (default: app/costar_tools.py, or any names in
+HDB_AGENT_PLUGINS, comma-separated) that exposes either
+    TOOLS = [fn, ...]                 plain functions: typed arguments, a docstring
+                                      that says when to use it, return a short string
+or  def make_tools(band_tools): return [fn, ...]    (to use alerts/status/clock)
+Each function becomes a tool for the deep agent; its text is made speakable and
+an exception becomes "I could not do that". Plugin tools get no link or haptics
+from here. register_tool(fn) does the same from code. A missing or broken plugin
+is skipped with one printed line; the agent still starts.
+
 Running it
 ----------
     python -m app.main --vision --agent          # the band app + the texting agent
@@ -47,6 +59,9 @@ AGENT_TIMEOUT_S = 25.0
 URGENT_SOUNDS = {"alarm", "siren", "car horn", "glass breaking", "shout", "scream", "yell",
                  "fire alarm", "smoke alarm"}
 SKIP_SOURCES = {"manual", "replay"}
+DEFAULT_PLUGINS = ("app.costar_tools",)
+CORE_TOOLS = ("get_status", "recent_alerts", "daily_summary", "pattern_legend", "explain_buzz",
+              "set_find_target", "send_urgent")
 
 # ---------------------------------------------------------------------------
 # Words: alerts and patterns in plain speech
@@ -137,6 +152,20 @@ def _clock(rec: dict) -> str:
 # Tools: plain Python over existing objects. No link, no haptics player.
 # ---------------------------------------------------------------------------
 
+def _safe_tool(fn: Callable) -> Callable:
+    """Plugin tools answer in speakable text and never raise into the agent."""
+    import functools
+
+    @functools.wraps(fn)
+    def run(*a, **k):
+        try:
+            return plain_text(str(fn(*a, **k)))
+        except Exception as e:
+            print(f"[band-agent] tool {fn.__name__} failed ({type(e).__name__}: {str(e)[:80]})")
+            return "I could not do that."
+    return run
+
+
 class BandTools:
     def __init__(self, alerts, status_fn: Callable[[], dict],
                  set_target_fn: Optional[Callable[[str], Optional[str]]] = None,
@@ -145,6 +174,39 @@ class BandTools:
         self.alerts, self.status_fn = alerts, status_fn
         self.set_target_fn, self.urgent_fn, self.clock = set_target_fn, urgent_fn, clock
         self._urgent_sent: deque = deque()
+        self.extra: list = []                  # plugin tools: see add_tool / load_plugins
+
+    def add_tool(self, fn: Callable) -> bool:
+        """Add a tool: a function with typed arguments and a docstring, returning a string."""
+        name = getattr(fn, "__name__", "")
+        if not name or name in CORE_TOOLS or any(t.__name__ == name for t in self.extra):
+            print(f"[band-agent] tool {name!r} skipped: name missing or already taken")
+            return False
+        self.extra.append(_safe_tool(fn))
+        return True
+
+    def load_plugins(self, names: Optional[list] = None) -> list:
+        """Import optional tool modules; returns the names of the tools added."""
+        import importlib
+        names = names if names is not None else (
+            [n.strip() for n in os.environ.get("HDB_AGENT_PLUGINS", "").split(",") if n.strip()]
+            or list(DEFAULT_PLUGINS))
+        added = []
+        for mod in names:
+            try:
+                try:
+                    m = importlib.import_module(mod)
+                except ModuleNotFoundError as e:
+                    if e.name == mod:
+                        continue                    # no such plugin installed: not an error
+                    raise
+                fns = list(m.make_tools(self)) if hasattr(m, "make_tools") else list(getattr(m, "TOOLS", []))
+                added += [f.__name__ for f in fns if self.add_tool(f)]
+            except Exception as e:                  # a broken plugin never stops the agent
+                print(f"[band-agent] plugin {mod} skipped ({type(e).__name__}: {str(e)[:80]})")
+        if added:
+            print(f"[band-agent] plugin tools: {', '.join(added)}")
+        return added
 
     def get_status(self) -> str:
         """Is the band connected, are the camera and microphones working, what is it looking for."""
@@ -342,7 +404,8 @@ recent_alerts for what happened, explain_buzz and pattern_legend for what a buzz
 set_find_target when asked to find something, send_urgent only when the wearer asks you to \
 alert the caregiver or an alert is clearly an emergency. Never invent alerts or times. Say \
 what a buzz meant in plain words. You cannot make the band buzz: it buzzes by itself. \
-If you are unsure what is asked, ask one short question."""
+If you are unsure what is asked, ask one short question. You may also have extra tools \
+(for example building lookup): use them when the question is about what they cover."""
 
 
 def load_model(name: Optional[str] = None):
@@ -352,8 +415,7 @@ def load_model(name: Optional[str] = None):
 
 def langchain_tools(tools: BandTools) -> list:
     from langchain_core.tools import StructuredTool
-    fns = [tools.get_status, tools.recent_alerts, tools.daily_summary, tools.pattern_legend,
-           tools.explain_buzz, tools.set_find_target, tools.send_urgent]
+    fns = [getattr(tools, n) for n in CORE_TOOLS] + list(tools.extra)
     return [StructuredTool.from_function(f, name=f.__name__, description=f.__doc__ or f.__name__)
             for f in fns]
 
@@ -535,6 +597,7 @@ def from_app(app, caregiver, vision=None, offline: bool = False) -> Optional[Age
         return d
     tools = BandTools(app.alerts, status,
                       (lambda t: vision.set_target(t)) if vision is not None else None)
+    tools.load_plugins()
     agent = BandAgent(tools, offline=offline)
     svc = AgentService(agent, caregiver.sender, allow, app.alerts, caregiver.phone,
                        caregiver_on=lambda: app.settings.caregiver_texts == "on")
@@ -572,7 +635,9 @@ def main(argv=None) -> int:
         return 0
     from .notify import load_env
     load_env()
-    agent = BandAgent(_demo_tools(), offline=a.offline)
+    demo = _demo_tools()
+    demo.load_plugins()
+    agent = BandAgent(demo, offline=a.offline)
     print(f"[band-agent] {agent.brain}" + (f" ({agent.error})" if agent.error else "")
           + "; sample alerts loaded; Ctrl-D to quit")
     try:
