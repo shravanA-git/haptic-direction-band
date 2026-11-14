@@ -302,6 +302,7 @@ async def run() -> None:
     team, local = load_yaml(TEAM_FILE), load_local()
     agents = my_agents(team, local)
     creds = load_yaml(CREDS_FILE)
+    agents = {k: v for k, v in agents.items() if v.get("engine") != "external"}
     missing = [k for k in agents if not creds.get(k, {}).get("api_key")]
     if missing:
         sys.exit(f"Not registered yet: {', '.join(missing)}. Run `register` first.")
