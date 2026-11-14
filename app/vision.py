@@ -45,6 +45,9 @@ Running it
         (also --dead-band, --dead-band-exit, --lost-after, --smoothing, --min-score)
     python -m app.vision --analyze recordings/banana.csv  # gaps, jitter, suggested settings
 
+Device: HDB_VISION_DEVICE=cpu|mps|cuda overrides; otherwise MPS is used only if it
+passes a test convolution in a child process (some torch/macOS pairs abort on it).
+
 Weights (yolo11s.pt, ~18 MB; HDB_YOLO_WEIGHTS to override) download at runtime into
 models/ (gitignored). Tuned on Sophanit's live banana run (Nov 13): yolov8n@416 saw
 the moving banana in ~25% of frames, median score 0.41, so: bigger model, 640 px,
@@ -244,6 +247,50 @@ DEFAULT_IMGSZ = 640
 DETECT_CONF = 0.15  # detector floor; the tracker applies TrackerConfig.min_score
 
 
+# A broken torch/macOS pairing (torch 2.15 on macOS 14.5) aborts the whole process
+# on the first MPS convolution - not a Python exception - so test MPS in a child
+# process before trusting it.
+_MPS_PROBE = ("import torch; x = torch.ones(1, 3, 32, 32, device='mps'); "
+              "w = torch.ones(4, 3, 3, 3, device='mps'); "
+              "print('ok', float(torch.nn.functional.conv2d(x, w).sum()))")
+_device_cache: Optional[str] = None
+
+
+def pick_device() -> str:
+    """HDB_VISION_DEVICE (cpu, mps, cuda) if set; else cuda, else MPS if it passes
+    a test convolution in a child process, else cpu."""
+    global _device_cache
+    env = os.environ.get("HDB_VISION_DEVICE", "").strip().lower()
+    if env:
+        return env
+    if _device_cache:
+        return _device_cache
+    dev = "cpu"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            dev = "cuda"
+        elif torch.backends.mps.is_available():
+            import subprocess
+            import sys
+            try:
+                r = subprocess.run([sys.executable, "-c", _MPS_PROBE], capture_output=True,
+                                   text=True, timeout=90)
+                ok = r.returncode == 0 and r.stdout.startswith("ok")
+            except subprocess.TimeoutExpired:
+                ok = False
+            if ok:
+                dev = "mps"
+            else:
+                print(f"[vision] MPS failed a test convolution (torch {torch.__version__}); "
+                      "using CPU. Fix: pip install 'torch<2.12' (or HDB_VISION_DEVICE=cpu "
+                      "to skip this check)")
+    except Exception:
+        dev = "cpu"
+    _device_cache = dev
+    return dev
+
+
 class Detector:
     def __init__(self, weights: str = None, imgsz: int = None,
                  device: Optional[str] = None):
@@ -265,14 +312,7 @@ class Detector:
         self.model = YOLO(str(path))
         self._lock = threading.Lock()
         self.imgsz = imgsz
-        if device is None:
-            try:
-                import torch
-                device = "mps" if torch.backends.mps.is_available() else (
-                    "cuda" if torch.cuda.is_available() else "cpu")
-            except Exception:
-                device = "cpu"
-        self.device = device
+        self.device = device or pick_device()
         names = self.model.names
         self.class_ids = {(n.replace("_", " ")): i for i, n in names.items()}
 
@@ -660,8 +700,27 @@ def check(camera=0) -> bool:
     try:
         det = Detector()
         line(True, f"detector {DEFAULT_WEIGHTS}@{det.imgsz} on {det.device}")
+        # Run real inference: loading weights proves nothing about the torch backend
+        # (torch 2.15 + macOS 14 MPS loaded fine and crashed on the first detect).
+        import numpy as np
+        import ultralytics
+        img = None
+        try:
+            import cv2
+            img = cv2.imread(str(Path(ultralytics.__file__).parent / "assets" / "bus.jpg"))
+        except Exception:
+            pass
+        if img is None:
+            img = np.full((480, 640, 3), 127, np.uint8)
+        det.detect_all(img)                      # warm-up
+        t = time.monotonic()
+        objs = det.detect_all(img)
+        ms = (time.monotonic() - t) * 1000
+        line(True, f"test detect on {det.device}: {ms:.0f} ms, found "
+                   + (", ".join(sorted({o[0] for o in objs})) or "nothing"))
     except Exception as e:
-        line(False, f"detector: {e}", "be online once so weights download into models/")
+        line(False, f"detector: {e}", "be online once so weights download into models/; "
+             "if it crashed, try HDB_VISION_DEVICE=cpu")
     try:
         import cv2
         v = Vision(camera=camera)
