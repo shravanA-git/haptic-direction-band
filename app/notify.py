@@ -25,7 +25,15 @@ from .recall import AlertLog
 from .settings import Settings
 
 
+# Taught sound heard by the band mics: its own sweep, then a directional pulse
+# toward where it came from. PROVISIONAL timing (not yet agreed via HDB-Protocol).
+SOUND_DIR_OFFSET_MS = 640
+
+
 def pattern(cue: str, motor: Optional[int] = None) -> list:
+    if cue == "sound" and motor is not None:
+        return haptics.taught_sound() + [(SOUND_DIR_OFFSET_MS, int(motor) % 8,
+                                          haptics.DIRECTIONAL_MS)]
     if cue == "directional":
         if motor is None:
             raise ValueError("directional cue needs a motor")

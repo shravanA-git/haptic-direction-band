@@ -131,6 +131,8 @@ def frame_pitch(frame: np.ndarray, noise_psd: Optional[np.ndarray] = None,
     tonality = held / total
     if tonality < TONAL_PEAK_FRAC:
         return None, tonality
+    if top <= 2 or top >= len(p) - 3:
+        return None, tonality   # rumble/hiss leaking in at the range edge, not a pitch
     k = top
     if 0 < k < len(p) - 1:   # parabolic interpolation on log power
         a, b, c = np.log(p[k - 1] + 1e-20), np.log(p[k] + 1e-20), np.log(p[k + 1] + 1e-20)

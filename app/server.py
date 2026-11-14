@@ -253,14 +253,31 @@ class App:
         self.state["sound"] = "taught, listening" if listener.template else "not taught yet"
 
     def on_sound(self, hit) -> None:
+        """Taught sound recognised (laptop mic) at hit.start..hit.end. If the band
+        is streaming MIC frames, estimate where it came from over that window (as
+        for names): the sound's own sweep, then a pulse toward it. Weak, stale or
+        missing evidence: the sweep alone."""
+        e, win = self.live.estimate(hit.start, hit.end)
         latency_ms = (time.monotonic() - hit.end) * 1000      # end of the sound -> cue sent
-        self.notify.cue("sound", "sound", None, hit.score, latency_ms,
-                        duration_ms=round((hit.end - hit.start) * 1000))
+        self.notify.cue("sound", "sound", e.motor, hit.score, latency_ms,
+                        duration_ms=round((hit.end - hit.start) * 1000),
+                        label=getattr(hit, "label", None), category=getattr(hit, "category", None),
+                        reason=e.reason, window=list(win) if win else None,
+                        strength=e.strength)
         what = getattr(hit, "label", "") or "it"
         cat = getattr(hit, "category", "")
-        self.state["sound"] = f"heard {what}" + (f" [{cat}]" if cat else "") + \
+        where = (f" from {haptics.MOTOR_NAMES[e.motor]} (motor {e.motor})" if e.motor is not None
+                 else "")
+        self.state["sound"] = f"heard {what}" + (f" [{cat}]" if cat else "") + where + \
             f" (match {hit.score:.2f})"
         self.emit({"type": "state", **self.state})
+        if e.motor is not None or win:
+            self.emit({"type": "estimate", "trace": f"live: sound {what}", "motor": e.motor,
+                       "angle": e.angle_deg, "consistency": round(e.consistency, 2),
+                       "strength": round(e.strength, 2), "frames": e.frames_used,
+                       "reason": e.reason, "window": win})
+        if win and self.recorder.active:
+            self.recorder.mark_alert(*win)
 
     def _on_taught(self, tpl, msg: str) -> None:
         # a failed teach keeps the sounds taught before

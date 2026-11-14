@@ -228,3 +228,31 @@ def test_v1_template_file_still_loads(tmp_path):
     (tmp_path / "t.json").write_text(json.dumps(v1))
     sl = listen.SoundListener(template_file=tmp_path / "t.json")
     assert sl.template is not None and sl.template.sig is None and sl.template.label == "sound"
+
+
+def test_taught_sound_buzzes_its_direction_from_band_mics(tmp_path):
+    """A recognised sound + band MIC frames from the back-left trace: the sound's
+    sweep, then a directional pulse on motor 5; logged with the motor."""
+    import time
+
+    from app import haptics, notify, trace
+    from app.link import Link, SimPort
+    from app.server import App
+    from tests.test_names import FIX, feed
+
+    port = SimPort(frames=[])
+    link = Link(port).start()
+    app = App(link)
+    t = trace.load(FIX / "back_left.json")
+    base = time.monotonic() - t["frames"][-1]["ms"] / 1000 - 0.1
+    feed(app.live, t, base)
+    app.on_sound(listen.SoundHit(0.93, base + 1.0, base + 1.45, 0.1, "doorbell", "two-tone", 659.0))
+    time.sleep(1.0)
+    link.close()
+    want = [f"PULSE {m} {ms}" for _, m, ms in haptics.taught_sound()] + \
+        [f"PULSE 5 {haptics.DIRECTIONAL_MS}"]
+    assert port.sent[:len(want)] == want
+    [a] = app.alerts.recent()
+    assert a["source"] == "sound" and a["motor"] == 5 and a["label"] == "doorbell"
+    assert "back-left" in app.state["sound"] and "doorbell" in app.state["sound"]
+    assert notify.pattern("sound")[-1] != (notify.SOUND_DIR_OFFSET_MS, 5, haptics.DIRECTIONAL_MS)
