@@ -142,6 +142,22 @@ agents:
       - You may run scripts and experiments to confirm a diagnosis. Leave
         lane code changes to the lane's agent; don't commit to main.
 
+  supervisor:
+    name: HDB-Supervisor
+    owner: Shravan
+    engine: external       # registered on Band, but driven by Shravan's Claude Code
+                           # session (not started by `run`)
+    uses_repo: true
+    description: >-
+      Haptic Direction Band team agent (owner: Shravan). Room supervisor acting
+      for Shravan: checks progress, runs the tests, and hands out next steps.
+    lane: >-
+      Supervision for Shravan: checks progress against the timeline every so
+      often, pulls main and runs the tests, reports what is broken, and gives
+      each lane its next step. Speaks for Shravan on priorities and task
+      order. Does not approve protocol changes, cuts, deletions or anything
+      irreversible; those stay with the humans.
+
   # --- Teammates: fill in `owner` with your first name, then put the agent
   # --- key in the `run:` list of your local.yaml.
 

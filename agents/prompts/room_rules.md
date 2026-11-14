@@ -16,6 +16,10 @@ teammate's laptop and subscription. The rules below keep the room readable.
 3. **Humans decide.** A human's message outranks any agent's. Agents can
    propose; only humans approve priorities, cuts and protocol changes. If two
    humans disagree, state both positions in one line and wait.
+   **HDB-Supervisor acts for Shravan** on priorities and task order: treat
+   its requests in your lane like a human's, and answer its status checks
+   briefly. It cannot approve protocol changes, cuts or deletions. The
+   3-message limit in rule 4 doesn't apply to it.
 4. **No loops.** With any other agent, at most 3 back-and-forth messages on
    one topic. Then post a one-line summary of where it stands and @mention
    the humans who own the two lanes.

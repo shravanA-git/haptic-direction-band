@@ -4,6 +4,8 @@
     uv run python hdb_team.py run        # start your agents (Ctrl+C to stop)
     uv run python hdb_team.py roster     # show who owns what
     uv run python hdb_team.py watch      # live feed of what your agents do (free)
+    uv run python hdb_team.py status [N] # print the last N feed lines once and exit
+    uv run python hdb_team.py say "..."  # post as HDB-Supervisor (@Name mentions)
 
 Each teammate runs this on their own laptop, logged in to their own Claude
 subscription (`claude auth login`), with their own Band user key.
@@ -307,6 +309,8 @@ async def run() -> None:
     async with contextlib.AsyncExitStack() as stack:
         running = []
         for key, spec in agents.items():
+            if spec.get("engine") == "external":
+                continue  # e.g. HDB-Supervisor: posts via `say`, no model here
             agent = Agent.from_config(
                 key, adapter=build_adapter(spec, team, local), config_path=CREDS_FILE
             )
@@ -375,7 +379,7 @@ def _format(item: dict, me: set[str]) -> str | None:
     return None
 
 
-async def watch() -> None:
+async def watch(once: bool = False) -> None:
     from band.client.rest import AsyncRestClient
 
     team, local = load_yaml(TEAM_FILE), load_local()
@@ -387,7 +391,11 @@ async def watch() -> None:
     backlog = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 25
     seen: set[str] = set()
     first = True
-    print(f"Watching {', '.join(sorted(me))}. Ctrl+C to stop.\n")
+    if once:
+        global RED, DIM, BOLD, RESET
+        RED = DIM = BOLD = RESET = ""
+    else:
+        print(f"Watching {', '.join(sorted(me))}. Ctrl+C to stop.\n")
     while True:
         rows = []
         for name, client in clients.items():
@@ -427,7 +435,51 @@ async def watch() -> None:
             who = d.get("sender_name") or "?"
             label = f"{who:<15}" if d.get("message_type") != "text" or who in me else " " * 15
             print(f"{DIM}{stamp}{RESET} {label} {line}", flush=True)
+        if once:
+            return
         await asyncio.sleep(5)
+
+
+# --- say: post in the room as HDB-Supervisor ---------------------------------
+
+async def say(text: str) -> None:
+    import re
+
+    from band.client.rest import AsyncRestClient
+    from band_rest import ChatMessageRequest, ChatMessageRequestMentionsItem
+
+    creds = load_yaml(CREDS_FILE)
+    if not creds.get("supervisor", {}).get("api_key"):
+        sys.exit("HDB-Supervisor isn't registered yet: add `supervisor` to `run` in "
+                 "local.yaml and run `register`.")
+    local = load_local()
+    client = AsyncRestClient(api_key=creds["supervisor"]["api_key"])
+    room = local.get("room_id")
+    if not room:
+        chats = getattr(await client.agent_api_chats.list_agent_chats(), "data", None) or []
+        if len(chats) != 1:
+            sys.exit(f"HDB-Supervisor is in {len(chats)} rooms; set `room_id` in local.yaml.")
+        room = chats[0].id
+    resp = await client.agent_api_participants.list_agent_chat_participants(chat_id=room)
+    people = getattr(resp, "data", None) or []
+    by_name = {}
+    for p in people:
+        d = p.dict() if hasattr(p, "dict") else dict(p)
+        for label in (d.get("name"), d.get("handle")):
+            if label:
+                by_name[str(label).lower()] = d
+    mentions, seen = [], set()
+    for name in re.findall(r"@([\w.\-/]+)", text):
+        d = by_name.get(name.lower().rstrip(".,:;"))
+        if d and d["id"] not in seen:
+            seen.add(d["id"])
+            mentions.append(ChatMessageRequestMentionsItem(id=d["id"], name=d.get("name")))
+    if not mentions:
+        sys.exit("No @mention matched anyone in the room. Names: "
+                 + ", ".join(sorted({str(p.dict().get('name')) for p in people})))
+    await client.agent_api_messages.create_agent_chat_message(
+        chat_id=room, message=ChatMessageRequest(content=text, mentions=mentions))
+    print(f"Posted to room {room[:8]}… mentioning {', '.join(m.name or m.id for m in mentions)}")
 
 
 def show_roster() -> None:
@@ -444,6 +496,12 @@ if __name__ == "__main__":
     elif command == "watch":
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(watch())
+    elif command == "status":
+        asyncio.run(watch(once=True))
+    elif command == "say":
+        if len(sys.argv) < 3:
+            sys.exit('Usage: hdb_team.py say "@HDB-Software please ..."')
+        asyncio.run(say(" ".join(sys.argv[2:])))
     elif command == "roster":
         show_roster()
     else:
