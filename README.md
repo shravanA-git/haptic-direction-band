@@ -35,6 +35,19 @@ The pin map, serial protocol, one-channel wiring and estimator notes are in
 handoff). The 36-hour schedule, gates, cut order and demo are in
 [`agents/context/timeline.md`](agents/context/timeline.md).
 
+## Run the laptop app
+
+```
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m app.main                 # real band (auto-detects the USB port)
+.venv/bin/python -m app.main --sim           # simulated band, no hardware
+.venv/bin/python -m tools.bench --gate       # H3 gate: PULSE 0 + STOP, no browser
+.venv/bin/python -m pytest -q
+```
+Dashboard: http://localhost:8765 (motor ring, mic levels, test pulses, STOP
+or Esc, record and replay). Close the Arduino Serial Monitor first: only one
+program can own the port.
+
 ## Git workflow (people and agents)
 
 1. Start a task: `git checkout <your-branch> && git pull --no-rebase origin main`

@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Haptic Direction Band</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --ink:#e8eaf0; --dim:#8a90a0; --on:#ffb020; --dry:#4aa8ff; --ok:#3ccf7a; --bad:#ff4d4d; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:18px/1.4 system-ui, sans-serif; }
+  header { display:flex; align-items:center; gap:24px; padding:12px 24px; background:var(--panel); }
+  header h1 { font-size:22px; margin:0; flex:1; }
+  .dot { display:inline-block; width:14px; height:14px; border-radius:50%; background:var(--bad); margin-right:6px; vertical-align:-1px; }
+  .dot.ok { background:var(--ok); }
+  main { display:grid; grid-template-columns: minmax(420px, 1.2fr) 1fr; gap:20px; padding:20px 24px; }
+  section { background:var(--panel); border-radius:12px; padding:16px 20px; }
+  h2 { font-size:16px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin:0 0 12px; }
+  #ring { width:100%; max-width:520px; display:block; margin:auto; }
+  .motor circle { fill:#2a2f3a; stroke:#454c5c; stroke-width:3; cursor:pointer; transition:fill .08s; }
+  .motor.on circle { fill:var(--on); stroke:#fff; }
+  .motor.dry circle { fill:var(--dry); stroke:#fff; }
+  .motor text { fill:var(--ink); font-size:22px; font-weight:700; text-anchor:middle; dominant-baseline:central; pointer-events:none; }
+  .motor .lbl { font-size:12px; font-weight:400; fill:var(--dim); }
+  button { font:inherit; color:var(--ink); background:#2a2f3a; border:1px solid #454c5c; border-radius:8px; padding:8px 14px; cursor:pointer; }
+  button:hover { background:#353b48; }
+  button.active { background:var(--bad); }
+  #stop { display:block; width:100%; margin-top:12px; padding:18px; font-size:28px; font-weight:800; background:var(--bad); border:none; color:#fff; letter-spacing:.1em; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px; }
+  .bars { display:grid; grid-template-columns: 70px 1fr 56px; gap:8px 12px; align-items:center; }
+  .bar { height:26px; background:#2a2f3a; border-radius:6px; overflow:hidden; }
+  .bar > div { height:100%; width:0; background:var(--ok); transition:width .05s; }
+  .bars.replay .bar > div { background:var(--dry); }
+  .num { text-align:right; font-variant-numeric:tabular-nums; color:var(--dim); }
+  select { font:inherit; background:#2a2f3a; color:var(--ink); border:1px solid #454c5c; border-radius:8px; padding:7px; max-width:100%; }
+  #est { font-size:22px; font-weight:700; min-height:32px; }
+  #log { font:13px/1.5 ui-monospace, monospace; color:var(--dim); height:150px; overflow:auto; white-space:pre-wrap; }
+  .kv { display:grid; grid-template-columns:110px 1fr; gap:4px 12px; }
+  .kv b { font-size:22px; }
+  .legend span { margin-right:14px; font-size:14px; color:var(--dim); }
+  .legend i { display:inline-block; width:12px; height:12px; border-radius:50%; margin-right:5px; vertical-align:-1px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Haptic Direction Band</h1>
+  <div><span id="conn" class="dot"></span><span id="dev">–</span></div>
+  <div><span id="frames">0</span> frames</div>
+  <div id="btn">Action: up</div>
+</header>
+<main>
+  <section>
+    <h2>Motor ring (click = 150 ms test pulse)</h2>
+    <svg id="ring" viewBox="-260 -260 520 520"></svg>
+    <div class="legend"><span><i style="background:var(--on)"></i>sent to band</span><span><i style="background:var(--dry)"></i>replay (dry run)</span></div>
+    <div class="row" style="margin-top:10px">
+      <button data-cue="generic">Generic (300 ms front)</button>
+      <button data-cue="centered">Centered (2× front)</button>
+      <button data-cue="lost">Lost</button>
+    </div>
+    <button id="stop" title="Esc">STOP</button>
+  </section>
+  <div style="display:grid; gap:20px; align-content:start">
+    <section>
+      <h2>Mic levels <span id="micsrc"></span></h2>
+      <div class="bars" id="bars"></div>
+    </section>
+    <section>
+      <h2>Now</h2>
+      <div class="kv">
+        <span>Object</span><b id="obj">–</b>
+        <span>Name</span><b id="name">–</b>
+      </div>
+    </section>
+    <section>
+      <h2>Record &amp; replay</h2>
+      <div class="row">
+        <button id="rec">● Record</button>
+        <button id="mark" title="hold while the name is spoken">Hold = alert window</button>
+      </div>
+      <div class="row">
+        <select id="traces"></select>
+        <button id="play">▶ Replay</button>
+        <button id="halt">■</button>
+      </div>
+      <div id="est"></div>
+    </section>
+    <section>
+      <h2>Log</h2>
+      <div id="log"></div>
+    </section>
+  </div>
+</main>
+<script>
+const NAMES = ["Front","Front-right","Right","Back-right","Back","Back-left","Left","Front-left"];
+const MICS = ["Front","Right","Back","Left"];
+const $ = id => document.getElementById(id);
+let ws, recording = false;
+
+// ---- ring
+const svg = $("ring"), NS = "http://www.w3.org/2000/svg";
+svg.innerHTML = `<ellipse rx="95" ry="115" fill="#20242d" stroke="#454c5c" stroke-width="3"/>
+  <polygon points="0,-150 -16,-118 16,-118" fill="#454c5c"/>
+  <text y="6" text-anchor="middle" fill="#8a90a0" font-size="16">head (top view)</text>`;
+const motors = NAMES.map((n, k) => {
+  const a = k * Math.PI / 4, x = 200 * Math.sin(a), y = -200 * Math.cos(a);
+  const g = document.createElementNS(NS, "g");
+  g.setAttribute("class", "motor");
+  g.innerHTML = `<circle cx="${x}" cy="${y}" r="42"/><text x="${x}" y="${y - 6}">${k}</text>
+                 <text class="lbl" x="${x}" y="${y + 18}">${n}</text>`;
+  g.onclick = () => send({cmd: "pulse", motor: k, ms: 150});
+  svg.appendChild(g);
+  return {g, timer: null};
+});
+function light(k, ms, dry) {
+  const m = motors[k];
+  clearTimeout(m.timer);
+  m.g.classList.remove("on", "dry");
+  m.g.classList.add(dry ? "dry" : "on");
+  m.timer = setTimeout(() => m.g.classList.remove("on", "dry"), Math.max(ms, 120));
+}
+function allOff() { motors.forEach(m => { clearTimeout(m.timer); m.g.classList.remove("on", "dry"); }); }
+
+// ---- mic bars (auto-scaled)
+let peak = 100;
+$("bars").innerHTML = MICS.map((n, i) =>
+  `<span>${n}</span><div class="bar"><div id="b${i}"></div></div><span class="num" id="v${i}">0</span>`).join("");
+function mic(levels, replay) {
+  peak = Math.max(peak * 0.999, ...levels, 1);
+  levels.forEach((v, i) => { $("b" + i).style.width = (100 * v / peak) + "%"; $("v" + i).textContent = Math.round(v); });
+  $("bars").classList.toggle("replay", replay);
+  $("micsrc").textContent = replay ? "(replay)" : "(live)";
+}
+
+function log(t) {
+  const el = $("log");
+  el.textContent += new Date().toLocaleTimeString() + "  " + t + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+function send(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); else log("not connected"); }
+
+// ---- controls
+$("stop").onclick = () => { send({cmd: "stop"}); allOff(); };
+document.addEventListener("keydown", e => { if (e.key === "Escape") $("stop").onclick(); });
+document.querySelectorAll("[data-cue]").forEach(b => b.onclick = () => send({cmd: "cue", name: b.dataset.cue}));
+$("rec").onclick = () => send({cmd: recording ? "record_stop" : "record_start"});
+$("mark").onmousedown = () => send({cmd: "alert_down"});
+$("mark").onmouseup = () => send({cmd: "alert_up"});
+$("play").onclick = () => { $("est").textContent = ""; send({cmd: "replay", name: $("traces").value}); };
+$("halt").onclick = () => send({cmd: "replay_stop"});
+
+// ---- websocket
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => log("dashboard connected");
+  ws.onclose = () => { $("conn").className = "dot"; $("dev").textContent = "app offline"; setTimeout(connect, 1000); };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    switch (m.type) {
+      case "mic": mic(m.levels, m.replay); break;
+      case "pulse": light(m.motor, m.ms, m.dry); log(`${m.dry ? "(dry) " : ""}PULSE ${m.motor} ${m.ms}`); break;
+      case "stop": allOff(); log("STOP"); break;
+      case "btn": $("btn").textContent = `${m.name[0] + m.name.slice(1).toLowerCase()}: ${m.down ? "DOWN" : "up"}`; break;
+      case "raw": log("< " + m.text); break;
+      case "status":
+        $("conn").className = "dot" + (m.connected ? " ok" : "");
+        $("dev").textContent = m.device + (m.error ? " — " + m.error : "");
+        $("frames").textContent = m.frames;
+        recording = m.recording;
+        $("rec").textContent = recording ? "■ Stop & save" : "● Record";
+        $("rec").classList.toggle("active", recording);
+        break;
+      case "traces": {
+        const cur = $("traces").value;
+        $("traces").innerHTML = m.items.map(t => `<option>${t}</option>`).join("");
+        if (m.items.includes(cur)) $("traces").value = cur;
+        break;
+      }
+      case "estimate":
+        $("est").textContent = m.motor === null
+          ? `→ generic attention (${m.reason})`
+          : `→ motor ${m.motor} ${NAMES[m.motor]} (${Math.round(m.angle)}°, agreement ${m.consistency})`;
+        log(`estimate ${m.trace}: ${$("est").textContent}`);
+        break;
+      case "state": $("obj").textContent = m.object ?? "–"; $("name").textContent = m.name ?? "–"; break;
+      case "log": log(m.text); break;
+    }
+  };
+}
+connect();
+</script>
+</body>
+</html>
