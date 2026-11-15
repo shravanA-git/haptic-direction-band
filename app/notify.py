@@ -30,11 +30,21 @@ from .settings import Settings
 SOUND_DIR_OFFSET_MS = 640
 
 
+# "pattern" (default): the taught sound's own sweep around the motors, then a LONGER pulse toward where
+# it came from (SOUND_DIR_MS, up from the usual 200 ms so the direction is easy to feel after the sweep).
+# "direction": only that one pulse, no sweep. Set HDB_SOUND_STYLE=direction for it.
+SOUND_STYLE = os.environ.get("HDB_SOUND_STYLE", "pattern").strip().lower()
+SOUND_DIR_MS = 450
+SOUND_TAPS = [(0, 0, 100), (180, 0, 100)]
+
+
 def pattern(cue: str, motor: Optional[int] = None, category: Optional[str] = None) -> list:
+    if cue == "sound" and SOUND_STYLE != "pattern":
+        return [(0, int(motor) % 8, SOUND_DIR_MS)] if motor is not None else list(SOUND_TAPS)
     if cue == "sound":
         steps = haptics.taught_sound(category)
         if motor is not None:
-            steps.append((SOUND_DIR_OFFSET_MS, int(motor) % 8, haptics.DIRECTIONAL_MS))
+            steps.append((SOUND_DIR_OFFSET_MS, int(motor) % 8, SOUND_DIR_MS))
         return steps
     if cue == "directional":
         if motor is None:
@@ -167,32 +177,48 @@ class PhotonSender:
     def _start(self) -> None:
         self._p = subprocess.Popen([self.node, str(self.bridge)], stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=None,       # the bridge's [photon] log lines show in the terminal
-                                   
                                    text=True, bufsize=1, cwd=str(self.bridge.parent))
-        ready = self._p.stdout.readline()
-        try:
-            r = json.loads(ready)
-        except ValueError:
-            r = {"ready": False, "error": f"bridge said {ready.strip()[:120]!r}"}
+        # The bridge's first poll prints every unseen inbound text BEFORE its ready line, so the
+        # first line is not always "ready": keep those texts and deliver them once running.
+        backlog: list = []
+        while True:
+            line = self._p.stdout.readline()
+            if not line:
+                r = {"ready": False, "error": "bridge exited before it was ready"}
+                break
+            try:
+                r = json.loads(line)
+            except ValueError:
+                r = {"ready": False, "error": f"bridge said {line.strip()[:120]!r}"}
+                break
+            if r.get("inbound"):
+                backlog.append(r)
+                continue
+            break
         if not r.get("ready"):
             self._p.kill()
             self._p = None
             raise RuntimeError(r.get("error") or "bridge failed to start")
-        threading.Thread(target=self._read, args=(self._p,), name="photon", daemon=True).start()
+        threading.Thread(target=self._read, args=(self._p, backlog), name="photon", daemon=True).start()
 
-    def _read(self, p) -> None:
+    def _deliver(self, r: dict) -> None:
+        self.received += 1
+        for fn in list(self._on_message):
+            try:
+                fn(str(r.get("from") or ""), str(r.get("text") or ""))
+            except Exception as e:
+                print(f"[photon] message handler error: {e}")
+
+    def _read(self, p, backlog=()) -> None:
+        for r in backlog:       # on this thread, not under the send lock: a handler may reply
+            self._deliver(r)
         for line in p.stdout:
             try:
                 r = json.loads(line)
             except ValueError:
                 continue
             if r.get("inbound"):
-                self.received += 1
-                for fn in list(self._on_message):
-                    try:
-                        fn(str(r.get("from") or ""), str(r.get("text") or ""))
-                    except Exception as e:
-                        print(f"[photon] message handler error: {e}")
+                self._deliver(r)
                 continue
             with self._cv:
                 self._replies[r.get("id")] = r

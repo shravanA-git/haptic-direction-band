@@ -78,3 +78,40 @@ def test_photon_sender_counts_received_and_sent(tmp_path):
     s.send("+15550000001", "bad")
     assert s.stats() == {"received": 2, "sent_ok": 1, "sent_failed": 1, "last_error": "HTTP 403 nope"}
     s.close()
+
+
+def test_photon_sender_starts_when_inbound_backlog_precedes_ready(tmp_path):
+    """The bridge's first poll prints unseen inbound texts before its ready line (a new caregiver's
+    first text, a backlog). That used to read as 'bridge failed to start' and kill the bridge on
+    every launch, so no caregiver text could ever be sent."""
+    import sys
+    import threading
+
+    from app.notify import PhotonSender
+    fake = tmp_path / "fake_bridge3.py"
+    fake.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'inbound': True, 'from': '+15550000093', 'text': 'hi'}), flush=True)\n"
+        "print(json.dumps({'inbound': True, 'from': '+15550000064', 'text': 'status'}), flush=True)\n"
+        "print(json.dumps({'ready': True}), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    m = json.loads(line)\n"
+        "    print(json.dumps({'id': m['id'], 'ok': True}), flush=True)\n")
+    got, evt = [], threading.Event()
+    s = PhotonSender(node=sys.executable, bridge=fake, timeout_s=5)
+    s.on_message(lambda frm, text: (got.append((frm, text)), len(got) == 2 and evt.set()))
+    assert evt.wait(5) and got == [("+15550000093", "hi"), ("+15550000064", "status")]
+    assert s.send("+15550000093", "caregiver alert") == (True, None)
+    assert s.error is None and s.stats()["received"] == 2
+    s.close()
+
+
+def test_photon_sender_reports_a_bridge_that_exits_before_ready(tmp_path):
+    import sys
+
+    from app.notify import PhotonSender
+    fake = tmp_path / "fake_bridge4.py"
+    fake.write_text("import sys\nsys.exit(1)\n")
+    s = PhotonSender(node=sys.executable, bridge=fake, timeout_s=2)
+    ok, err = s.send("+15550000093", "x")
+    assert not ok and "exited before it was ready" in err

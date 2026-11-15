@@ -35,7 +35,9 @@ def test_log_writes_jsonl_and_labels(tmp_path):
         log.add("tv", "generic")
 
 
-def test_notifier_plays_and_logs():
+def test_notifier_plays_and_logs(monkeypatch):
+    from app import notify
+    monkeypatch.setattr(notify, "SOUND_STYLE", "pattern")   # these check the per-category sweeps
     port = SimPort()
     link = Link(port).start()
     dry = []
@@ -95,3 +97,23 @@ def test_app_logs_name_find_manual_and_labels(tmp_path):
     _, labels = recall.load(tmp_path / "a.jsonl")
     assert [(l["ref"], l["truth"]) for l in labels] == [(2, 5), (1, 5), (None, 4)]
     link.close()
+
+
+def test_taught_sound_buzzes_one_motor_by_default(monkeypatch):
+    """Default style: one pulse on the side the sound came from, never a sweep around all four."""
+    from app import notify
+    monkeypatch.setattr(notify, "SOUND_STYLE", "direction")
+    assert notify.pattern("sound", 2, "tone") == [(0, 2, notify.SOUND_DIR_MS)]
+    assert len({m for _, m, _ in notify.pattern("sound", 6, "melody")}) == 1
+    unknown = notify.pattern("sound", None, "tone")          # direction unclear: two quick front taps
+    assert {m for _, m, _ in unknown} == {0} and len(unknown) == 2
+
+
+def test_default_sound_cue_sweeps_all_four_then_a_longer_pulse_toward_the_sound(monkeypatch):
+    from app import notify
+    monkeypatch.setattr(notify, "SOUND_STYLE", "pattern")
+    steps = notify.pattern("sound", 2, None)          # no category: the shared sweep over all four
+    sweep, last = steps[:-1], steps[-1]
+    assert {m for _, m, _ in sweep} == {0, 2, 4, 6}                      # the sweep still goes around all four
+    assert last[1] == 2 and last[2] == notify.SOUND_DIR_MS > haptics.DIRECTIONAL_MS
+    assert last[0] == notify.SOUND_DIR_OFFSET_MS and notify.SOUND_DIR_MS <= 1000
