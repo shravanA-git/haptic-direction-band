@@ -69,6 +69,10 @@ class Condition:
     motor_bleed: float = 0.0     # chance a frame gets a motor-noise spike on one channel
     clock_err_ms: int = 0        # alert window misaligned by up to +- this
     sources: int = 1             # 0 = fully diffuse control (expected generic)
+    floors: Optional[tuple] = None   # per-channel quiet level (front, right, back, left), overrides floor
+    front_burst: float = 0.0     # chance per frame of a +2..7 spike on the FRONT mic (the jumpy one)
+    warp_deg: float = 0.0        # head/hat shadow asymmetry: a source at theta sounds like
+                                 # theta - warp*sin(2*theta), pulling diagonals toward front/back
 
 
 CONDITIONS = {c.name: c for c in [
@@ -79,6 +83,10 @@ CONDITIONS = {c.name: c for c in [
     Condition("clock", clock_err_ms=150),
     Condition("hard", floor=35, floor_jitter=6, speech=(25, 50), babble=0.6, diffuse=0.35,
               gain_err=0.3, motor_bleed=0.15, clock_err_ms=100),
+    # The real hat's front mic: small, jumpy baseline. Relative-to-own-baseline excess made it look
+    # loud; absolute excess over a robust floor does not.
+    Condition("frontnoise", floors=(8, 22, 22, 22), floor_jitter=1.5, speech=(25, 60), front_burst=0.35),
+    Condition("asym", warp_deg=28.0),
     Condition("diffuse", diffuse=1.0, sources=0),
 ]}
 
@@ -95,13 +103,17 @@ def simulate(motor: Optional[int], cond: Condition, seed: int) -> dict:
     """One trace: a name called from motor's direction (None = diffuse)."""
     rnd = random.Random(seed)
     theta = DIRECTIONS[motor] + rnd.uniform(-10, 10) if motor is not None else 0.0
-    gains = mic_gains(theta, 1.0 if cond.sources == 0 else cond.diffuse)
+    theta_eff = theta - cond.warp_deg * math.sin(math.radians(2 * theta))
+    gains = mic_gains(theta_eff, 1.0 if cond.sources == 0 else cond.diffuse)
     err = [1 + rnd.uniform(-cond.gain_err, cond.gain_err) for _ in MIC_ANGLES]
     amp = rnd.uniform(*cond.speech)
     frames = []
     for i in range(TRACE_MS // FRAME_MS):
         ms = i * FRAME_MS
-        lv = [cond.floor + rnd.uniform(-cond.floor_jitter, cond.floor_jitter) for _ in MIC_ANGLES]
+        base = cond.floors or (cond.floor,) * 4
+        lv = [b + rnd.uniform(-cond.floor_jitter, cond.floor_jitter) for b in base]
+        if cond.front_burst and rnd.random() < cond.front_burst:
+            lv[0] += rnd.uniform(2, 7)
         if cond.babble and rnd.random() < 0.3:
             ch = rnd.randrange(4)
             lv[ch] += rnd.uniform(0, cond.babble) * cond.floor
@@ -166,7 +178,7 @@ class Tally:
 HEADER = f"{'condition':14s} {'n':>4s} {'correct':>8s} {'near':>5s} {'wrong':>6s} {'generic':>8s}   {'gate':>6s}"
 
 
-def run_trace(t: dict, expect_override=...) -> list:
+def run_trace(t: dict, expect_override=..., algo: Optional[str] = None, centroids=None) -> list:
     """[(alert, expected, Estimate, kind)] for every labelled alert in a trace."""
     out = []
     file_exp = (t.get("expected") or {}).get("motor", ...) if isinstance(t.get("expected"), dict) else ...
@@ -174,12 +186,13 @@ def run_trace(t: dict, expect_override=...) -> list:
         exp = expect_override if expect_override is not ... else a.get("expected", file_exp)
         if exp is ...:
             continue                 # unlabelled
-        e = direction.estimate(t["frames"], a["startMs"], a["endMs"])
+        e = direction.estimate(t["frames"], a["startMs"], a["endMs"], algo=algo, centroids=centroids)
         out.append((a, exp, e, classify(e.motor, exp)))
     return out
 
 
-def evaluate(conditions, trials: int, seed: int = 0, save: Optional[Path] = None):
+def evaluate(conditions, trials: int, seed: int = 0, save: Optional[Path] = None,
+             algo: Optional[str] = None):
     """{condition: (Tally, {motor: Tally})}"""
     results = {}
     for name in conditions:
@@ -192,13 +205,51 @@ def evaluate(conditions, trials: int, seed: int = 0, save: Optional[Path] = None
             for k in range(trials * (8 if m is None else 1)):
                 s = seed * 1_000_003 + ci * 10_007 + (m if m is not None else 9) * 1009 + k
                 t = simulate(m, cond, s)
-                [(_, _, _, kind)] = run_trace(t)
+                [(_, _, _, kind)] = run_trace(t, algo=algo)
                 total.add(kind)
                 per[m].add(kind)
                 if save:
                     trace.save(t, save / f"{name}_{'none' if m is None else NAMES[m]}_{k:02d}.json")
         results[name] = (total, per)
     return results
+
+
+def confusion(pairs: list) -> dict:
+    """pairs: [(expected motor or None, got motor or None)] -> matrix and the front-bias numbers.
+    front_bias = share of trials whose true direction was NOT front that were called front."""
+    m = {}
+    for exp, got in pairs:
+        m.setdefault(exp, {})
+        m[exp][got] = m[exp].get(got, 0) + 1
+    non_front = [(e, g) for e, g in pairs if e not in (0, None)]
+    called_front = sum(1 for e, g in non_front if g == 0)
+    wrong = sum(1 for e, g in pairs if g is not None and (e is None or min((g - e) % 8, (e - g) % 8) > 1))
+    return {"matrix": m, "n": len(pairs), "front_bias": called_front / len(non_front) if non_front else 0.0,
+            "called_front": called_front, "non_front": len(non_front), "wrong": wrong,
+            "generic": sum(1 for _, g in pairs if g is None)}
+
+
+def print_matrix(c: dict, title: str) -> None:
+    cols = list(range(8)) + [None]
+    print(f"  {title}: rows = true direction, columns = what the band buzzed")
+    print("  " + " " * 12 + "".join(f"{('gen' if k is None else NAMES[k][:5]):>7s}" for k in cols))
+    for e in sorted(c["matrix"], key=lambda k: -1 if k is None else k):
+        row = c["matrix"][e]
+        print("  " + f"{'(none)' if e is None else NAMES[e]:12s}" + "".join(f"{row.get(k, 0):7d}" for k in cols))
+
+
+def sim_pairs(cond_name: str, trials: int, seed: int, algo: str, centroids=None) -> list:
+    cond = CONDITIONS[cond_name]
+    ci = zlib.crc32(cond_name.encode()) % 10_007
+    motors = [None] if cond.sources == 0 else list(DIRECTIONS)
+    pairs = []
+    for m in motors:
+        for k in range(trials * (8 if m is None else 1)):
+            s = seed * 1_000_003 + ci * 10_007 + (m if m is not None else 9) * 1009 + k
+            t = simulate(m, cond, s)
+            [(_, exp, e, _)] = run_trace(t, algo=algo, centroids=centroids)
+            pairs.append((exp, e.motor))
+    return pairs
 
 
 def main(argv=None) -> int:
@@ -212,9 +263,24 @@ def main(argv=None) -> int:
                     default=..., help="label for every alert in the given traces (motor or 'generic')")
     ap.add_argument("--save", type=Path, help="write simulated traces here (replayable)")
     ap.add_argument("--gate", action="store_true", help="exit 1 if any row fails the gate")
+    ap.add_argument("--algo", choices=("v1", "v2"), help="estimator (default: direction.ALGORITHM, v2)")
+    ap.add_argument("--confusion", action="store_true",
+                    help="before (v1) / after (v2) confusion matrices and front-bias per condition")
     ap.add_argument("-v", "--verbose", action="store_true", help="per-direction rows")
     a = ap.parse_args(argv)
 
+    if a.confusion:
+        names = [c.strip() for c in a.conditions.split(",") if c.strip() and c.strip() != "none"]
+        print(f"Confusion, {a.trials} trials per direction, seed {a.seed}: "
+              "front-bias = non-front calls buzzed as FRONT")
+        print(f"{'condition':12s} {'algo':>5s} {'front-bias':>11s} {'wrong':>6s} {'generic':>8s}")
+        for name in names:
+            for algo in ("v1", "v2"):
+                c = confusion(sim_pairs(name, a.trials, a.seed, algo))
+                print(f"{name:12s} {algo:>5s} {100 * c['front_bias']:9.1f}% {c['wrong']:6d} {c['generic']:8d}")
+                if a.verbose:
+                    print_matrix(c, f"{name} {algo}")
+        return 0
     failed = False
     conds = [] if a.conditions == "none" else [c.strip() for c in a.conditions.split(",") if c.strip()]
     bad = [c for c in conds if c not in CONDITIONS]
@@ -226,7 +292,7 @@ def main(argv=None) -> int:
         print(f"Simulated: {a.trials} trials per direction (diffuse: {8 * a.trials}), seed {a.seed}")
         print(HEADER)
         overall = Tally()
-        for name, (total, per) in evaluate(conds, a.trials, a.seed, a.save).items():
+        for name, (total, per) in evaluate(conds, a.trials, a.seed, a.save, a.algo).items():
             print(total.row(name))
             failed |= not total.passes()
             for k in Tally.KEYS:

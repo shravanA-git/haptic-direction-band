@@ -1,10 +1,22 @@
-"""Name-direction estimator, first pass (works on band-clock milliseconds).
+"""Name-direction estimator (works on band-clock milliseconds).
 
-Steps (agents/context/protocol.md): remove DC, match gains, per frame compute
-(right-left, front-back) normalized by total level, combine across the alert
-window, pick the nearest of 8 motors. Weak or conflicting evidence -> None
-(caller plays the generic attention cue). Clock alignment from laptop speech
-timestamps to ESP32 ms comes later (ClockSync below is the hook).
+estimate() (v2, robust), per name call:
+  1. noise floor per channel: median + MAD of the 2 s of MIC frames BEFORE the name
+     (frames while a motor was buzzing are skipped), in absolute units;
+  2. a channel counts in a frame only if it is above floor + K_SIGMA x noise, so a
+     small or jumpy mic (the front one on the real hat) cannot invent signal;
+     excess = (level - floor) x gain, gains from tools/calibrate.py;
+  3. work on the SPIKE: frames whose (3-frame smoothed) total excess is at least
+     half of the name's peak;
+  4. per frame (right-left, front-back) / total; drop frames whose direction is a
+     circular outlier, Huber-weight the rest, average;
+  5. pick the motor: nearest 45 degrees (analytic, the default), or nearest learned
+     centroid with a margin when app/centroids.json exists (tools/learn_centroids.py
+     from labelled trials; head and hat shadow asymmetrically, so data beats the
+     ideal cosine response). Weak, conflicting or ambiguous -> None (generic cue).
+estimate_v1() is the first-pass version, kept for before/after comparisons
+(estimate(..., algo="v1") or HDB_ESTIMATOR=v1).
+ClockSync maps laptop speech timestamps to ESP32 ms.
 """
 from __future__ import annotations
 
@@ -28,10 +40,12 @@ MIN_FRAMES = 2
 class Estimate:
     motor: Optional[int]       # None -> generic attention
     angle_deg: Optional[float]
-    strength: float            # mean loudness excess
+    strength: float            # v2: SNR (mean spike excess / noise); v1: mean excess over baseline
     consistency: float         # 0..1 agreement of per-frame directions
     frames_used: int
     reason: str
+    margin: float = 0.0        # v2 centroid classifier: distance gap to the runner-up (0 = analytic)
+    vector: Optional[tuple] = None   # v2: mean (east, north) of the spike, the centroid feature
 
 
 def _baseline(frames: Sequence[dict], start: int, end: int):
@@ -57,10 +71,10 @@ def load_calibration(path=CALIBRATION_FILE) -> Optional[list]:
     return [float(x) for x in g]
 
 
-def estimate(frames: Sequence[dict], start_ms: int, end_ms: int,
-             gains: Optional[Sequence[float]] = None) -> Estimate:
-    """gains: optional per-channel sensitivity correction from tools/calibrate.py,
-    applied to each channel's excess over its baseline."""
+def estimate_v1(frames: Sequence[dict], start_ms: int, end_ms: int,
+                gains: Optional[Sequence[float]] = None) -> Estimate:
+    """First pass (kept for comparison). gains: optional per-channel sensitivity correction from
+    tools/calibrate.py, applied to each channel's excess over its baseline."""
     base = _baseline(frames, start_ms, end_ms)
     g = list(gains) if gains is not None else [1.0, 1.0, 1.0, 1.0]
     win = [f["levels"] for f in frames if start_ms <= f["ms"] <= end_ms]
@@ -128,9 +142,12 @@ class LiveEstimator:
     """
 
     def __init__(self, keep_ms: int = 8000, pad_ms: int = 100, stale_s: float = 1.0,
-                 clock: Optional[ClockSync] = None, gains: Optional[Sequence[float]] = None):
+                 clock: Optional[ClockSync] = None, gains: Optional[Sequence[float]] = None,
+                 centroids: Optional[dict] = None):
         self.keep_ms, self.pad_ms, self.stale_s = keep_ms, pad_ms, stale_s
         self.gains = gains          # from load_calibration(); None = uncorrected
+        self.centroids = centroids  # from load_centroids(); None = analytic 8-way
+        self._motor_spans: deque = deque(maxlen=64)   # laptop-monotonic (start_s, end_s) of motor pulses
         self.clock = clock or ClockSync()
         self._frames: deque = deque()
         self._last_rx = 0.0
@@ -150,6 +167,23 @@ class LiveEstimator:
                 self._frames.popleft()
             self._last_rx = rx
 
+    def note_motor(self, start_s: float, duration_ms: float) -> None:
+        """A motor was commanded at laptop time start_s for duration_ms: its buzz bleeds into the
+        mics, so those frames are left out of the noise floor and the evidence."""
+        with self._lock:
+            self._motor_spans.append((start_s, start_s + duration_ms / 1000.0))
+
+    def _skip_ms(self, lo_s: float, hi_s: float) -> list:
+        """Motor spans near [lo_s, hi_s] as ESP32-ms ranges (with spin-down margin)."""
+        out = []
+        for a, b in list(self._motor_spans):
+            if b < lo_s - 4.0 or a > hi_s + 0.5:
+                continue
+            ea, eb = self.clock.to_esp_ms(a), self.clock.to_esp_ms(b)
+            if ea is not None and eb is not None:
+                out.append((int(ea) - 30, int(eb) + MOTOR_MARGIN_MS))
+        return out
+
     def window(self, start_s: float, end_s: float):
         """Laptop monotonic seconds -> padded (start_ms, end_ms) on the ESP32 clock."""
         a, b = self.clock.to_esp_ms(start_s), self.clock.to_esp_ms(end_s)
@@ -168,4 +202,158 @@ class LiveEstimator:
             return Estimate(None, None, 0.0, 0.0, 0, "no MIC frames (band not streaming)"), None
         if now - last_rx > self.stale_s:
             return Estimate(None, None, 0.0, 0.0, 0, f"MIC stream stale ({now - last_rx:.1f} s)"), win
-        return estimate(frames, *win, gains=self.gains), win
+        skip = self._skip_ms(start_s, end_s)
+        return estimate(frames, *win, gains=self.gains, centroids=self.centroids, skip_ms=skip), win
+
+
+
+# --------------------------------------------------------------------------
+# v2: robust estimator
+# --------------------------------------------------------------------------
+
+import os  # noqa: E402
+
+ALGORITHM = os.environ.get("HDB_ESTIMATOR", "v2")
+PRE_ROLL_MS = 2000
+MIN_PRE_FRAMES = 6
+K_SIGMA = 3.0             # a channel counts only if it is this many noise sigmas above its floor
+V2_MIN_CONSISTENCY = 0.6  # whole-spike coherence for a direction to exist (swept on the sims: matches
+                          # v1 on the diffuse control, 40 -> 153 correct on "noisy")
+MIN_SNR = 3.0             # mean spike excess over the noise of all four channels
+SPIKE_FRAC = 0.5
+OUTLIER_DEG = 60.0
+HUBER_DEG = 30.0
+CENTROID_MARGIN = 0.15    # relative gap (d2 - d1) / d2 between the nearest and runner-up centroid; 0 = on the
+                          # midline between two directions. Scale-free: centroids can sit close together
+CENTROIDS_FILE = Path(__file__).resolve().parent / "centroids.json"
+MOTOR_MARGIN_MS = 120     # frames this long after a motor pulse (spin-down, bleed) are skipped
+
+
+def _in_spans(ms: float, spans: Sequence) -> bool:
+    return any(a <= ms <= b for a, b in spans)
+
+
+def noise_floor(frames: Sequence[dict], start_ms: int, end_ms: int, skip: Sequence = ()):
+    """(median, sigma) per channel, absolute units, from the quiet frames before the name."""
+    pre = [f["levels"] for f in frames
+           if start_ms - PRE_ROLL_MS <= f["ms"] < start_ms and not _in_spans(f["ms"], skip)]
+    if len(pre) < MIN_PRE_FRAMES:     # short recording: everything outside the window, then everything
+        pre = [f["levels"] for f in frames
+               if (f["ms"] < start_ms or f["ms"] > end_ms) and not _in_spans(f["ms"], skip)]
+        if len(pre) < 3:
+            pre = [f["levels"] for f in frames]
+    med, sig = [], []
+    for ch in zip(*pre):
+        m = median(ch)
+        mad = median(abs(v - m) for v in ch)
+        med.append(m)
+        sig.append(max(1.4826 * mad, 0.02 * abs(m), 0.5))
+    return med, sig
+
+
+def _circ_dist(a: float, b: float) -> float:
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def load_centroids(path=CENTROIDS_FILE) -> Optional[dict]:
+    """{motor: (east, north)} learned by tools/learn_centroids.py, or None."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    c = json.loads(path.read_text())["centroids"]
+    out = {int(k): (float(v[0]), float(v[1])) for k, v in c.items()}
+    if len(out) < 2:
+        raise ValueError("centroids.json needs at least 2 classes")
+    return out
+
+
+def classify_centroid(vec, centroids: dict, margin: float = None) -> tuple:
+    """(motor or None, relative margin) by nearest centroid in (east, north); None when the
+    point is too close to the midline between two directions."""
+    margin = CENTROID_MARGIN if margin is None else margin
+    ranked = sorted((math.hypot(vec[0] - cx, vec[1] - cy), m) for m, (cx, cy) in centroids.items())
+    if len(ranked) < 2:
+        return ranked[0][1], 1.0
+    d1, d2 = ranked[0][0], ranked[1][0]
+    rel = (d2 - d1) / d2 if d2 > 1e-9 else 0.0
+    return (ranked[0][1] if rel >= margin else None), rel
+
+
+def estimate(frames: Sequence[dict], start_ms: int, end_ms: int,
+             gains: Optional[Sequence[float]] = None, centroids: Optional[dict] = None,
+             skip_ms: Sequence = (), algo: Optional[str] = None) -> Estimate:
+    """Robust name direction (see the module docstring). gains: per-channel sensitivity
+    correction (tools/calibrate.py), multiplies each channel's excess. centroids: {motor:
+    (east, north)} from load_centroids(); skip_ms: [(a, b)] band-clock spans when a motor was on."""
+    if (algo or ALGORITHM) == "v1":
+        return estimate_v1(frames, start_ms, end_ms, gains)
+    skip = list(skip_ms)
+    win = [f for f in frames if start_ms <= f["ms"] <= end_ms and not _in_spans(f["ms"], skip)]
+    if not win:
+        return Estimate(None, None, 0.0, 0.0, 0, "no frames in window (stale?)")
+    med, sig = noise_floor(frames, start_ms, end_ms, skip)
+    g = list(gains) if gains is not None else [1.0, 1.0, 1.0, 1.0]
+    ex = []                                    # per frame: gated, gain-matched excess, front/right/back/left
+    for f in win:
+        ex.append([(v - m) * k if (v - m) > K_SIGMA * s else 0.0
+                   for v, m, s, k in zip(f["levels"], med, sig, g)])
+    tot = [sum(e) for e in ex]
+    if max(tot) <= 0:
+        return Estimate(None, None, 0.0, 0.0, 0, "too few loud frames")
+    sm = [sum(tot[max(0, i - 1):i + 2]) / 3 for i in range(len(tot))]       # 3-frame smoothing
+    peak = max(sm)
+    keep = [i for i in range(len(tot)) if sm[i] >= SPIKE_FRAC * peak and tot[i] > 0]
+    noise = math.sqrt(sum(s * s for s in sig))
+    snr = (sum(tot[i] for i in keep) / len(keep)) / noise if keep else 0.0
+    if len(keep) < MIN_FRAMES or snr < MIN_SNR:
+        return Estimate(None, None, snr, 0.0, len(keep), "too few loud frames")
+    vec = []                                   # (x, y, weight) per spike frame
+    for i in keep:
+        f_, r_, b_, l_ = ex[i]
+        x, y = (r_ - l_) / tot[i], (f_ - b_) / tot[i]
+        if math.hypot(x, y) > 1e-6:
+            vec.append((x, y, tot[i]))
+    if len(vec) < MIN_FRAMES:
+        return Estimate(None, None, snr, 0.0, len(vec), "too few loud frames")
+    w_all = sum(w for _, _, w in vec)
+    # Is there a direction at all? Coherence of the WHOLE spike, before any rejection: real calls
+    # are coherent, diffuse noise and rotating peaks are not (outlier rejection must not manufacture
+    # a direction out of random frames).
+    cx = sum(x / math.hypot(x, y) * w for x, y, w in vec) / w_all
+    cy = sum(y / math.hypot(x, y) * w for x, y, w in vec) / w_all
+    if math.hypot(cx, cy) < V2_MIN_CONSISTENCY:
+        return Estimate(None, math.degrees(math.atan2(cx, cy)) % 360, snr, math.hypot(cx, cy),
+                        len(vec), "conflicting directions")
+    for _ in range(2):                         # drop circular outliers around the weighted direction
+        sx = sum(x * w for x, y, w in vec)
+        sy = sum(y * w for x, y, w in vec)
+        centre = math.degrees(math.atan2(sx, sy)) % 360
+        kept = [v for v in vec if _circ_dist(math.degrees(math.atan2(v[0], v[1])) % 360, centre) <= OUTLIER_DEG]
+        if len(kept) < MIN_FRAMES:
+            break
+        vec = kept
+    agree = sum(w for _, _, w in vec) / w_all   # share of the spike that agrees; a few outliers are fine,
+    if agree < 0.5:                             # but with no majority (rotating peaks) there is no direction
+        return Estimate(None, centre, snr, 0.0, len(vec), "conflicting directions")
+    ws = []                                    # Huber weights: far-from-centre frames count less
+    for x, y, w in vec:
+        d = _circ_dist(math.degrees(math.atan2(x, y)) % 360, centre)
+        ws.append(w * (1.0 if d <= HUBER_DEG else HUBER_DEG / d))
+    W = sum(ws)
+    X = sum(x * w for (x, y, _), w in zip(vec, ws)) / W
+    Y = sum(y * w for (x, y, _), w in zip(vec, ws)) / W
+    ux = sum(x / math.hypot(x, y) * w for (x, y, _), w in zip(vec, ws)) / W
+    uy = sum(y / math.hypot(x, y) * w for (x, y, _), w in zip(vec, ws)) / W
+    consistency = math.hypot(ux, uy) * agree     # outliers that were dropped still lower confidence
+    angle = math.degrees(math.atan2(X, Y)) % 360
+    if len(vec) < MIN_FRAMES:
+        return Estimate(None, angle, snr, consistency, len(vec), "too few loud frames", 0.0, (X, Y))
+    if consistency < V2_MIN_CONSISTENCY:
+        return Estimate(None, angle, snr, consistency, len(vec), "conflicting directions", 0.0, (X, Y))
+    if centroids:
+        motor, margin = classify_centroid((X, Y), centroids)
+        if motor is None:
+            return Estimate(None, angle, snr, consistency, len(vec), "ambiguous (close to two directions)",
+                            margin, (X, Y))
+        return Estimate(motor, angle, snr, consistency, len(vec), "ok", margin, (X, Y))
+    return Estimate(int(round(angle / 45)) % 8, angle, snr, consistency, len(vec), "ok", 0.0, (X, Y))

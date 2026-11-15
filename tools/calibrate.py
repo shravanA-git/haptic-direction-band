@@ -4,6 +4,7 @@
   python -m tools.calibrate --cardinals     # front, right, back, left only
   python -m tools.calibrate --sim           # simulated band with mismatched mics
   python -m tools.calibrate --save          # write app/calibration.json without asking
+  python -m tools.calibrate --reps 3        # 3 laps of 8 positions (24 claps), for learn_centroids
 
 Steps:
   1. Quiet: stay silent for a few seconds; per-channel baseline and noise.
@@ -144,7 +145,7 @@ def compute_gains(frames: list, claps: list, base: list) -> Optional[list]:
     """claps: [(position, start, end)]. Mean excess per channel over claps
     spread evenly around the head -> gain to bring each channel to the mean.
     Needs all 8 positions or the 4 cardinals (otherwise directions bias it)."""
-    positions = sorted(p for p, _, _ in claps)
+    positions = sorted({p for p, _, _ in claps})
     if positions not in (list(range(8)), [0, 2, 4, 6]):
         return None
     sens = [0.0] * 4
@@ -186,9 +187,9 @@ def run_calibration(link: Link, ask: Callable[[str], str], positions, out=print,
     base = q["baseline"]
     claps = []
     out(f"[cal] step 2: clap once from each of {len(positions)} positions, ~1 m away")
-    for p in positions:
+    for n, p in enumerate(positions, 1):
         while True:
-            r = ask(f"[cal]   stand {POS_NAMES[p].upper()} of the band, press Enter, then clap "
+            r = ask(f"[cal]   ({n}/{len(positions)}) stand {POS_NAMES[p].upper()} of the band, press Enter, then clap "
                     "(s = skip) ").strip().lower()
             if r == "s":
                 break
@@ -247,6 +248,9 @@ def main(argv=None, ask: Callable[[str], str] = input) -> int:
     ap.add_argument("--port")
     ap.add_argument("--sim", action="store_true", help="simulated band with mismatched mics")
     ap.add_argument("--cardinals", action="store_true", help="4 positions instead of 8")
+    ap.add_argument("--reps", type=int, default=1,
+                    help="go around the positions this many times (3 gives tools/learn_centroids.py "
+                         "enough to learn per-direction centroids)")
     ap.add_argument("--quiet-s", type=float, default=3.0)
     ap.add_argument("--save", action="store_true", help="write app/calibration.json without asking")
     ap.add_argument("--out", type=Path, default=CALIBRATION_FILE, help=argparse.SUPPRESS)
@@ -264,7 +268,7 @@ def main(argv=None, ask: Callable[[str], str] = input) -> int:
             return 1
     link.start()
     time.sleep(0.1 if a.sim else 2.0)       # opening the port resets the ESP32
-    positions = [0, 2, 4, 6] if a.cardinals else list(range(8))
+    positions = ([0, 2, 4, 6] if a.cardinals else list(range(8))) * max(1, a.reps)
     try:
         res = run_calibration(link, ask, positions, quiet_s=a.quiet_s, on_ready=on_ready)
     finally:

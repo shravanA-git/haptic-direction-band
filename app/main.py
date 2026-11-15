@@ -122,6 +122,13 @@ def main(argv=None) -> int:
             print(f"[hdb] mic calibration from app/calibration.json: gains {app.live.gains}")
     except (ValueError, KeyError) as e:
         print(f"[hdb] ignoring app/calibration.json: {e}")
+    try:
+        app.live.centroids = direction.load_centroids()
+        if app.live.centroids:
+            print(f"[hdb] name direction: {len(app.live.centroids)} learned centroids "
+                  "(app/centroids.json); otherwise the analytic 8-way")
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"[hdb] ignoring app/centroids.json: {e}")
     vision = guide = None
     if a.target is not None or a.vision:
         from .guide import ObjectGuide

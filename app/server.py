@@ -426,6 +426,7 @@ class App:
     def _on_sent(self, line: str) -> None:
         p = line.split()
         if p[0] == "PULSE":
+            self.live.note_motor(time.monotonic(), int(p[2]))     # buzz bleeds into the mics
             self.emit({"type": "pulse", "motor": int(p[1]), "ms": int(p[2]), "dry": False})
         elif p[0] == "STOP":
             self.emit({"type": "stop"})
