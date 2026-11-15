@@ -90,7 +90,9 @@ def test_hit_times_on_monotonic_clock(tmp_path):
     assert hits[0].start == pytest.approx(501.5, abs=0.05)
 
 
-def test_app_teach_detect_buzzes_pattern_and_logs(tmp_path):
+def test_app_teach_detect_buzzes_pattern_and_logs(tmp_path, monkeypatch):
+    from app import notify
+    monkeypatch.setattr(notify, "SOUND_STYLE", "pattern")   # these check the per-category sweeps
     import time
 
     from app import haptics
@@ -231,7 +233,9 @@ def test_v1_template_file_still_loads(tmp_path):
     assert sl.template is not None and sl.template.sig is None and sl.template.label == "sound"
 
 
-def test_taught_sound_buzzes_its_direction_from_band_mics(tmp_path):
+def test_taught_sound_buzzes_its_direction_from_band_mics(tmp_path, monkeypatch):
+    from app import notify
+    monkeypatch.setattr(notify, "SOUND_STYLE", "pattern")   # these check the per-category sweeps
     """A recognised sound + band MIC frames from the back-left trace: the sound's
     sweep, then a directional pulse on motor 5; logged with the motor."""
     import time
@@ -251,7 +255,7 @@ def test_taught_sound_buzzes_its_direction_from_band_mics(tmp_path):
     time.sleep(1.0)
     link.close()
     want = [f"PULSE {m} {ms}" for _, m, ms in sorted(haptics.taught_sound("two-tone"))] + \
-        [f"PULSE 5 {haptics.DIRECTIONAL_MS}"]
+        [f"PULSE 5 {notify.SOUND_DIR_MS}"]
     assert port.sent[:len(want)] == want
     [a] = app.alerts.recent()
     assert a["source"] == "sound" and a["motor"] == 5 and a["label"] == "doorbell"
@@ -311,7 +315,9 @@ def test_app_forget_by_label_keeps_the_others(tmp_path):
     assert [m for m in sent if m["type"] == "sounds"][-1] == {"type": "sounds", "items": []}
 
 
-def test_each_category_has_its_own_non_directional_pattern():
+def test_each_category_has_its_own_non_directional_pattern(monkeypatch):
+    from app import notify
+    monkeypatch.setattr(notify, "SOUND_STYLE", "pattern")   # these check the per-category sweeps
     from app import haptics, notify
 
     cats = ["tone", "two-tone", "repeating", "melody", "percussive", "noise", "voice"]
@@ -327,7 +333,7 @@ def test_each_category_has_its_own_non_directional_pattern():
         assert max(o + ms for o, _, ms in p) < notify.SOUND_DIR_OFFSET_MS, c
         # the pulse toward the sound still follows the category pattern
         assert notify.pattern("sound", 5, c) == p + [(notify.SOUND_DIR_OFFSET_MS, 5,
-                                                      haptics.DIRECTIONAL_MS)]
+                                                      notify.SOUND_DIR_MS)]
     assert haptics.taught_sound(None) == haptics.taught_sound("unknown") == haptics.SOUND_STEPS
     assert notify.pattern("sound") == haptics.SOUND_STEPS
 
@@ -590,3 +596,19 @@ def test_real_speaker_rings_in_the_room_are_one_event_each():
         assert s.duration_s >= 1.2 and "falling" in s.description
         hz = listen._distinct_pitches(s.notes)
         assert hz[0] == pytest.approx(659, rel=0.02) and hz[1] == pytest.approx(523, rel=0.02)
+
+
+def test_sound_listener_clock_resyncs_after_dropped_samples():
+    """Same bug as the name listener: a forever-minimum offset put every sound ~10 s in the past after a
+    stall that dropped samples, so no band frames matched and no direction pulse followed the sweep."""
+    sl = listen.SoundListener()
+    block = np.zeros(listen.SAMPLE_RATE // 10, dtype=np.float32)
+    t = 2000.0
+    for _ in range(20):                          # 2 s healthy
+        sl.feed(block, t_first=t)
+        t += 0.1
+    t += 8.0                                     # an 8 s stall: that audio never arrived
+    for _ in range(80):                          # healthy again
+        sl.feed(block, t_first=t)
+        t += 0.1
+    assert abs(sl._t(sl._n) - t) < 0.3

@@ -59,6 +59,7 @@ from typing import Callable, Optional
 import numpy as np
 
 SAMPLE_RATE = 16000
+OFFSET_WINDOW_S = 5.0     # audio-clock offset = min over the last 5 s (re-syncs after dropped samples)
 FRAME = 512                    # 32 ms
 NBANDS = 20
 FMIN, FMAX = 100.0, 7000.0
@@ -661,6 +662,7 @@ class SoundListener:
         self._buf = np.zeros(0, dtype=np.float32)
         self._n = 0                       # samples consumed
         self._offset: Optional[float] = None
+        self._off_hist: deque = deque()   # (t_first, offset) of recent callbacks
         self._ev: Optional[_Event] = None
         self._teach_until: Optional[int] = None   # sample index where teaching ends
         self._teach_label = DEFAULT_LABEL
@@ -771,7 +773,13 @@ class SoundListener:
             t_first = time.monotonic() - len(samples) / SAMPLE_RATE
         with self._lock:
             off = t_first - (self._n + len(self._buf)) / SAMPLE_RATE
-            self._offset = off if self._offset is None else min(self._offset + 1e-6, off)
+            # Windowed minimum, not a forever-minimum: dropped samples (a busy CPU) make `off` grow, and a
+            # global min would keep the old small value, putting every later sound ~10 s in the past, outside
+            # the band-frame history ('no frames in window') so no direction pulse followed the sweep.
+            self._off_hist.append((t_first, off))
+            while self._off_hist and self._off_hist[0][0] < t_first - OFFSET_WINDOW_S:
+                self._off_hist.popleft()
+            self._offset = min(o for _, o in self._off_hist)
             self._buf = np.concatenate([self._buf, samples])
             while len(self._buf) >= FRAME:
                 f, self._buf = self._buf[:FRAME], self._buf[FRAME:]
