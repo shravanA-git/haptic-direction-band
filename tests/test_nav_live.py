@@ -121,3 +121,58 @@ def test_driven_tour_routes_through_the_scan_points_in_between():
     rp.plan("P0", "office")
     assert [p for p, _, _ in rp.legs[0]["subs"]] == ["P1", "P2"]
     assert round(sum(s.metres for s in rp.steps)) == 15                # barely longer
+
+
+def office_twin():
+    """long_twin's corridor, with a lobby at P0 and a deeper office (P4, P5): the
+    arrival point P4 sits at the office's edge, the room extends north to P5."""
+    from tools.costar_nav import build_twin
+    pts = {"P0": (0, 0), "P1": (0, 4), "P2": (0, 8), "P3": (0, 12), "P4": (3, 12), "P5": (3, 15)}
+    nb = {"P0": ["P1"], "P1": ["P0", "P2"], "P2": ["P1", "P3"], "P3": ["P2", "P4"],
+          "P4": ["P3", "P5"], "P5": ["P4"]}
+    room = {"P0": "L", "P4": "O", "P5": "O"}
+    return build_twin({
+        "name": "corridor", "floors": [],
+        "rooms": [{"id": "O", "classifications": [{"label": "Office"}], "boundary": {"edges": []}},
+                  {"id": "L", "classifications": [{"label": "Lobby"}], "boundary": {"edges": []}}],
+        "panoLocations": [{"id": k, "label": k, "position": {"x": x, "y": y, "z": 0}}
+                          for k, (x, y) in pts.items()],
+        "locations": [{"id": k, "neighbors": v, **({"room": {"id": room[k]}} if k in room else {})}
+                      for k, v in nb.items()]})
+
+
+def test_arrival_faces_into_the_room_not_the_wall():
+    log, moves = Log(), []
+    rp = RoutePlayer(office_twin(), play=log.cue, speak=log.say, threaded=False)
+    rp.on_move = lambda pano, heading: moves.append((pano, round(heading)))
+    rp.plan("P0", "office")
+    rp.play(now=0.0)
+    run_clock(rp, log, 60)
+    assert moves[-1] == ("P4", 0)          # walked east into P4, then turned north into the room
+
+
+def test_live_plans_from_the_tour_not_the_dropdown_and_demo_flies_to_its_start(monkeypatch):
+    app, nav, rp, sent, link = make_live_app(monkeypatch)
+    app.route.twin = nav.twin = office_twin()
+    app.handle({"cmd": "nav_pose", "sweep": "P2", "yaw": 0})      # the tour stands at P2
+    app.handle({"cmd": "route_plan", "start": "Lobby", "to": "office"})   # stale dropdown value
+    assert rp.start_pano == "P2"
+    assert "Starting at" not in rp.intro
+    sent.clear()
+    out = app.handle({"cmd": "route_demo"})
+    assert rp.start_pano == "P0" and rp.goal == "Office"
+    assert rp.intro.endswith("Starting at the lobby."), out
+    demo = [m for m in sent if m["type"] == "route_demo"][0]
+    assert (demo["start"], demo["to"], demo["legs"]) == ("Lobby", "Office", 2)
+    link.close()
+
+
+def test_drive_keeps_here_and_heading_fresh(monkeypatch):
+    app, nav, rp, sent, link = make_live_app(monkeypatch)
+    app.handle({"cmd": "nav_pose", "sweep": "P0", "yaw": 0})
+    app.handle({"cmd": "route_plan", "start": "", "to": "office"})
+    app.handle({"cmd": "route_play"})
+    app.handle({"cmd": "route_next"})                              # jump to the turn at P3
+    navs = [m for m in sent if m["type"] == "nav"]
+    assert navs[-1]["pano"] == "P3" and navs[-1]["heading"] == 90 and navs[-1]["goal"] == "office"
+    link.close()

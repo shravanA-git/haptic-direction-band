@@ -356,7 +356,9 @@ function connectWs() {
   ws = new WebSocket(withKey(`ws://${location.host}/ws`, "?"));
   ws.onmessage = ev => {
     const m = JSON.parse(ev.data);
-    if (m.type === "tour_move") {
+    if (m.type === "route_demo") {
+      if (!isLive()) $("start").value = m.start;
+    } else if (m.type === "tour_move") {
       tourMove(m);
     } else if (m.type === "route") {
       showRoute(m);
@@ -392,7 +394,14 @@ async function main() {
   if (sp) $("speed").value = sp;
   for (const r of cfg.rooms || []) {
     const b = document.createElement("button"); b.textContent = r;
-    b.onclick = () => send({cmd: "route_plan", start: $("start").value, to: r}); $("rooms").appendChild(b);
+    b.onclick = () => { send({cmd: "route_plan", start: startValue(), to: r}); focusTour(); };
+    $("rooms").appendChild(b);
+  }
+  if (cfg.demo) {                                // the longest multi-turn route in this model
+    const b = document.createElement("button"); b.className = "primary";
+    b.textContent = `★ Demo: ${cfg.demo.start} → ${cfg.demo.to} (${cfg.demo.legs} legs, ${cfg.demo.metres} m)`;
+    b.onclick = () => { send({cmd: "route_demo"}); focusTour(); };
+    $("rooms").prepend(b);
   }
   showBrief();
   connectWs();

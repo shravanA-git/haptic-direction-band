@@ -398,7 +398,51 @@ class RoutePlayer:
             legs.append({"start": path[i], "bearing": brg(pos[path[i]], pos[path[i + 1]]),
                          "end": path[j], "last": brg(pos[path[j - 1]], pos[path[j]]), "subs": subs})
             i = j
+        if legs:
+            legs[-1]["into"] = self.into_room_bearing(legs[-1]["end"], legs[-1]["last"])
         return legs
+
+    def into_room_bearing(self, pano_id: str, fallback: float) -> float:
+        """Arrival view: from the arrival scan point toward the middle of its room
+        (the other scan points in it), so the tour doesn't end facing a wall."""
+        from tools.costar_nav import bearing as brg
+        p = self.twin.panos[pano_id]
+        mates = [q for q in self.twin.panos.values() if q.room and q.room == p.room]
+        if len(mates) < 2:
+            return fallback
+        cx = sum(q.x for q in mates) / len(mates)
+        cy = sum(q.y for q in mates) / len(mates)
+        if ((cx - p.x) ** 2 + (cy - p.y) ** 2) ** 0.5 < 0.7:
+            return fallback                    # already in the middle: keep walking direction
+        return brg((p.x, p.y), (cx, cy))
+
+    def demo_pair(self) -> Optional[dict]:
+        """The longest showcase in this model: the start room and destination room
+        whose route has the most legs (then the most metres), planned the way it
+        will be played (short_hops). Named rooms only; a hallway is a poor goal."""
+        from tools.costar_nav import route_steps
+        vague = ("Void", "Unknown", "Other")
+        labels = sorted({r.label for r in self.twin.rooms.values() if r.label not in vague})
+        goals_ok = [g for g in labels if g.lower() not in ("hallway", "corridor")] or labels
+        best = None
+        for label, pano in self.starts():
+            if label in vague:
+                continue
+            for goal in goals_ok:
+                if goal == label:
+                    continue
+                goals = goal_panos(self.twin, goal)
+                if not goals or pano in goals:
+                    continue
+                path = shortest_path(self.twin, pano, goals, 2.0 if self.short_hops else 1.0)
+                if not path:
+                    continue
+                steps = route_steps(self.twin, path, None)
+                key = (len(steps), sum(s.metres for s in steps))
+                if best is None or key > best[0]:
+                    best = (key, {"start": label, "start_pano": pano, "to": goal,
+                                  "legs": len(steps), "metres": round(key[1], 1)})
+        return best[1] if best else None
 
     def arrival_text(self) -> str:
         room = self.steps[-1].room if self.steps else self.goal
@@ -522,7 +566,8 @@ class RoutePlayer:
         self.done = True
         out = [("cue", haptics.centered())]
         if self.legs:                        # tour: inside the goal room, facing into it
-            out.append(("move", (self.legs[-1]["end"], self.legs[-1]["last"])))
+            last = self.legs[-1]
+            out.append(("move", (last["end"], last.get("into", last["last"]))))
         return out + [("say", self.arrival_text()), ("status", ("arrived", self.leg))]
 
     def _say(self, text: str) -> None:

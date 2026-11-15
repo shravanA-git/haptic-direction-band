@@ -265,7 +265,10 @@ class App:
             self._nav_hold_subscribed = True
             self.alerts.subscribe(self._nav_alert_hold)
 
-    def route_go(self, start: Optional[str], place: str, play: bool = False, **detail) -> dict:
+    def route_go(self, start: Optional[str], place: str, play: bool = False,
+                 force_start: bool = False, **detail) -> dict:
+        """Plan (and maybe play) a route. Live tour: from where the tour stands,
+        unless force_start (the demo route), which flies the tour there first."""
         if self.route is None:
             return {"type": "log", "text": "route player is off (start with --nav <model id>)"}
         if self.vision is not None:
@@ -288,10 +291,17 @@ class App:
                     text = f"This scan is suite {self.costar.get('scan_suite')}; you're already there."
                     self.route.announce(text, haptics.centered())
                     return {"type": "log", "text": prefix + "route: " + text}
-        if not start and self.nav_live and self.nav is not None and self.nav.pano:
-            start = self.nav.pano                  # live tour: plan from where the tour stands
+        live_here = self.nav.pano if self.nav_live and self.nav is not None else None
+        starting = ""
+        if live_here and not force_start:
+            start = live_here                      # live tour: plan from where the tour stands
         self.route.short_hops = self.nav_live          # driven tour: pass the scan points between
         ok, msg = self.route.plan(start, place)
+        if ok and live_here and self.route.start_pano != live_here:
+            p = self.route.twin.panos[self.route.start_pano]
+            room = self.route.twin.rooms[p.room].label.lower() if p.room else "start"
+            starting = f" Starting at the {room}."        # the tour flies there with step 1
+            self.route.intro = (self.route.intro + starting).strip()
         if not ok:
             self.play_cue(haptics.target_unknown(), "nav")
         elif play:
@@ -310,6 +320,11 @@ class App:
         self.driver.moved(pano, yaw)
         self.emit({"type": "tour_move", "pano": pano, "yaw": round(yaw, 1),
                    "position": {"x": p.x, "y": p.z, "z": -p.y}})    # z-up model -> y-up tour
+        # where the tour now is (our own target): keeps 'here' and the heading fresh
+        twin = self.route.twin
+        self.emit({"type": "nav", "goal": self.route.goal, "pano": pano,
+                   "room": twin.rooms[p.room].label if p.room else None,
+                   "heading": round(heading % 360), "info": None})
 
     def _nav_pose(self, sweep, position, yaw) -> None:
         """A pose from the live tour. While a route drives the tour, our own
@@ -718,6 +733,14 @@ class App:
             if m.get("start") is not None:
                 self.route_start = str(m.get("start") or "") or None
             return self.route_go(self.route_start, str(m.get("to") or "").strip())
+        elif cmd == "route_demo":
+            demo = self._demo()
+            if not demo:
+                return {"type": "log", "text": "route: no multi-leg route in this model"}
+            self.route_start = demo["start"]
+            out = self.route_go(demo["start_pano"], demo["to"], force_start=True)
+            self.emit({"type": "route_demo", **demo})
+            return out
         elif cmd == "route_start":
             self.route_start = str(m.get("start") or "") or None
         elif cmd in ("route_play", "route_next") and self.route is not None:
@@ -970,9 +993,19 @@ class App:
             "starts": [label for label, _ in self.route.starts()] if self.route else [],
             "start": self.route_start, "brief": brief,
             "speed": self.route.speed if self.route else None,
+            "demo": self._demo(),
             "yaw_sign": self.nav.yaw_sign if self.nav is not None else None,
             "export_only": self.nav is None and self.route is None,
             "error": self.nav_info.get("error")})
+
+    def _demo(self) -> Optional[dict]:
+        if self.route is None:
+            return None
+        self.route.short_hops = self.nav_live          # plan it the way it will be played
+        key = (self.route.twin, self.nav_live)
+        if getattr(self, "_demo_cache", (None,))[0] != key:
+            self._demo_cache = (key, self.route.demo_pair())
+        return self._demo_cache[1]
 
     def _asset_dir(self) -> Optional[Path]:
         model = self.nav_info.get("model")
