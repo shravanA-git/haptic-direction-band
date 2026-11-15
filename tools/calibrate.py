@@ -3,7 +3,7 @@
   python -m tools.calibrate                 # real band, 8 positions
   python -m tools.calibrate --cardinals     # front, right, back, left only
   python -m tools.calibrate --sim           # simulated band with mismatched mics
-  python -m tools.calibrate --save          # write app/calibration.json without asking
+  python -m tools.calibrate --save          # write app/calibration.local.json without asking
   python -m tools.calibrate --reps 3        # 3 laps of 8 positions (24 claps), for learn_centroids
 
 Steps:
@@ -16,8 +16,10 @@ Steps:
      the average, measured from claps spread evenly around the head.
   4. Save: recordings/calib-HHMMSS.json (labelled trace: replayable, and
      scored by tools/eval_estimator.py and tools/trial_metrics.py) and, if
-     correction doesn't make things worse, app/calibration.json, which the
-     app loads at start for live name alerts.
+     correction doesn't make things worse, app/calibration.local.json (gitignored: it
+     describes this wearer's hat), which the app loads at start in preference to the
+     shared app/calibration.json. A clipped clap (any mic at 4095) is not counted:
+     you are told to reduce the mic gain trimmer or snap softer, and asked again.
 Close the Arduino Serial Monitor first: only one program can own the port.
 """
 from __future__ import annotations
@@ -34,7 +36,7 @@ from statistics import median
 from typing import Callable, Optional
 
 from app import direction, trace
-from app.direction import CALIBRATION_FILE
+from app.direction import CALIBRATION_LOCAL_FILE
 from app.link import Link, MicFrame, SimPort
 from tools.bench import POS_NAMES, _yes, open_link
 from tools.eval_estimator import classify, mic_gains
@@ -42,6 +44,7 @@ from tools.eval_estimator import classify, mic_gains
 ROOT = Path(__file__).resolve().parent.parent
 RECORDINGS = ROOT / "recordings"
 CHANNELS = ("front", "right", "back", "left")
+CLIP_ADC = 4090          # a channel at the 12-bit ADC ceiling (4095): the clap clipped, its direction is gone
 CLAP_EXCESS = 1.0        # mean excess over baseline (baseline units) that counts as a clap
 CLAP_MAX_MS = 400
 GAIN_LIMITS = (0.4, 2.5)
@@ -117,6 +120,20 @@ def excess(levels, base) -> list:
     return [max(v / b - 1.0, 0.0) for v, b in zip(levels, base)]
 
 
+def clap_peaks(frames: list, a: int, b: int) -> list:
+    """Per-channel peak level (front, right, back, left) of the frames in [a - 40, b + 40] ms."""
+    win = [f["levels"] for f in frames if a - 40 <= f["ms"] <= b + 40]
+    return [max(c) for c in zip(*win)] if win else [0.0] * 4
+
+
+def is_clipped(peaks: list) -> bool:
+    return max(peaks) >= CLIP_ADC
+
+
+def fmt_peaks(peaks: list) -> str:
+    return " ".join(f"{n[0].upper()}{p:.0f}" for n, p in zip(CHANNELS, peaks))
+
+
 def find_clap(frames: list, base: list) -> Optional[tuple]:
     """First loud run in frames -> (start_ms, end_ms) or None."""
     start = last = None
@@ -163,7 +180,7 @@ def compute_gains(frames: list, claps: list, base: list) -> Optional[list]:
 def score(frames: list, claps: list, gains=None) -> list:
     out = []
     for p, a, b in claps:
-        e = direction.estimate(frames, a - 40, b + 40, gains=gains)
+        e = direction.estimate(frames, a - 40, b + 40, gains=gains, min_frames=1)   # a clap is 1 frame
         out.append((p, e, classify(e.motor, p)))
     return out
 
@@ -198,9 +215,14 @@ def run_calibration(link: Link, ask: Callable[[str], str], positions, out=print,
                 on_ready(p)
             hit = wait_for_clap(col, n0, base, clap_timeout)
             if hit:
+                time.sleep(0.3)           # let the clap die down (and its tail reach the buffer)
+                peaks = clap_peaks(col.since(n0), *hit)
+                if is_clipped(peaks):     # all four mics at the ADC ceiling: no direction left in it
+                    out(f"[cal]   {POS_NAMES[p]}: CLIPPED (peaks {fmt_peaks(peaks)}). Reduce the mic gain "
+                        "trimmer or snap softer / from farther away; this clap is not counted. Again:")
+                    continue
                 claps.append((p, *hit))
-                out(f"[cal]   {POS_NAMES[p]}: clap at {hit[0]}-{hit[1]} ms")
-                time.sleep(0.25)          # let the clap die down
+                out(f"[cal]   {POS_NAMES[p]}: clap at {hit[0]}-{hit[1]} ms, peaks {fmt_peaks(peaks)}")
                 break
             out("[cal]   no clap heard: clap louder or closer, and try again")
     frames = col.since(0)
@@ -230,7 +252,7 @@ def run_calibration(link: Link, ask: Callable[[str], str], positions, out=print,
                                  for p, a, b in claps]}}
 
 
-def save_calibration(res: dict, path=CALIBRATION_FILE) -> Path:
+def save_calibration(res: dict, path=CALIBRATION_LOCAL_FILE) -> Path:
     path = Path(path)
     path.write_text(json.dumps({
         "gains": res["gains"], "channels": list(CHANNELS),
@@ -252,8 +274,9 @@ def main(argv=None, ask: Callable[[str], str] = input) -> int:
                     help="go around the positions this many times (3 gives tools/learn_centroids.py "
                          "enough to learn per-direction centroids)")
     ap.add_argument("--quiet-s", type=float, default=3.0)
-    ap.add_argument("--save", action="store_true", help="write app/calibration.json without asking")
-    ap.add_argument("--out", type=Path, default=CALIBRATION_FILE, help=argparse.SUPPRESS)
+    ap.add_argument("--save", action="store_true",
+                    help="write app/calibration.local.json (this wearer's hat) without asking")
+    ap.add_argument("--out", type=Path, default=CALIBRATION_LOCAL_FILE, help=argparse.SUPPRESS)
     ap.add_argument("--trace-dir", type=Path, default=RECORDINGS, help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
     on_ready = None

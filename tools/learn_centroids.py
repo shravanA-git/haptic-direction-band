@@ -8,7 +8,7 @@ generic front cue). No centroids file -> the analytic path, unchanged.
   python -m tools.calibrate --reps 3            # 3 laps of the 8 positions (24 claps); --cardinals for 4
   python -m tools.learn_centroids               # all recordings/calib-*.json, leave-one-out report
   python -m tools.learn_centroids recordings/calib-101500.json --save
-  python -m tools.learn_centroids --no-gains    # features without app/calibration.json
+  python -m tools.learn_centroids --no-gains    # features without the gains file
 
 --save writes app/centroids.json (gitignored: it describes one wearer's head and hat),
 but only if the leave-one-out score is at least as good as the analytic estimator's.
@@ -41,7 +41,8 @@ def gather(paths, gains) -> list:
             exp = a.get("expected")
             if not isinstance(exp, int):
                 continue
-            e = direction.estimate(t["frames"], a["startMs"], a["endMs"], gains=gains, algo="v2")
+            e = direction.estimate(t["frames"], a["startMs"], a["endMs"], gains=gains, algo="v2",
+                                   min_frames=1)           # a clap is one informative frame
             out.append((exp, e))
     return out
 
@@ -126,7 +127,7 @@ def main(argv=None) -> int:
     if not paths:
         print("no calib traces: python -m tools.calibrate --reps 3")
         return 1
-    gains = None if a.no_gains else direction.load_calibration() if direction.CALIBRATION_FILE.exists() else None
+    gains = None if a.no_gains else direction.load_calibration()      # local file first, else shared
     try:
         trials = gather(paths, gains)
     except (OSError, ValueError, KeyError) as e:

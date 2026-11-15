@@ -123,6 +123,9 @@ def describe_alert(rec: dict) -> tuple:
         return None
     w = where(rec)
     if src == "name":
+        if not w and str(rec.get("reason", "")).startswith("saturated"):
+            return ("your name was called, but the sound was too loud for the microphones to tell the "
+                    "direction", "one buzz at the front, direction unknown", False)
         return ((f"your name was called {w}" if w else "your name was called, direction unclear"),
                 "one short buzz on the side the caller was" if w else "one buzz at the front, direction unclear",
                 False)

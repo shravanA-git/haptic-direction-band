@@ -310,3 +310,9 @@ def test_app_status_carries_the_agent_counters():
     app.agent_status = lambda: {"brain": "keyword router", "received": 2}
     assert app.status()["agent"] == {"brain": "keyword router", "received": 2}
     link.close()
+
+
+def test_a_too_loud_name_call_is_explained():
+    what, meant, urgent = B.describe_alert({"source": "name", "cue": "generic", "reason": "saturated: sound too loud for the mics"})
+    assert "too loud for the microphones" in what and not urgent
+    assert B.describe_alert({"source": "name", "cue": "generic"})[0] == "your name was called, direction unclear"

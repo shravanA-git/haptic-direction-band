@@ -46,6 +46,8 @@ class Estimate:
     reason: str
     margin: float = 0.0        # v2 centroid classifier: distance gap to the runner-up (0 = analytic)
     vector: Optional[tuple] = None   # v2: mean (east, north) of the spike, the centroid feature
+    saturated: int = 0         # v2: window frames left out: the first clipped one (a mic at the ADC
+                               # ceiling) and everything after it
 
 
 def _baseline(frames: Sequence[dict], start: int, end: int):
@@ -56,14 +58,24 @@ def _baseline(frames: Sequence[dict], start: int, end: int):
     return [max(median(ch), 1e-6) for ch in zip(*quiet)]
 
 
-CALIBRATION_FILE = Path(__file__).resolve().parent / "calibration.json"
+CALIBRATION_FILE = Path(__file__).resolve().parent / "calibration.json"            # shared, Protocol-approved
+CALIBRATION_LOCAL_FILE = Path(__file__).resolve().parent / "calibration.local.json"   # this wearer's hat (gitignored)
 
 
-def load_calibration(path=CALIBRATION_FILE) -> Optional[list]:
-    """Per-channel sensitivity correction (front, right, back, left) written by
-    `python -m tools.calibrate --save`. Absent file -> None (no correction)."""
-    path = Path(path)
-    if not path.exists():
+def calibration_path() -> Optional[Path]:
+    """The gains file in use: this wearer's local one if it exists, else the shared default, else None."""
+    for p in (CALIBRATION_LOCAL_FILE, CALIBRATION_FILE):
+        if p.exists():
+            return p
+    return None
+
+
+def load_calibration(path=None) -> Optional[list]:
+    """Per-channel sensitivity correction (front, right, back, left). With no path:
+    app/calibration.local.json (written by `python -m tools.calibrate --save`, gitignored) in
+    preference to the shared app/calibration.json. No file -> None (no correction)."""
+    path = Path(path) if path is not None else calibration_path()
+    if path is None or not path.exists():
         return None
     g = json.loads(path.read_text())["gains"]
     if len(g) != 4 or not all(0.2 <= float(x) <= 5 for x in g):
@@ -227,21 +239,30 @@ CENTROID_MARGIN = 0.15    # relative gap (d2 - d1) / d2 between the nearest and 
                           # midline between two directions. Scale-free: centroids can sit close together
 CENTROIDS_FILE = Path(__file__).resolve().parent / "centroids.json"
 MOTOR_MARGIN_MS = 120     # frames this long after a motor pulse (spin-down, bleed) are skipped
+SATURATED = 3900          # a frame with any channel at or above this is clipped (ADC max 4095): its
+                          # ratios are meaningless, so it is excluded, not used
+SATURATED_REASON = "saturated: sound too loud for the mics"
+SMOOTH_MIN_FRAMES = 8     # 3-frame smoothing of the spike only for windows long enough to need it
+                          # (a 60-80 ms clap has 3-4 frames; smoothing left too few)
 
 
 def _in_spans(ms: float, spans: Sequence) -> bool:
     return any(a <= ms <= b for a, b in spans)
 
 
+def is_saturated(levels: Sequence[float]) -> bool:
+    return max(levels) >= SATURATED
+
+
 def noise_floor(frames: Sequence[dict], start_ms: int, end_ms: int, skip: Sequence = ()):
     """(median, sigma) per channel, absolute units, from the quiet frames before the name."""
-    pre = [f["levels"] for f in frames
-           if start_ms - PRE_ROLL_MS <= f["ms"] < start_ms and not _in_spans(f["ms"], skip)]
+    ok = lambda f: not _in_spans(f["ms"], skip) and not is_saturated(f["levels"])     # noqa: E731
+    pre = [f["levels"] for f in frames if start_ms - PRE_ROLL_MS <= f["ms"] < start_ms and ok(f)]
     if len(pre) < MIN_PRE_FRAMES:     # short recording: everything outside the window, then everything
-        pre = [f["levels"] for f in frames
-               if (f["ms"] < start_ms or f["ms"] > end_ms) and not _in_spans(f["ms"], skip)]
+        pre = [f["levels"] for f in frames if (f["ms"] < start_ms or f["ms"] > end_ms) and ok(f)]
         if len(pre) < 3:
-            pre = [f["levels"] for f in frames]
+            pre = [f["levels"] for f in frames if not is_saturated(f["levels"])] or \
+                  [f["levels"] for f in frames]
     med, sig = [], []
     for ch in zip(*pre):
         m = median(ch)
@@ -281,16 +302,33 @@ def classify_centroid(vec, centroids: dict, margin: float = None) -> tuple:
 
 def estimate(frames: Sequence[dict], start_ms: int, end_ms: int,
              gains: Optional[Sequence[float]] = None, centroids: Optional[dict] = None,
-             skip_ms: Sequence = (), algo: Optional[str] = None) -> Estimate:
+             skip_ms: Sequence = (), algo: Optional[str] = None,
+             min_frames: Optional[int] = None) -> Estimate:
     """Robust name direction (see the module docstring). gains: per-channel sensitivity
     correction (tools/calibrate.py), multiplies each channel's excess. centroids: {motor:
-    (east, north)} from load_centroids(); skip_ms: [(a, b)] band-clock spans when a motor was on."""
+    (east, north)} from load_centroids(); skip_ms: [(a, b)] band-clock spans when a motor was on.
+    min_frames: spike frames needed (default 2; calibration claps are one informative frame, so
+    tools/calibrate and tools/learn_centroids pass 1)."""
     if (algo or ALGORITHM) == "v1":
         return estimate_v1(frames, start_ms, end_ms, gains)
     skip = list(skip_ms)
-    win = [f for f in frames if start_ms <= f["ms"] <= end_ms and not _in_spans(f["ms"], skip)]
-    if not win:
+    in_win = [f for f in frames if start_ms <= f["ms"] <= end_ms and not _in_spans(f["ms"], skip)]
+    if not in_win:
         return Estimate(None, None, 0.0, 0.0, 0, "no frames in window (stale?)")
+    # Clipped frames carry no direction, and neither does what follows them: after a clap or shout
+    # pins the mics at 4095 the decay frames read near-equal on all four channels (real hat, Nov 14).
+    # So only frames BEFORE the first clipped one are evidence.
+    first_clip = next((f["ms"] for f in in_win if is_saturated(f["levels"])), None)
+    win = [f for f in in_win if first_clip is None or f["ms"] < first_clip]
+    nsat = len(in_win) - len(win)
+    min_frames = MIN_FRAMES if min_frames is None else max(1, int(min_frames))
+
+    def generic(reason, angle=None, snr=0.0, cons=0.0, used=0, margin=0.0, vector=None):
+        if nsat and reason in ("too few loud frames", "no frames in window (stale?)"):
+            reason = SATURATED_REASON                 # too little unclipped signal left: say why
+        return Estimate(None, angle, snr, cons, used, reason, margin, vector, nsat)
+    if not win:
+        return generic("no frames in window (stale?)")
     med, sig = noise_floor(frames, start_ms, end_ms, skip)
     g = list(gains) if gains is not None else [1.0, 1.0, 1.0, 1.0]
     ex = []                                    # per frame: gated, gain-matched excess, front/right/back/left
@@ -299,22 +337,23 @@ def estimate(frames: Sequence[dict], start_ms: int, end_ms: int,
                    for v, m, s, k in zip(f["levels"], med, sig, g)])
     tot = [sum(e) for e in ex]
     if max(tot) <= 0:
-        return Estimate(None, None, 0.0, 0.0, 0, "too few loud frames")
-    sm = [sum(tot[max(0, i - 1):i + 2]) / 3 for i in range(len(tot))]       # 3-frame smoothing
+        return generic("too few loud frames")
+    sm = ([sum(tot[max(0, i - 1):i + 2]) / 3 for i in range(len(tot))]      # 3-frame smoothing
+          if len(tot) >= SMOOTH_MIN_FRAMES else list(tot))
     peak = max(sm)
     keep = [i for i in range(len(tot)) if sm[i] >= SPIKE_FRAC * peak and tot[i] > 0]
     noise = math.sqrt(sum(s * s for s in sig))
     snr = (sum(tot[i] for i in keep) / len(keep)) / noise if keep else 0.0
-    if len(keep) < MIN_FRAMES or snr < MIN_SNR:
-        return Estimate(None, None, snr, 0.0, len(keep), "too few loud frames")
+    if len(keep) < min_frames or snr < MIN_SNR:
+        return generic("too few loud frames", snr=snr, used=len(keep))
     vec = []                                   # (x, y, weight) per spike frame
     for i in keep:
         f_, r_, b_, l_ = ex[i]
         x, y = (r_ - l_) / tot[i], (f_ - b_) / tot[i]
         if math.hypot(x, y) > 1e-6:
             vec.append((x, y, tot[i]))
-    if len(vec) < MIN_FRAMES:
-        return Estimate(None, None, snr, 0.0, len(vec), "too few loud frames")
+    if len(vec) < min_frames:
+        return generic("too few loud frames", snr=snr, used=len(vec))
     w_all = sum(w for _, _, w in vec)
     # Is there a direction at all? Coherence of the WHOLE spike, before any rejection: real calls
     # are coherent, diffuse noise and rotating peaks are not (outlier rejection must not manufacture
@@ -322,19 +361,19 @@ def estimate(frames: Sequence[dict], start_ms: int, end_ms: int,
     cx = sum(x / math.hypot(x, y) * w for x, y, w in vec) / w_all
     cy = sum(y / math.hypot(x, y) * w for x, y, w in vec) / w_all
     if math.hypot(cx, cy) < V2_MIN_CONSISTENCY:
-        return Estimate(None, math.degrees(math.atan2(cx, cy)) % 360, snr, math.hypot(cx, cy),
-                        len(vec), "conflicting directions")
+        return generic("conflicting directions", math.degrees(math.atan2(cx, cy)) % 360, snr,
+                       math.hypot(cx, cy), len(vec))
     for _ in range(2):                         # drop circular outliers around the weighted direction
         sx = sum(x * w for x, y, w in vec)
         sy = sum(y * w for x, y, w in vec)
         centre = math.degrees(math.atan2(sx, sy)) % 360
         kept = [v for v in vec if _circ_dist(math.degrees(math.atan2(v[0], v[1])) % 360, centre) <= OUTLIER_DEG]
-        if len(kept) < MIN_FRAMES:
+        if len(kept) < min_frames:
             break
         vec = kept
     agree = sum(w for _, _, w in vec) / w_all   # share of the spike that agrees; a few outliers are fine,
     if agree < 0.5:                             # but with no majority (rotating peaks) there is no direction
-        return Estimate(None, centre, snr, 0.0, len(vec), "conflicting directions")
+        return generic("conflicting directions", centre, snr, 0.0, len(vec))
     ws = []                                    # Huber weights: far-from-centre frames count less
     for x, y, w in vec:
         d = _circ_dist(math.degrees(math.atan2(x, y)) % 360, centre)
@@ -346,14 +385,14 @@ def estimate(frames: Sequence[dict], start_ms: int, end_ms: int,
     uy = sum(y / math.hypot(x, y) * w for (x, y, _), w in zip(vec, ws)) / W
     consistency = math.hypot(ux, uy) * agree     # outliers that were dropped still lower confidence
     angle = math.degrees(math.atan2(X, Y)) % 360
-    if len(vec) < MIN_FRAMES:
-        return Estimate(None, angle, snr, consistency, len(vec), "too few loud frames", 0.0, (X, Y))
+    if len(vec) < min_frames:
+        return generic("too few loud frames", angle, snr, consistency, len(vec), vector=(X, Y))
     if consistency < V2_MIN_CONSISTENCY:
-        return Estimate(None, angle, snr, consistency, len(vec), "conflicting directions", 0.0, (X, Y))
+        return generic("conflicting directions", angle, snr, consistency, len(vec), vector=(X, Y))
     if centroids:
         motor, margin = classify_centroid((X, Y), centroids)
         if motor is None:
-            return Estimate(None, angle, snr, consistency, len(vec), "ambiguous (close to two directions)",
-                            margin, (X, Y))
-        return Estimate(motor, angle, snr, consistency, len(vec), "ok", margin, (X, Y))
-    return Estimate(int(round(angle / 45)) % 8, angle, snr, consistency, len(vec), "ok", 0.0, (X, Y))
+            return generic("ambiguous (close to two directions)", angle, snr, consistency, len(vec),
+                           margin, (X, Y))
+        return Estimate(motor, angle, snr, consistency, len(vec), "ok", margin, (X, Y), nsat)
+    return Estimate(int(round(angle / 45)) % 8, angle, snr, consistency, len(vec), "ok", 0.0, (X, Y), nsat)

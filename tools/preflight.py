@@ -110,8 +110,9 @@ def check_serial(r: Report, pulse: bool) -> None:
         link.close()
     mm = ROOT / "app" / "motor_map.json"
     r.add("ok", "motor map: " + ("app/motor_map.json (remapped)" if mm.exists() else "pin map (no remap)"))
-    cal = ROOT / "app" / "calibration.json"
-    r.add("ok" if cal.exists() else "WARN", "mic calibration: " + ("app/calibration.json" if cal.exists()
+    from app.direction import calibration_path
+    cal = calibration_path() or ROOT / "app" / "calibration.json"
+    r.add("ok" if cal.exists() else "WARN", "mic calibration: " + (f"app/{cal.name}" if cal.exists()
                                                                   else "none"),
           "optional: python -m tools.calibrate (claps at 8 positions)")
 

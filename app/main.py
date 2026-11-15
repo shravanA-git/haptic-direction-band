@@ -118,10 +118,15 @@ def main(argv=None) -> int:
     app = App(link, AlertLog(alert_path), recall_mode=a.recall)
     try:
         app.live.gains = direction.load_calibration()
+        src = direction.calibration_path()
         if app.live.gains:
-            print(f"[hdb] mic calibration from app/calibration.json: gains {app.live.gains}")
+            print(f"[hdb] mic calibration from app/{src.name}: gains {app.live.gains}"
+                  + ("  (this wearer's local file)" if src == direction.CALIBRATION_LOCAL_FILE
+                     else "  (shared default; python -m tools.calibrate --save writes a local one)"))
+        else:
+            print("[hdb] no mic calibration file: channels are not gain-matched")
     except (ValueError, KeyError) as e:
-        print(f"[hdb] ignoring app/calibration.json: {e}")
+        print(f"[hdb] ignoring the mic calibration file: {e}")
     try:
         app.live.centroids = direction.load_centroids()
         if app.live.centroids:

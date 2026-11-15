@@ -164,3 +164,59 @@ def test_confusion_report_cli_shows_front_bias_before_and_after(capsys):
     assert ("frontnoise", "v1") in rows and ("frontnoise", "v2") in rows
     assert float(rows[("frontnoise", "v1")].split()[2].rstrip("%")) > 10
     assert float(rows[("frontnoise", "v2")].split()[2].rstrip("%")) <= 2
+
+
+def clap_frames(tail):
+    """A quiet hat (baselines ~115) and one clap whose frames are given: (ms, [f, r, b, l])."""
+    fs = frames(n=60, step=25, floor=[113, 117, 112, 116], jitter=4.0)
+    for ms, lv in tail:
+        for f in fs:
+            if f["ms"] == ms:
+                f["levels"] = lv
+    return fs
+
+
+def test_saturated_frames_are_not_evidence_and_the_reason_says_so():
+    # real-hat shape: the clap pins all four mics at 4095, then the decay reads near-equal on every mic
+    fs = clap_frames([(1000, [4095] * 4), (1025, [4095] * 4), (1050, [2184, 2049, 1671, 1825]),
+                      (1075, [1190, 1144, 1024, 1169]), (1100, [809, 925, 819, 968])])
+    e = estimate(fs, 975, 1200)
+    assert e.motor is None and e.reason == direction.SATURATED_REASON and e.saturated >= 2
+    # nothing after the first clipped frame is trusted, so the confident-looking decay can't make a guess
+    assert estimate(fs, 975, 1200, min_frames=1).motor is None
+
+
+def test_pre_clip_onset_frames_still_count_and_a_direction_survives_a_late_clip():
+    fs = clap_frames([(1000, [150, 700, 160, 150]), (1025, [180, 760, 170, 160]),     # onset: from the right
+                      (1050, [4095] * 4), (1075, [3000, 3000, 3000, 3000])])
+    e = estimate(fs, 975, 1200)
+    assert e.motor == 2 and e.saturated >= 2 and e.reason == "ok" and e.frames_used == 2    # clip + what follows
+
+
+def test_one_frame_claps_need_min_frames_1():
+    fs = clap_frames([(1000, [262, 825, 406, 345])])                                   # the real "right" clap
+    assert estimate(fs, 975, 1100).motor is None and estimate(fs, 975, 1100).reason == "too few loud frames"
+    e = estimate(fs, 975, 1100, min_frames=1)
+    assert e.motor in (2, 3) and e.frames_used == 1
+
+
+def test_short_windows_are_not_smoothed_away():
+    fs = clap_frames([(1000, [120, 120, 120, 120]), (1025, [500, 900, 450, 380]), (1050, [380, 700, 360, 300])])
+    assert estimate(fs, 975, 1075).motor == 2                                          # both frames kept
+
+
+def test_real_hat_calibration_trace_if_present():
+    from pathlib import Path
+    p = Path("recordings/calib-204853.json")
+    if not p.exists():
+        pytest.skip("real calibration trace not on this machine")
+    t = trace.load(p)
+    sat = got = 0
+    for a in t["alerts"]:
+        e = estimate(t["frames"], a["startMs"], a["endMs"], min_frames=1)
+        if e.reason == direction.SATURATED_REASON:
+            sat += 1
+            assert e.motor is None                          # never a guess from clipped frames
+        elif e.motor is not None and min((e.motor - a["expected"]) % 8, (a["expected"] - e.motor) % 8) <= 1:
+            got += 1
+    assert sat >= 5 and got >= 3

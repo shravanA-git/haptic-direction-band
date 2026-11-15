@@ -28,3 +28,6 @@ tools/photon/.cursor.json
 
 # per-wearer name-direction centroids (tools/learn_centroids.py)
 app/centroids.json
+
+# per-wearer mic gains (tools/calibrate.py --save); the shared app/calibration.json stays Protocol-approved
+app/calibration.local.json
