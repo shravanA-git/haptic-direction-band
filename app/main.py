@@ -227,7 +227,16 @@ def main(argv=None) -> int:
         app.nav_factory = start_nav
         try:
             model = load_model(a.nav, a.nav_file, False)
-            start_nav(build_twin(model), model)
+            twin = build_twin(model)
+            if a.nav:
+                from tools.costar_nav import apply_labels
+                from tools.label_places import load_labels, summary
+                labels = load_labels(a.nav)
+                if labels:     # AI room labels (tools/label_places) + manual fixes
+                    apply_labels(twin, labels)
+                    print("[hdb] nav: " + summary(labels).splitlines()[0])
+            app.nav_model = model
+            start_nav(twin, model)
         except (NavError, OSError, ValueError, KeyError) as e:
             print(f"[hdb] nav: model not loaded ({e})")
             if a.nav:   # the tour may still be public: export its sweep graph from /nav

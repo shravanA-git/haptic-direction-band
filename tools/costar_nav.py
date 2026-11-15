@@ -305,6 +305,7 @@ class Room:
     label: str
     floor: str | None
     segs: list[Seg] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)   # signage, e.g. "room 101" (AI labels)
 
 
 @dataclass
@@ -315,6 +316,7 @@ class Twin:
     walls: dict[str | None, list[Seg]]   # floor id -> wall segments
     links: dict[str, list[tuple[str, float]]]
     edge_types: dict[str, int] = field(default_factory=dict)   # type -> count (diagnostics)
+    floors: dict[str, int] = field(default_factory=dict)       # floor id -> number (1, 2, ...)
 
 
 def build_twin(model: dict) -> Twin:
@@ -410,7 +412,31 @@ def build_twin(model: dict) -> Twin:
         for i, a in enumerate(plist):
             for b in plist[i + 1:]:
                 try_link(a, b, MAX_LINK_M)
-    return Twin(model.get("name") or model.get("id", "?"), panos, rooms, walls, links, edge_types)
+    floor_no = {}
+    for k, fl in enumerate(model.get("floors") or [], 1):
+        digits = "".join(ch for ch in str(fl.get("label") or "") if ch.isdigit())
+        floor_no[fl.get("id")] = int(digits) if digits else k
+    return Twin(model.get("name") or model.get("id", "?"), panos, rooms, walls, links, edge_types,
+                floor_no)
+
+
+def apply_labels(twin: Twin, labels: dict | None) -> Twin:
+    """AI labels (tools/label_places) override the scan's rooms: each destination
+    ('Lecture hall (floor 2)') becomes a room holding its scan points, with any
+    signage it read as searchable aliases ('room 101'). Manual fixes included."""
+    if not labels:
+        return twin
+    for k, d in enumerate(labels.get("destinations") or []):
+        rid = f"ai:{k}"
+        aliases = [d.get("place", "")] + [str(x) for x in d.get("signs") or []]
+        aliases += [f"room {''.join(c for c in s if c.isdigit())}" for s in d.get("signs") or []
+                    if any(c.isdigit() for c in s)]
+        floor = next((twin.panos[p].floor for p in d.get("panos") or [] if p in twin.panos), None)
+        twin.rooms[rid] = Room(rid, d["name"], floor, [], [a for a in aliases if a])
+        for p in d.get("panos") or []:
+            if p in twin.panos:
+                twin.panos[p].room = rid
+    return twin
 
 
 def find_pano(twin: Twin, ref: str) -> Pano:
@@ -431,7 +457,17 @@ def goal_panos(twin: Twin, target: str) -> set[str]:
     if not t:
         return set()
     keys = {t, t[:-1]} if len(t) > 3 and t.endswith("s") else {t}
-    room_ids = {r.id for r in twin.rooms.values() if any(k in r.label.lower() for k in keys)}
+    digits = "".join(c for c in t if c.isdigit())
+
+    def hit(r) -> bool:
+        if any(k in r.label.lower() for k in keys):
+            return True
+        al = [a.lower() for a in r.aliases]
+        if any(k == a or k in a for k in keys for a in al):
+            return True
+        # 'room 101' / '101' against signage that read e.g. 'Room 101' or '101A'
+        return bool(digits) and any(digits == "".join(c for c in a if c.isdigit()) for a in al)
+    room_ids = {r.id for r in twin.rooms.values() if hit(r)}
     return {p.id for p in twin.panos.values() if p.room in room_ids}
 
 

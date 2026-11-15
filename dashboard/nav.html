@@ -93,6 +93,13 @@
       <button id="next">Next step</button>
       <button id="rstop">■ Stop</button>
     </div>
+    <div id="fixbox" style="display:none;margin:10px 0">
+      <h2>This spot</h2>
+      <div id="spotlabel" class="dim">–</div>
+      <div class="row"><select id="fixplace"></select>
+        <input id="fixname" placeholder="better name (optional)">
+        <button id="fixsave" title="save a correction for this scan point (kept with the AI labels)">Fix label</button></div>
+    </div>
     <div class="dim">Or hold Action and say "take me to the kitchen": it plans and plays.
       Name and sound alerts interrupt; nothing is spoken while Action is held.</div>
   </div>
@@ -125,7 +132,28 @@ const KEY = new URLSearchParams(location.search).get("k");
 const withKey = (u, sep) => KEY ? `${u}${sep}k=${encodeURIComponent(KEY)}` : u;
 let ws, lastSent = {sweep: null, yaw: null, t: 0};
 let cfg = {}, sweeps = {}, floors = {}, rooms = {}, currentSweep = null, labels = {}, route = null;
-let sdk = null;
+let sdk = null, labelsByPano = {}, curPano = null;
+async function loadLabels() {
+  try {
+    const j = await (await fetch(withKey("/nav/labels", "?"))).json();
+    labelsByPano = j.panos || {};
+    if (Object.keys(labelsByPano).length) {
+      $("fixbox").style.display = "block";
+      $("fixplace").innerHTML = "";
+      for (const p of j.places || []) { const o = document.createElement("option"); o.value = o.textContent = p; $("fixplace").appendChild(o); }
+    }
+  } catch (e) {}
+  showSpot();
+}
+function setSpot(pano) { if (pano && pano !== curPano) { curPano = pano; showSpot(); } }
+function showSpot() {
+  const l = labelsByPano[curPano];
+  if (!l) { $("spotlabel").textContent = curPano ? "no AI label for this scan point" : "–"; return; }
+  $("spotlabel").textContent = `${l.place} · ${Math.round(100 * (l.confidence || 0))}%` +
+    (l.manual ? " (fixed by hand)" : l.smoothed ? " (from neighbours)" : "") +
+    (l.name ? ` – ${l.name}` : "") + ((l.signs || []).length ? ` · signs: ${l.signs.join(", ")}` : "");
+  $("fixplace").value = l.place;
+}
 const isLive = () => cfg.mode === "live";
 const startValue = () => isLive() ? "" : $("start").value;
 function focusTour() { if (isLive()) { const t = $("tour"); t.focus(); try { t.contentWindow.focus(); } catch (e) {} } }
@@ -202,7 +230,9 @@ function showRoute(m) {
   arr.textContent = `arrive: ${m.goal}`;
   if (m.event === "arrived") arr.className = "cur";
   ol.appendChild(arr);
+  if (m.event === "planned") setSpot(m.start);
   if (m.event === "step") {
+    setSpot(m.steps[m.current] ? m.steps[m.current].pano : null);
     $("step").textContent = m.text; drawRing(m.motor);
     const nxt = m.steps[m.current];
     showView(nxt ? nxt.pano : null);
@@ -244,6 +274,11 @@ $("play").onclick = () => { send({cmd: "route_play"}); focusTour(); };
 $("speed").onchange = () => send({cmd: "route_speed", speed: $("speed").value});
 $("next").onclick = () => { send({cmd: "route_next"}); focusTour(); };
 $("rstop").onclick = () => send({cmd: "route_stop"});
+$("fixsave").onclick = () => {
+  if (!curPano) { log("fix label: plan or walk to a spot first"); return; }
+  send({cmd: "label_fix", pano: curPano, place: $("fixplace").value, name: $("fixname").value.trim()});
+  $("fixname").value = "";
+};
 
 // ------------------------------------------------------------ live tour + export
 function showNamed() {
@@ -356,7 +391,9 @@ function connectWs() {
   ws = new WebSocket(withKey(`ws://${location.host}/ws`, "?"));
   ws.onmessage = ev => {
     const m = JSON.parse(ev.data);
-    if (m.type === "route_demo") {
+    if (m.type === "labels_changed") {
+      log("labels updated"); setTimeout(() => location.reload(), 300);
+    } else if (m.type === "route_demo") {
       if (!isLive()) $("start").value = m.start;
     } else if (m.type === "tour_move") {
       tourMove(m);
@@ -364,6 +401,7 @@ function connectWs() {
       showRoute(m);
       if (m.event === "step" || m.event === "arrived") log(m.text);
     } else if (m.type === "nav") {
+      setSpot(m.pano);
       $("where").textContent = `here: ${m.room || "?"}` + (m.goal ? ` → ${m.goal}` : "");
       if (m.heading != null) $("facing").textContent = `tour heading ${m.heading}° (model)`;
       if (m.info) { $("step").textContent = m.info; drawRing(m.info === "arrived" ? 0 : null); log(m.info); }
@@ -392,8 +430,13 @@ async function main() {
   if (cfg.start) $("start").value = cfg.start;
   const sp = {0.6: "slow", 0.8: "normal", 1.5: "demo"}[cfg.speed];
   if (sp) $("speed").value = sp;
+  const dests = (cfg.labels && cfg.labels.destinations) || [];
+  const conf = {};
+  for (const d of dests) conf[d.name] = d;
   for (const r of cfg.rooms || []) {
-    const b = document.createElement("button"); b.textContent = r;
+    const b = document.createElement("button"); const d = conf[r];
+    b.textContent = d ? `${r} · ${Math.round(100 * d.confidence)}%` : r;
+    if (d) b.title = `AI label (${cfg.labels.by}): ${d.about}` + (d.signs.length ? ` · signs: ${d.signs.join(", ")}` : "") + ` · ${d.n} scan points`;
     b.onclick = () => { send({cmd: "route_plan", start: startValue(), to: r}); focusTour(); };
     $("rooms").appendChild(b);
   }
@@ -404,6 +447,7 @@ async function main() {
     $("rooms").prepend(b);
   }
   showBrief();
+  loadLabels();
   connectWs();
   if (cfg.mode === "export") {
     $("where").innerHTML = '<span class="warn">The Model API can\'t load this tour' +

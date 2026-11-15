@@ -129,6 +129,7 @@ class App:
         self.nav_info: dict = {}
         self.nav_factory = None          # main: twin -> start a NavGuide (after a tour export)
         self.route = None                # app.nav.RoutePlayer: plan once, play the route
+        self.nav_model: Optional[dict] = None   # the Model API dict (rebuild after label fixes)
         self.route_start: Optional[str] = None
         self.brief: dict = {}
         self.costar: Optional[dict] = None   # tools.costar_kit cache: property + tenants
@@ -297,6 +298,10 @@ class App:
             start = live_here                      # live tour: plan from where the tour stands
         self.route.short_hops = self.nav_live          # driven tour: pass the scan points between
         ok, msg = self.route.plan(start, place)
+        if not ok and msg.startswith("that's on"):         # another floor, no stairs labelled
+            text = msg[0].upper() + msg[1:].split(" (")[0] + "."
+            self.route.announce(text, haptics.target_unknown())
+            return {"type": "log", "text": prefix + "route: " + msg}
         if ok and live_here and self.route.start_pano != live_here:
             p = self.route.twin.panos[self.route.start_pano]
             room = self.route.twin.rooms[p.room].label.lower() if p.room else "start"
@@ -741,6 +746,8 @@ class App:
             out = self.route_go(demo["start_pano"], demo["to"], force_start=True)
             self.emit({"type": "route_demo", **demo})
             return out
+        elif cmd == "label_fix":
+            return self.label_fix(m.get("pano") or "", m.get("place") or "", m.get("name") or "")
         elif cmd == "route_start":
             self.route_start = str(m.get("start") or "") or None
         elif cmd in ("route_play", "route_next") and self.route is not None:
@@ -980,7 +987,10 @@ class App:
             return web.json_response({"error": "navigation is off"}, status=404)
         import os
         twin = self.nav.twin if self.nav is not None else (self.route.twin if self.route else None)
-        rooms = sorted({r.label for r in twin.rooms.values() if r.label != "Void"}) if twin else []
+        used = {p.room for p in twin.panos.values()} if twin else set()
+        rooms = sorted({r.label for r in twin.rooms.values()
+                        if r.label != "Void" and r.id in used}) if twin else []
+        labels = self._labels()
         brief = {k: self.brief.get(k) for k in ("name", "address", "facts", "aerial", "preview")}
         if self.costar:
             brief["costar"] = self.briefing_line()
@@ -996,6 +1006,11 @@ class App:
             "demo": self._demo(),
             "yaw_sign": self.nav.yaw_sign if self.nav is not None else None,
             "export_only": self.nav is None and self.route is None,
+            "labels": None if not labels else {
+                "by": labels.get("labeller"),
+                "destinations": [{k: d.get(k) for k in ("name", "place", "floor", "confidence",
+                                                         "signs", "about")} | {"n": len(d["panos"])}
+                                 for d in labels.get("destinations") or []]},
             "error": self.nav_info.get("error")})
 
     def _demo(self) -> Optional[dict]:
@@ -1006,6 +1021,39 @@ class App:
         if getattr(self, "_demo_cache", (None,))[0] != key:
             self._demo_cache = (key, self.route.demo_pair())
         return self._demo_cache[1]
+
+    def _labels(self) -> Optional[dict]:
+        model = self.nav_info.get("model")
+        if not model:
+            return None
+        from tools.label_places import load_labels
+        return load_labels(model)
+
+    async def nav_labels(self, request):
+        """AI place labels per scan point (manual fixes win), for the /nav page."""
+        from tools.label_places import PLACES, effective
+        data = self._labels()
+        return web.json_response({"panos": effective(data) if data else {}, "places": PLACES})
+
+    def label_fix(self, pano: str, place: str, name: str = "") -> dict:
+        """A correction typed on /nav: saved with the labels (survives re-runs),
+        then the routable rooms are rebuilt from it."""
+        model_id = self.nav_info.get("model")
+        if not model_id or self.route is None:
+            return {"type": "log", "text": "labels: no model"}
+        from tools.costar_nav import apply_labels, build_twin
+        from tools.label_places import set_manual
+        try:
+            data = set_manual(model_id, str(pano), str(place), str(name or ""))
+        except ValueError as e:
+            return {"type": "log", "text": f"labels: {e}"}
+        twin = apply_labels(build_twin(self.nav_model), data)
+        for g in (self.route, self.nav):
+            if g is not None:
+                g.twin = twin
+        self._demo_cache = (None, None)
+        self.emit({"type": "labels_changed"})
+        return {"type": "log", "text": f"labels: scan point {pano} is now '{name or place}'"}
 
     def _asset_dir(self) -> Optional[Path]:
         model = self.nav_info.get("model")
@@ -1200,6 +1248,7 @@ class App:
         app.router.add_get("/nav/config", self.nav_config)
         app.router.add_post("/nav/export", self.nav_export)
         app.router.add_get("/nav/asset/{name}", self.nav_asset)
+        app.router.add_get("/nav/labels", self.nav_labels)
         app.router.add_get("/nav/pano/{pano}", self.nav_pano)
         app.router.add_get("/nav/pano/{pano}/{face}", self.nav_pano)
 

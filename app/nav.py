@@ -312,6 +312,8 @@ class RoutePlayer:
         self.steps: list = []
         self.texts: list = []
         self.intro = ""             # spoken once with the first step (arrival briefing)
+        self.notice = ""            # e.g. "That's on floor 3; take the stairs." (with step 1)
+        self._arrive = ""
         self._intro_due = False
         self.goal: Optional[str] = None
         self.start_pano: Optional[str] = None
@@ -354,10 +356,20 @@ class RoutePlayer:
             rooms = sorted({r.label for r in self.twin.rooms.values() if r.label != "Void"})
             return False, f"no room like '{goal}' (rooms: {', '.join(rooms) or 'none'})"
         steps, legs = [], []
+        self.notice, self._arrive = "", ""
         if a.id not in goals:
             path = shortest_path(self.twin, a.id, goals, 2.0 if self.short_hops else 1.0)
             if not path:
-                return False, f"no walkable route to {goal}"
+                other = self._other_floor(a, goals)
+                if other is None:
+                    return False, f"no walkable route to {goal}"
+                floor_text, path = other
+                if path is None:
+                    return False, f"{floor_text} (no stairs or elevator labelled on this floor)"
+                self.notice = floor_text[0].upper() + floor_text[1:] + "."
+                end = self.twin.panos[path[-1]]
+                where = self.twin.rooms[end.room].label.lower() if end.room else "stairs"
+                self._arrive = f"You're at the {where}. {self.notice}"
             steps = route_steps(self.twin, path, None)
             legs = self._legs(path, steps)
         here = self.twin.rooms[a.room].label if a.room else None
@@ -371,7 +383,31 @@ class RoutePlayer:
             self._intro_due, self._skip = True, 0
         self._status("planned")
         total = sum(s.metres for s in steps)
+        if self.notice:
+            return True, f"{self.notice[:-1]}: {len(steps)} steps, {total:.0f} m to the stairs"
         return True, f"{len(steps)} steps, {total:.0f} m to the {goal}"
+
+    def _other_floor(self, a, goals) -> Optional[tuple]:
+        """Routes stay on one floor (no stairs in the scan data). If the goal is on
+        another floor: ("that's on floor 2; take the stairs", route to the nearest
+        stairs/elevator on this floor, or None if none is labelled)."""
+        goal_floors = {self.twin.panos[g].floor for g in goals} - {None}
+        if not a.floor or not goal_floors or a.floor in goal_floors:
+            return None
+        nos = sorted(self.twin.floors.get(f, 0) for f in goal_floors)
+        fl = f"floor {nos[0]}" if nos and nos[0] else "another floor"
+        lifts = {p.id for p in self.twin.panos.values() if p.floor == a.floor and p.room
+                 and any(w in self.twin.rooms[p.room].label.lower() for w in ("stair", "elevator"))}
+        best = None
+        for target in lifts:
+            path = shortest_path(self.twin, a.id, {target})
+            if path:
+                d = sum(_dist(self.twin, u, v) for u, v in zip(path, path[1:]))
+                if best is None or d < best[0]:
+                    best = (d, path)
+        word = "the stairs" if not best or "stair" in self.twin.rooms[
+            self.twin.panos[best[1][-1]].room].label.lower() else "the elevator"
+        return f"that's on {fl}; take {word}", (best[1] if best else None)
 
     def announce(self, text: str, cue: Optional[list] = None) -> None:
         """Say something instead of a route (e.g. the tenant is on another floor):
@@ -445,6 +481,8 @@ class RoutePlayer:
         return best[1] if best else None
 
     def arrival_text(self) -> str:
+        if getattr(self, "_arrive", ""):
+            return self._arrive
         room = self.steps[-1].room if self.steps else self.goal
         return f"You've arrived at the {str(room or self.goal).lower()}."
 
@@ -575,8 +613,8 @@ class RoutePlayer:
             return
         if self._intro_due:
             self._intro_due = False
-            if self.intro:
-                text = f"{self.intro} {text}"
+            notice = getattr(self, "notice", "")
+            text = " ".join(t for t in (self.intro, notice, text) if t)
         self.speak(text)
 
     def _ensure_thread(self) -> None:
