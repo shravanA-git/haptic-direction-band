@@ -162,7 +162,7 @@ class LiveEstimator:
     the generic attention cue.
     """
 
-    def __init__(self, keep_ms: int = 8000, pad_ms: int = 100, stale_s: float = 1.0,
+    def __init__(self, keep_ms: int = 30000, pad_ms: int = 100, stale_s: float = 1.0,
                  clock: Optional[ClockSync] = None, gains: Optional[Sequence[float]] = None,
                  centroids: Optional[dict] = None):
         self.keep_ms, self.pad_ms, self.stale_s = keep_ms, pad_ms, stale_s

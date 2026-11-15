@@ -657,7 +657,7 @@ class OpenVocab:
 class Vision:
     def __init__(self, camera=0, mirror: bool = False, weights: str = None,
                  imgsz: int = None, config: Optional[TrackerConfig] = None,
-                 max_fps: float = 15.0, log_path: Optional[str] = None,
+                 max_fps: float = 10.0, log_path: Optional[str] = None,
                  record_path: Optional[str] = None):
         self.camera = camera
         self.log_path = log_path  # per-frame CSV for tuning dead band / lost timing
@@ -786,11 +786,18 @@ class Vision:
                               "Camera, then quit and reopen the terminal; or try --camera 1)",
                               strict)
         self.error = None
+        try:        # the detector runs on the GPU (MPS); don't let torch's CPU pools fight whisper's
+            import torch
+            torch.set_num_threads(2)
+        except Exception:
+            pass
         self._running = True
         self._thread = threading.Thread(target=self._loop, args=(cap,), name="vision",
                                         daemon=True)
         self._thread.start()
-        if open_vocab_ready() is None and os.environ.get("HDB_OPEN_VOCAB_PRELOAD", "1") != "0":
+        # Off by default: loading YOLOE + the text encoder (~10 s of all-core CPU) at startup
+        # slowed name decoding 2-3x for the first minute. It loads on the first non-COCO target.
+        if open_vocab_ready() is None and os.environ.get("HDB_OPEN_VOCAB_PRELOAD", "0") == "1":
             threading.Thread(target=self._warm_open_vocab, name="open-vocab-load",
                              daemon=True).start()
         return True
@@ -836,7 +843,22 @@ class Vision:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         return cap
 
+    IDLE_FPS = 3.0     # no find target: no inference at all, the camera just ticks over for the preview
+
+    def _drain(self, cap, seconds: float) -> None:
+        """Wait out the rest of a frame period by discarding camera frames (cheap grabs), so the next
+        read is fresh instead of the oldest buffered frame."""
+        end = time.monotonic() + seconds
+        while self._running and time.monotonic() < end:
+            if not cap.grab():
+                time.sleep(0.01)
+
     def _loop(self, cap) -> None:
+        from . import priority
+        # Idle (no target): efficiency cores, so the preview never competes with whisper. With a target:
+        # normal priority: utility threads get coalesced, late timer wake-ups (a 33 ms wait took ~100 ms),
+        # which capped a 10 fps loop near 4 fps and made the hot/cold pulses sluggish.
+        qos = None
         period = 1.0 / self.max_fps if self.max_fps else 0
         last = time.monotonic()
         is_file = isinstance(self.camera, str) and not self.camera.isdigit()
@@ -888,8 +910,16 @@ class Vision:
                 # Pace from the start of this iteration (the old code measured from
                 # before the previous sleep, so it ran at ~2x max_fps when idle).
                 work = time.monotonic() - tick
-                if period and work < period:
-                    time.sleep(period - work)
+                want = "default" if target else "utility"
+                if want != qos:
+                    qos = want
+                    priority.set_thread_qos(want)
+                eff = period if target else 1.0 / self.IDLE_FPS      # 8-10 fps with a target, ~3 idle
+                if eff and work < eff:
+                    if is_file:
+                        time.sleep(eff - work)
+                    else:
+                        self._drain(cap, eff - work)
                 now = time.monotonic()
                 dt = now - last
                 self.fps = 0.8 * self.fps + 0.2 * (1.0 / dt if dt > 0 else 0)

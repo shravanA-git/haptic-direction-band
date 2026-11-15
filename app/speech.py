@@ -208,6 +208,8 @@ class Transcriber:
         with self._lock:
             if self._model is None:
                 from faster_whisper import WhisperModel
+                from . import priority
+                priority.set_thread_qos("initiated")   # whisper's thread pool inherits this from the loader
                 MODELS_DIR.mkdir(parents=True, exist_ok=True)
                 self._model = WhisperModel(self.model_name, device="cpu",
                                            compute_type="int8",
@@ -494,6 +496,8 @@ class NameListener:
     WINDOW_S = 2.0
     OFFSET_WINDOW_S = 5.0   # audio-clock offset is the min over this many seconds (re-syncs after dropped samples)
     HOP_S = 0.5
+    DUTY_MAX = 0.4         # decoding may use at most this share of the time while the room is audible:
+    HOP_MAX_S = 1.2        # the hop stretches (up to HOP_MAX_S) when a decode takes longer than DUTY_MAX x hop
     ACTIVE_TAIL_S = 1.0    # keep decoding this long after the last loud frame
     MIN_START_RMS = 0.003  # absolute floor for "someone is talking"
     FLOOR_S = 30.0         # noise floor = 10th percentile of frame RMS over this long
@@ -550,6 +554,15 @@ class NameListener:
         self._reset_buf()
 
     # ---- public ----
+    def hop_s(self) -> float:
+        """Seconds between decodes: HOP_S, stretched so decoding takes at most DUTY_MAX of the time
+        (a 0.46 s decode every 0.5 s was ~92% duty, ~90-300% CPU in any room that stays audible).
+        Self-regulating, never beyond HOP_MAX_S, so a name is still reported within ~HOP_MAX_S + a decode."""
+        if not self._decode_s:
+            return self.HOP_S
+        recent = list(self._decode_s)[-8:]
+        return min(self.HOP_MAX_S, max(self.HOP_S, (sum(recent) / len(recent)) / self.DUTY_MAX))
+
     def timing(self) -> dict:
         """Why is a name late? Seconds a window waited for the decoder, how long a decode took,
         and name-end-to-report latency, over the last 50 (p50 / p95), plus drop counts."""
@@ -557,6 +570,7 @@ class NameListener:
             v = sorted(d)
             return round(v[min(len(v) - 1, int(round(q * (len(v) - 1))))], 2) if v else None
         return {"decodes": self.decodes, "dropped": self.dropped, "hits": len(self._latencies),
+                "hop_s": round(self.hop_s(), 2),
                 "wait_p50": pct(self._waits, .5), "wait_p95": pct(self._waits, .95),
                 "decode_p50": pct(self._decode_s, .5), "decode_p95": pct(self._decode_s, .95),
                 "latency_p50": pct(self._latencies, .5), "latency_p95": pct(self._latencies, .95),
@@ -682,11 +696,11 @@ class NameListener:
         self.noise_floor = floor
         if rms > max(self.ACTIVE_RATIO * floor, self.MIN_START_RMS):
             if self._last_loud is None:          # talking starts: first decode one hop in
-                self._next_hop = self._n + int(self.HOP_S * SAMPLE_RATE)
+                self._next_hop = self._n + int(self.hop_s() * SAMPLE_RATE)
             self._last_loud = self._n
         if self._last_loud is None or self._n < self._next_hop:
             return
-        self._next_hop = self._n + int(self.HOP_S * SAMPLE_RATE)
+        self._next_hop = self._n + int(self.hop_s() * SAMPLE_RATE)
         if self._n - self._last_loud > self.ACTIVE_TAIL_S * SAMPLE_RATE:
             self._last_loud = None               # quiet again: stop decoding
             return
@@ -711,6 +725,8 @@ class NameListener:
             self._worker.start()
 
     def _work(self) -> None:
+        from . import priority
+        priority.set_thread_qos("initiated")     # the decoder wins any CPU contention with vision
         try:
             self.warmup()
         except Exception as e:
