@@ -30,10 +30,10 @@ HDB-Software and HDB-Deep edit the shared checkout `hdb/` (branch
 work. Test the released code in a throwaway worktree:
 
 ```bash
-cd /Users/shravan_anand/cowork_workspace/HackPrincetonNew/hdb
+cd <path-to-repo>
 git fetch -q
 git worktree add -f --detach /tmp/hdb-ctl origin/main 2>/dev/null || git -C /tmp/hdb-ctl checkout -q --detach origin/main
-cd /tmp/hdb-ctl && /Users/shravan_anand/cowork_workspace/HackPrincetonNew/hdb/.venv/bin/python -m pytest -q
+cd /tmp/hdb-ctl && <path-to-repo>/.venv/bin/python -m pytest -q
 ```
 
 Use a different path from the supervisor's `/tmp/hdb-main`.
