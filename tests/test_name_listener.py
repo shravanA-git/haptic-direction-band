@@ -189,3 +189,23 @@ def test_garbled_real_call_is_not_mistaken_for_a_sound_alike():
     model = SoundAlikeModel("Soften")   # not a name: the real call stands
     _, hits, _ = listen(audio_with([(1.5, 2.0, 0.3)]), model)
     assert len(hits) == 1 and hits[0].name == "Shravan"
+
+
+def test_audio_clock_resyncs_after_dropped_samples():
+    """A busy CPU (model loads, camera inference) makes PortAudio drop samples, so the sample counter
+    falls behind real time. A forever-minimum offset kept the early value and put every later name
+    window seconds in the past, outside the band-frame history ('no frames in window' -> generic
+    front buzz). The offset must follow the stream again once the old callbacks age out."""
+    nl = NameListener(["Max"], transcriber=NS(load=lambda: FakeModel()))
+    nl.paused = True                                  # only the clock matters here
+    block = np.zeros(SR // 10, np.float32)            # 100 ms
+    t = 1000.0
+    for _ in range(20):                               # 2 s of healthy audio: sample n is at t0 + n/SR
+        nl.feed(block, t_first=t)
+        t += 0.1
+    t += 8.0                                          # the CPU stalls: 8 s of audio never arrives
+    for _ in range(80):                               # 8 s of healthy audio again
+        nl.feed(block, t_first=t)
+        t += 0.1
+    n_now = nl._n
+    assert abs(nl._t(n_now) - t) < 0.3                # the timeline is back in step with the clock

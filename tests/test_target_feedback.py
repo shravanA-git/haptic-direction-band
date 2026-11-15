@@ -53,8 +53,8 @@ def test_spoken_target_gets_ack_and_unknowns_get_distinct_cue():
     sent, log = run([R(text="Find the banana.", target="banana", error=None),
                      R(text="Find my glasses.", target=None, error=None),
                      R(text="", target=None, error="too short")])
-    assert sent == ACK + UNK + UNK
-    assert log == [("ack", None), ("unknown", "no known object"), ("unknown", "too short")]
+    assert sent == ACK + UNK                 # silence ("too short") says so on the dashboard, no buzz
+    assert log == [("ack", None), ("unknown", "no known object")]
     assert set(ACK).isdisjoint(UNK)
 
 

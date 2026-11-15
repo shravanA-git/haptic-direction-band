@@ -173,7 +173,7 @@ def test_action_drives_speech_and_spoken_target_reaches_vision():
             m = await _collect(ws, lambda m: m["type"] == "log" and "no known object" in m["text"])
             assert fv.target == "cell phone"             # typed/previous target kept
             sp.on_result(R(text="", target=None, error="too short"))
-            await _collect(ws, lambda m: m["type"] == "log" and "too short" in m["text"])
+            await _collect(ws, lambda m: m["type"] == "log" and "didn't hear anything" in m["text"])
             await ws.close()
         link.close()
 
@@ -246,3 +246,88 @@ def test_lan_token_cookie_manifest_and_icons():
         link.close()
 
     asyncio.run(run())
+
+
+class CancelSpeech(FakeSpeech):
+    def __init__(self):
+        super().__init__()
+        self.cancelled = 0
+
+    def cancel(self):
+        self.cancelled += 1
+
+
+def _tap_app(clock):
+    """App with a fake vision/guide/speech and a controllable clock for tap-vs-hold timing."""
+    from app import haptics, server
+    from app.guide import ObjectGuide
+
+    port = SimPort()
+    link = Link(port).start()
+    app = App(link)
+    fv, sp = FakeVision(), CancelSpeech()
+    pulses = []
+    app.attach_vision(fv, ObjectGuide(lambda cue: pulses.append(cue)))
+    app.attach_speech(sp)
+    server.time = type("T", (), {"monotonic": staticmethod(lambda: clock[0]), "time": time.time, "sleep": time.sleep})
+    return app, fv, sp, link, pulses
+
+
+def test_tap_confirms_found_stops_the_search_and_discards_the_recording():
+    clock = [100.0]
+    app, fv, sp, link, pulses = _tap_app(clock)
+    import app.server as server
+    real = server.time
+    try:
+        fv.target = "cup"
+        app._action(True)
+        clock[0] += 0.15                                   # a 150 ms tap
+        app._action(False)
+        assert fv.target is None                          # the camera looks for nothing now
+        assert sp.cancelled == 1 and sp.presses == [True]  # no transcription, no on_button(False)
+        assert "found (confirmed by tap)" in app.state["object"]
+        assert any(a["cue"] == "found" and a.get("confirmed") == "tap" for a in app.alerts.recent())
+    finally:
+        server.time = time
+        link.close()
+
+
+def test_hold_keeps_hold_to_talk_and_a_tap_without_a_search_does_nothing():
+    import app.server as server
+    clock = [200.0]
+    app, fv, sp, link, pulses = _tap_app(clock)
+    try:
+        fv.target = "cup"
+        app._action(True)
+        clock[0] += 1.2                                    # a real hold
+        app._action(False)
+        assert fv.target == "cup" and sp.presses == [True, False] and sp.cancelled == 0
+
+        fv.target = None                                   # no search running
+        n_alerts = len(app.alerts.recent())
+        app._action(True)
+        clock[0] += 0.1
+        app._action(False)
+        assert sp.cancelled == 1 and len(app.alerts.recent()) == n_alerts   # silent: no cue, no 'unknown object'
+        assert fv.target is None
+    finally:
+        server.time = time
+        link.close()
+
+
+def test_double_tap_found_once_then_nothing():
+    import app.server as server
+    clock = [300.0]
+    app, fv, sp, link, pulses = _tap_app(clock)
+    try:
+        fv.target = "cup"
+        for _ in range(2):
+            app._action(True)
+            clock[0] += 0.1
+            app._action(False)
+            clock[0] += 0.3
+        found = [a for a in app.alerts.recent() if a["cue"] == "found" and a.get("confirmed") == "tap"]
+        assert len(found) == 1 and fv.target is None
+    finally:
+        server.time = time
+        link.close()

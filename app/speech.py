@@ -306,6 +306,20 @@ class Speech:
         if sum(len(c) for c in self._chunks) < MAX_SECONDS * SAMPLE_RATE:
             self._chunks.append(indata[:, 0].copy())
 
+    def cancel(self) -> None:
+        """Stop recording and throw the audio away (a tap on the pad is a click, not a command)."""
+        with self._lock:
+            if not self.recording:
+                return
+            self.recording = False
+            stream, self._stream = self._stream, None
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            pass
+        self._chunks = []
+
     def end(self) -> None:
         with self._lock:
             if not self.recording:
@@ -478,6 +492,7 @@ class NameListener:
 
     FRAME = 480            # 30 ms at 16 kHz
     WINDOW_S = 2.0
+    OFFSET_WINDOW_S = 5.0   # audio-clock offset is the min over this many seconds (re-syncs after dropped samples)
     HOP_S = 0.5
     ACTIVE_TAIL_S = 1.0    # keep decoding this long after the last loud frame
     MIN_START_RMS = 0.003  # absolute floor for "someone is talking"
@@ -514,6 +529,9 @@ class NameListener:
         self.last: Optional[NameHit] = None
         self.decodes = 0
         self.dropped = 0
+        self._waits: "collections.deque" = collections.deque(maxlen=50)    # s a window waited for the decoder
+        self._decode_s: "collections.deque" = collections.deque(maxlen=50)  # s one window took to decode
+        self._latencies: "collections.deque" = collections.deque(maxlen=50)  # s from a name's end to its report
         self._stream = None
         self._q: "queue.Queue" = queue.Queue()
         self._qlock = threading.Lock()
@@ -523,7 +541,8 @@ class NameListener:
             maxlen=int(self.FLOOR_S * SAMPLE_RATE / self.FRAME))
         self.noise_floor = 0.0
         self._n = 0                # samples fed so far
-        self._offset = None        # monotonic(sample 0), min-filtered
+        self._offset = None        # monotonic(sample 0), min-filtered over the last OFFSET_WINDOW_S
+        self._off_hist: "collections.deque" = collections.deque()   # (t_first, offset) recent callbacks
         self._last_hit_t = -1e9
         self._pending: Optional[NameHit] = None   # edge-deferred candidate
         self._vetoed: "collections.deque" = collections.deque(maxlen=20)  # (name, start)
@@ -531,6 +550,19 @@ class NameListener:
         self._reset_buf()
 
     # ---- public ----
+    def timing(self) -> dict:
+        """Why is a name late? Seconds a window waited for the decoder, how long a decode took,
+        and name-end-to-report latency, over the last 50 (p50 / p95), plus drop counts."""
+        def pct(d, q):
+            v = sorted(d)
+            return round(v[min(len(v) - 1, int(round(q * (len(v) - 1))))], 2) if v else None
+        return {"decodes": self.decodes, "dropped": self.dropped, "hits": len(self._latencies),
+                "wait_p50": pct(self._waits, .5), "wait_p95": pct(self._waits, .95),
+                "decode_p50": pct(self._decode_s, .5), "decode_p95": pct(self._decode_s, .95),
+                "latency_p50": pct(self._latencies, .5), "latency_p95": pct(self._latencies, .95),
+                "last_latency": round(self._latencies[-1], 2) if self._latencies else None,
+                "noise_floor": round(self.noise_floor, 4)}
+
     def set_names(self, names) -> None:
         self.names = [n.strip() for n in (names.split(",") if isinstance(names, str)
                                           else names) if n.strip()]
@@ -596,7 +628,14 @@ class NameListener:
         if t_first is None:
             t_first = time.monotonic() - len(samples) / SAMPLE_RATE
         off = t_first - self._n / SAMPLE_RATE
-        self._offset = off if self._offset is None else min(self._offset + 1e-6, off)
+        # Windowed minimum, not a forever-minimum: when callbacks are starved (model loads, a busy
+        # CPU) PortAudio drops samples, the sample counter falls behind real time and `off` grows.
+        # A global min kept the early small value, so every later name window was placed ~10 s in
+        # the past, outside the band-frame history: 'no frames in window' -> a generic front buzz.
+        self._off_hist.append((t_first, off))
+        while self._off_hist and self._off_hist[0][0] < t_first - self.OFFSET_WINDOW_S:
+            self._off_hist.popleft()
+        self._offset = min(o for _, o in self._off_hist)
         self._ensure_worker()
         for i in range(0, len(samples), self.FRAME):
             self._frame(samples[i:i + self.FRAME])
@@ -664,7 +703,7 @@ class NameListener:
                         self.dropped += 1
                     except queue.Empty:
                         break
-            self._q.put(item)
+            self._q.put(item + (time.monotonic(),) if len(item) == 2 else item)
 
     def _ensure_worker(self) -> None:
         if self._worker is None or not self._worker.is_alive():
@@ -681,8 +720,12 @@ class NameListener:
             try:
                 if item is None:
                     return
-                audio, t0 = item
+                audio, t0 = item[0], item[1]
+                t_start = time.monotonic()
+                if len(item) > 2:
+                    self._waits.append(t_start - item[2])
                 self.process(audio, t0)
+                self._decode_s.append(time.monotonic() - t_start)
             except Exception as e:
                 print(f"[names] error: {e}")
             finally:
@@ -765,6 +808,7 @@ class NameListener:
             return None
         self._last_hit_t = found.start
         found.latency = round(time.monotonic() - found.end, 3)
+        self._latencies.append(found.latency)
         self.last = found
         if self.on_hit:
             try:

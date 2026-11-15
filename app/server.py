@@ -109,6 +109,7 @@ class App:
         # dashboard banner. The app keeps running whatever fails.
         self.faults: dict = {}
         self._action_down = False
+        self._action_t = None            # monotonic time of the last Action DOWN (tap vs hold)
         self._vision_stall_since: Optional[float] = None
         self._vision_restart_at = 0.0
         self._restarting = False
@@ -195,6 +196,12 @@ class App:
     def _on_speech(self, r) -> None:
         """Hold-to-talk result. The wearer may not see the dashboard, so every
         outcome also buzzes: "got it, searching" or "can't look for that"."""
+        if str(getattr(r, "error", "") or "") == "too short" or (
+                not getattr(r, "error", None) and not (getattr(r, "text", "") or "").strip()):
+            self.state["heard"] = "didn't hear anything"
+            self.emit({"type": "state", **self.state})
+            self.emit({"type": "log", "text": "speech: didn't hear anything (hold the pad while you speak)"})
+            return                                 # no unknown-object buzz for silence
         if getattr(r, "error", None):
             if str(r.error).startswith("mic"):
                 self.faults["speech"] = f"hold-to-talk {r.error}"
@@ -388,9 +395,29 @@ class App:
         self.emit({"type": "log", "text": f"teach a sound: {msg}"})
         self.emit(self.sounds_msg())
 
+    TAP_MAX_S = 0.4      # a press shorter than this is a TAP: "I found it" (not hold-to-talk)
+
+    def _find_target(self):
+        v = self.vision
+        t = getattr(v, "target", None)
+        return t if t else getattr(getattr(v, "tracker", None), "target", None)
+
     def _action(self, down: bool) -> None:
         """Action button (board or dashboard): alert window while recording,
-        no cues while held, hold-to-talk speech."""
+        no cues while held, hold-to-talk speech. A TAP (< TAP_MAX_S) confirms "I found it":
+        the recording is discarded, the search stops (the camera looks for nothing) and the
+        found cue plays once. A tap with no search running does nothing."""
+        now = time.monotonic()
+        tap, found = False, None
+        if down:
+            self._action_t = now
+        elif self._action_t is not None:
+            tap = (now - self._action_t) < self.TAP_MAX_S
+            self._action_t = None
+        if tap and self.vision:
+            found = self._find_target()
+            if found:
+                self.vision.set_target(None)       # stop looking for anything
         self._action_down = down
         if self.recorder.active:
             (self.recorder.alert_down if down else self.recorder.alert_up)()
@@ -400,9 +427,21 @@ class App:
         for lst in (self.names, self.sound):  # hold-to-talk owns the mic while held
             if lst:
                 (lst.pause if down else lst.resume)()
+        if found:
+            if self.guide is not None:             # stop the hot/cold pulses even if the guide was paused
+                from types import SimpleNamespace
+                self.guide.on_decision(SimpleNamespace(state="idle", target=None, t=now,
+                                                       confidence=0.0, offset=None, changed=True))
+            self.state["object"] = f"{found}: found (confirmed by tap)"
+            self.emit({"type": "state", **self.state})
+            self.emit({"type": "log", "text": f"tap: found the {found}; search stopped"})
+            self.notify.cue("find", "found", None, 1.0, None, target=found, confirmed="tap")
         if self.speech:
             try:
-                self.speech.on_button(down)
+                if tap and hasattr(self.speech, "cancel"):
+                    self.speech.cancel()           # a click, not a command: no transcript, no cue
+                else:
+                    self.speech.on_button(down)
             except Exception as e:  # missing sounddevice, no mic permission...
                 self.emit({"type": "log", "text": f"speech: {e}"})
 
@@ -630,7 +669,8 @@ class App:
                 "frames": self.link.frames_rx, "recording": self.recorder.active,
                 "health": self.link.health(), "faults": dict(self.faults),
                 "motors": list(haptics.ACTIVE) if haptics.ACTIVE is not None else list(range(8)),
-                "agent": self.agent_status() if self.agent_status else None}
+                "agent": self.agent_status() if self.agent_status else None,
+                "names": self.names.timing() if getattr(self.names, "timing", None) else None}
 
     # ------------------------------------------------------------- watchdog
     VISION_STALL_S = 2.0      # no camera frame this long -> fault, target treated as lost
