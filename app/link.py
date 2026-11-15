@@ -264,12 +264,17 @@ class Link:
 
     def __init__(self, port, on_sent: Optional[Callable[[str], None]] = None,
                  motor_map: Optional[Sequence[int]] = None,
-                 reopen: Optional[Callable[[], object]] = None, retry_s: float = 1.0):
+                 reopen: Optional[Callable[[], object]] = None, retry_s: float = 1.0,
+                 silent_s: float = 2.0):
         """reopen: called (every retry_s) after the port fails, to get a fresh
         port, e.g. lambda: SerialPort(find_esp32_port()). Without it a failed
-        port stays failed."""
+        port stays failed. silent_s: a port that HAS delivered lines and then
+        returns nothing for this long is treated as dead too (a USB device that
+        dropped and re-enumerated under the same name keeps a stale handle that
+        reads empty forever instead of raising); only with a reopen factory."""
         self.port = port
-        self.reopen, self.retry_s = reopen, retry_s
+        self.reopen, self.retry_s, self.silent_s = reopen, retry_s, silent_s
+        self._port_rx = 0.0          # monotonic time of the last line from the CURRENT port
         self.reconnects = 0
         self.dropped_writes = 0
         self.device = getattr(port, "device", "?")
@@ -404,7 +409,9 @@ class Link:
             self.error = None
             self.reconnects += 1
             self._last_mic_ms = None
+            self._port_rx = 0.0
             print(f"[link] reconnected to {self.device}")
+            self.stop()          # never leave a motor on across a reconnect (firmware also stops on link loss)
             return
 
     def _run(self) -> None:
@@ -416,9 +423,16 @@ class Link:
                 self._reconnect()
                 continue
             if not line or not line.strip():
+                if (self.reopen is not None and self._port_rx
+                        and time.monotonic() - self._port_rx > self.silent_s):
+                    age = time.monotonic() - self._port_rx
+                    self.error = f"no data for {age:.1f} s: the USB device dropped? reopening"
+                    print(f"[link] {self.error}")
+                    self._reconnect()
                 continue
             ev = parse_line(line)
             self.last_rx = ev.rx
+            self._port_rx = time.monotonic()
             self.lines_rx += 1
             if isinstance(ev, MicFrame):
                 self.frames_rx += 1

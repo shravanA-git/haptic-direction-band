@@ -140,3 +140,63 @@ def test_hold_to_talk_mic_error_shows_until_next_good_result():
     app._on_speech(D(text="find the cup", target="cup", error=None))
     assert "speech" not in app.check_health()
     link.close()
+
+
+class SilentPort:
+    """A stale USB handle: delivers some lines, then reads return nothing forever, without raising."""
+    device = "/dev/cu.usbserial-0001"
+
+    def __init__(self, lines=0, forever=False, period=0.01):
+        self.n, self.period, self.sent, self.closed, self.forever = lines, period, [], False, forever
+        self.i = 0
+
+    def readline(self):
+        time.sleep(self.period)
+        if self.forever or self.i < self.n:
+            self.i += 1
+            return f"MIC {self.i * 25} 100 100 100 100"
+        return None                                    # stale handle: empty read, no exception
+
+    def write_line(self, line):
+        self.sent.append(line)
+
+    def close(self):
+        self.closed = True
+
+
+def test_silent_port_that_stopped_streaming_is_reopened_and_stopped():
+    stale, fresh = SilentPort(lines=20), SilentPort(forever=True)
+    opened = []
+    link = Link(stale, reopen=lambda: opened.append(1) or fresh, retry_s=0.05, silent_s=0.3).start()
+    assert wait(lambda: link.frames_rx >= 20)
+    assert link.reconnects == 0 and link.error is None          # streaming: left alone
+    assert wait(lambda: link.reconnects == 1, 3.0)              # silent past silent_s: reopened
+    assert stale.closed and link.port is fresh and opened == [1]
+    assert fresh.sent == ["STOP"]                               # motors off right after the reopen
+    assert wait(lambda: link.error is None and link.health()["state"] == "streaming")
+    assert link.health()["reconnects"] == 1
+    link.close()
+
+
+def test_silence_never_reopens_a_port_that_never_streamed_or_without_a_factory():
+    quiet = SilentPort(lines=0)                                 # nothing received yet: not "dead", just quiet
+    reopens = []
+    link = Link(quiet, reopen=lambda: reopens.append(1) or SilentPort(), retry_s=0.05, silent_s=0.2).start()
+    time.sleep(0.8)
+    assert reopens == [] and link.reconnects == 0 and not quiet.closed
+    link.close()
+    bare = SilentPort(lines=5)                                  # no reopen factory (sim traces end this way)
+    link = Link(bare, silent_s=0.2).start()
+    time.sleep(0.8)
+    assert link.reconnects == 0 and not bare.closed and link.error is None
+    link.close()
+
+
+def test_reconnect_after_an_exception_also_sends_stop():
+    class Flaky(SilentPort):
+        def readline(self):
+            raise OSError(5, "Input/output error")
+    fresh = SilentPort(forever=True)
+    link = Link(Flaky(), reopen=lambda: fresh, retry_s=0.05).start()
+    assert wait(lambda: link.reconnects == 1 and "STOP" in fresh.sent)
+    link.close()
