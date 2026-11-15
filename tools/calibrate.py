@@ -18,8 +18,10 @@ Steps:
      scored by tools/eval_estimator.py and tools/trial_metrics.py) and, if
      correction doesn't make things worse, app/calibration.local.json (gitignored: it
      describes this wearer's hat), which the app loads at start in preference to the
-     shared app/calibration.json. A clipped clap (any mic at 4095) is not counted:
-     you are told to reduce the mic gain trimmer or snap softer, and asked again.
+     shared app/calibration.json. A clap that is clipped, too loud for the hat (the mics flatten
+     around 2400-2650) or has no direction (all four channels within 25%) is not counted: you are
+     told to snap softer (aim for peaks 400-1500) and asked again, so every position gets the
+     requested number of ACCEPTED claps. The hat's ceiling is learned and saved with the gains.
 Close the Arduino Serial Monitor first: only one program can own the port.
 """
 from __future__ import annotations
@@ -44,6 +46,10 @@ from tools.eval_estimator import classify, mic_gains
 ROOT = Path(__file__).resolve().parent.parent
 RECORDINGS = ROOT / "recordings"
 CHANNELS = ("front", "right", "back", "left")
+CLAP_MAX_PEAK = 2200     # a clap's loudest frame above this (hats flatten around 2400-2650) is too loud
+CLAP_MIN_CONTRAST = 0.25  # (max - min) / max of the clap's excess over the quiet floor: below = no direction
+TOO_LOUD = ("too loud / no direction: snap softer, aim for peaks 400-1500. "
+            "This clap is not counted. Again:")
 CLIP_ADC = 4090          # a channel at the 12-bit ADC ceiling (4095): the clap clipped, its direction is gone
 CLAP_EXCESS = 1.0        # mean excess over baseline (baseline units) that counts as a clap
 CLAP_MAX_MS = 400
@@ -130,6 +136,38 @@ def is_clipped(peaks: list) -> bool:
     return max(peaks) >= CLIP_ADC
 
 
+def clap_frame(frames: list, a: int, b: int) -> Optional[list]:
+    """The loudest frame (levels) of the clap window: a clap is one or two informative frames."""
+    win = [f["levels"] for f in frames if a - 40 <= f["ms"] <= b + 40]
+    return max(win, key=sum) if win else None
+
+
+def learn_ceiling(frames: list) -> Optional[float]:
+    """The level at which this hat's four mics flatten against the rails: the median top level of
+    the frames that went flat (all channels within 15%, above 2200) but did not hit the ADC max.
+    None until at least 2 such frames have been seen."""
+    flat = [max(f["levels"]) for f in frames
+            if direction.FLAT_LEVEL <= max(f["levels"]) < direction.SATURATED
+            and direction.contrast(f["levels"]) < direction.FLAT_CONTRAST]
+    return round(median(flat), 1) if len(flat) >= 2 else None
+
+
+def reject_reason(frames: list, a: int, b: int, base: list, ceiling: Optional[float] = None) -> Optional[str]:
+    """Why this clap should not count (message to show), or None. Clipped, too loud for this hat,
+    or no direction (its four channels are nearly equal)."""
+    peaks = clap_peaks(frames, a, b)
+    if is_clipped(peaks):
+        return (f"CLIPPED (peaks {fmt_peaks(peaks)}). Reduce the mic gain trimmer or snap softer / from "
+                "farther away; this clap is not counted. Again:")
+    lv = clap_frame(frames, a, b)
+    if lv is None:
+        return None
+    limit = 0.9 * ceiling if ceiling else CLAP_MAX_PEAK
+    if max(lv) > limit or direction.contrast([max(v - bb, 0.0) for v, bb in zip(lv, base)]) < CLAP_MIN_CONTRAST:
+        return f"peaks {fmt_peaks(peaks)}: {TOO_LOUD}"
+    return None
+
+
 def fmt_peaks(peaks: list) -> str:
     return " ".join(f"{n[0].upper()}{p:.0f}" for n, p in zip(CHANNELS, peaks))
 
@@ -203,7 +241,9 @@ def run_calibration(link: Link, ask: Callable[[str], str], positions, out=print,
         out(f"[cal]   WARN {fl}")
     base = q["baseline"]
     claps = []
-    out(f"[cal] step 2: clap once from each of {len(positions)} positions, ~1 m away")
+    attempts = {}
+    out(f"[cal] step 2: clap once from each of {len(positions)} positions, ~1 m away "
+        "(soft: aim for peaks 400-1500)")
     for n, p in enumerate(positions, 1):
         while True:
             r = ask(f"[cal]   ({n}/{len(positions)}) stand {POS_NAMES[p].upper()} of the band, press Enter, then clap "
@@ -216,16 +256,27 @@ def run_calibration(link: Link, ask: Callable[[str], str], positions, out=print,
             hit = wait_for_clap(col, n0, base, clap_timeout)
             if hit:
                 time.sleep(0.3)           # let the clap die down (and its tail reach the buffer)
-                peaks = clap_peaks(col.since(n0), *hit)
-                if is_clipped(peaks):     # all four mics at the ADC ceiling: no direction left in it
-                    out(f"[cal]   {POS_NAMES[p]}: CLIPPED (peaks {fmt_peaks(peaks)}). Reduce the mic gain "
-                        "trimmer or snap softer / from farther away; this clap is not counted. Again:")
+                attempts[p] = attempts.get(p, 0) + 1
+                new = col.since(n0)
+                why = reject_reason(new, *hit, base, learn_ceiling(col.frames))
+                if why:                   # clipped, too loud for this hat, or no direction in it
+                    out(f"[cal]   {POS_NAMES[p]}: {why}")
                     continue
                 claps.append((p, *hit))
-                out(f"[cal]   {POS_NAMES[p]}: clap at {hit[0]}-{hit[1]} ms, peaks {fmt_peaks(peaks)}")
+                out(f"[cal]   {POS_NAMES[p]}: clap at {hit[0]}-{hit[1]} ms, "
+                    f"peaks {fmt_peaks(clap_peaks(new, *hit))}")
                 break
             out("[cal]   no clap heard: clap louder or closer, and try again")
     frames = col.since(0)
+    ceiling = learn_ceiling(frames)
+    out(f"[cal] accepted {len(claps)} of {len(positions)} claps (rejected {sum(attempts.values()) - len(claps)}"
+        f"{'; hat ceiling about %.0f' % ceiling if ceiling else ''})")
+    out(f"[cal]   {'position':12s} {'accepted':>8s} {'tries':>5s}  loudest frame of each accepted clap")
+    for p in sorted({p for p, _, _ in claps} | set(attempts)):
+        mine = [(a, b) for q, a, b in claps if q == p]
+        want = sum(1 for q in positions if q == p)
+        row = "  ".join(fmt_peaks(clap_frame(frames, a, b) or [0] * 4) for a, b in mine)
+        out(f"[cal]   {POS_NAMES[p]:12s} {len(mine):>3d}/{want:<4d} {attempts.get(p, 0):>5d}  {row}")
     gains = compute_gains(frames, claps, base)
     before, after = score(frames, claps), score(frames, claps, gains) if gains else None
     out("[cal] step 3: results (estimated direction per clap)")
@@ -246,7 +297,7 @@ def run_calibration(link: Link, ask: Callable[[str], str], positions, out=print,
         out(f"[cal]   correct: {n_ok}/{len(claps)}. No gains: need claps from all 8 positions "
             "or all 4 cardinals.")
     return {"baseline": base, "noise": q["noise"], "flags": q["flags"], "gains": gains,
-            "claps": claps, "correct_raw": n_ok, "correct_calibrated": n_ok2,
+            "ceiling": ceiling, "claps": claps, "correct_raw": n_ok, "correct_calibrated": n_ok2,
             "trace": {"frames": frames,
                       "alerts": [{"startMs": a - 40, "endMs": b + 40, "expected": p}
                                  for p, a, b in claps]}}
@@ -255,7 +306,7 @@ def run_calibration(link: Link, ask: Callable[[str], str], positions, out=print,
 def save_calibration(res: dict, path=CALIBRATION_LOCAL_FILE) -> Path:
     path = Path(path)
     path.write_text(json.dumps({
-        "gains": res["gains"], "channels": list(CHANNELS),
+        "gains": res["gains"], "ceiling": res.get("ceiling"), "channels": list(CHANNELS),
         "baseline": [round(b, 2) for b in res["baseline"]],
         "noise": [round(n, 2) for n in res["noise"]],
         "positions": [p for p, _, _ in res["claps"]],

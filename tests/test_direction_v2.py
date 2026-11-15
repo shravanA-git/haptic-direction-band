@@ -220,3 +220,66 @@ def test_real_hat_calibration_trace_if_present():
         elif e.motor is not None and min((e.motor - a["expected"]) % 8, (a["expected"] - e.motor) % 8) <= 1:
             got += 1
     assert sat >= 5 and got >= 3
+
+
+# ---- flat-frame saturation, learned ceiling, contrast weighting (real hat, calib-210831) ----
+
+def test_flat_frames_are_saturated_well_below_the_adc_ceiling():
+    sat = direction.is_saturated
+    assert sat([2479, 2582, 2543, 2569])                    # the real back clap: all four ~equal near 2500
+    assert not sat([636, 2269, 787, 1036])                  # loud but directional: real signal, kept
+    assert not sat([2656, 2673, 2470, 1835])                # near the rails but 31% contrast: not flat...
+    assert sat([2656, 2673, 2470, 1835], ceiling=2582)      # ...unless this hat's learned ceiling says it is
+    assert not sat([1500, 1450, 1480, 1520])                # flat but under FLAT_LEVEL: just a loud even sound
+    assert sat([4095, 100, 100, 100]) and sat([3900, 3000, 100, 100])
+    assert direction.contrast([100, 100, 100, 100]) == 0.0 and direction.contrast([0, 0, 0, 0]) == 0.0
+
+
+def test_a_learned_ceiling_makes_near_the_rails_frames_clipped():
+    fs = clap_frames([(1000, [2656, 2673, 2470, 1835]), (1025, [1400, 1500, 1350, 1100])])
+    no_ceiling = estimate(fs, 975, 1100, min_frames=1)
+    with_ceiling = estimate(fs, 975, 1100, min_frames=1, ceiling=2582)
+    assert no_ceiling.saturated == 0
+    assert with_ceiling.motor is None and with_ceiling.reason == direction.SATURATED_REASON
+    live = direction.LiveEstimator()
+    live.ceiling = 2582
+    assert live.ceiling == 2582
+
+
+def test_flat_decay_frames_are_down_weighted_not_trusted():
+    # one clearly directional frame (right) among loud, nearly even frames that tilt slightly to the back
+    fs = clap_frames([(1000, [150, 700, 160, 150])] +
+                     [(1025 + 25 * i, [1500, 1500, 1560, 1480]) for i in range(5)])
+    assert estimate(fs, 975, 1200, min_frames=1).motor == 2
+    direction_contrast_full = direction.CONTRAST_FULL
+    try:
+        direction.CONTRAST_FULL = 1e-9                      # weighting off: the loud flat frames take over
+        assert estimate(fs, 975, 1200, min_frames=1).motor != 2
+    finally:
+        direction.CONTRAST_FULL = direction_contrast_full
+
+
+def test_load_ceiling_reads_the_same_file(tmp_path, monkeypatch):
+    local = tmp_path / "calibration.local.json"
+    monkeypatch.setattr(direction, "CALIBRATION_LOCAL_FILE", local)
+    monkeypatch.setattr(direction, "CALIBRATION_FILE", tmp_path / "calibration.json")
+    assert direction.load_ceiling() is None
+    local.write_text(json.dumps({"gains": [1, 1, 1, 1], "ceiling": 2582.5}))
+    assert direction.load_ceiling() == 2582.5 and direction.load_calibration() == [1, 1, 1, 1]
+    local.write_text(json.dumps({"gains": [1, 1, 1, 1], "ceiling": None}))
+    assert direction.load_ceiling() is None
+
+
+def test_real_trace_flat_and_clipped_claps_never_get_a_direction_if_present():
+    from pathlib import Path
+    p = Path("recordings/calib-210831.json")
+    if not p.exists():
+        pytest.skip("real calibration trace not on this machine")
+    t = trace.load(p)
+    fr = t["frames"]
+    for i in (2, 4):                                        # the flat back clap and the near-the-rails front clap
+        a = t["alerts"][i]
+        e = estimate(fr, a["startMs"], a["endMs"], min_frames=1, ceiling=2582)
+        assert e.motor is None, (i, e)
+    a = t["alerts"][5]                                      # loud but directional right clap: kept, read right
+    assert estimate(fr, a["startMs"], a["endMs"], min_frames=1, ceiling=2582).motor == 2

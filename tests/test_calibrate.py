@@ -136,3 +136,48 @@ def test_local_calibration_beats_the_shared_file_and_save_writes_the_local_one(t
     import argparse  # noqa: F401
     assert calibrate.CALIBRATION_LOCAL_FILE.name == "calibration.local.json"
     assert calibrate.save_calibration.__defaults__[0].name == "calibration.local.json"
+
+
+def test_reject_reason_flags_too_loud_flat_and_directionless_claps():
+    base = [95, 110, 103, 106]
+    frames = lambda lv: [{"ms": 0, "levels": [100] * 4}, {"ms": 25, "levels": lv}, {"ms": 50, "levels": [100] * 4}]  # noqa: E731
+    flat = calibrate.reject_reason(frames([2479, 2582, 2543, 2569]), 25, 25, base)
+    assert flat and "too loud / no direction" in flat and "snap softer, aim for peaks 400-1500" in flat
+    assert "F2479 R2582 B2543 L2569" in flat                              # the peak table row
+    loud = calibrate.reject_reason(frames([636, 2269, 787, 1036]), 25, 25, base)
+    assert loud and "too loud" in loud                                    # directional but over the hat's range
+    assert calibrate.reject_reason(frames([4095, 4095, 4095, 4095]), 25, 25, base).startswith("CLIPPED")
+    even = calibrate.reject_reason(frames([240, 220, 215, 235]), 25, 25, base)
+    assert even and "no direction" in even                                # excess contrast under 25%
+    assert calibrate.reject_reason(frames([635, 327, 306, 305]), 25, 25, base) is None        # a good soft clap
+    assert calibrate.reject_reason(frames([700, 220, 260, 230]), 25, 25, base) is None
+    # a learned ceiling lowers the bar: 90% of it is already too loud
+    assert calibrate.reject_reason(frames([1200, 300, 260, 250]), 25, 25, base, ceiling=1300)
+
+
+def test_learn_ceiling_needs_two_flat_frames_below_the_adc_max():
+    fr = [{"ms": i, "levels": lv} for i, lv in enumerate(
+        [[100] * 4, [2479, 2582, 2543, 2569], [2500, 2520, 2510, 2555], [4095] * 4, [636, 2269, 787, 1036]])]
+    assert calibrate.learn_ceiling(fr) == pytest.approx(2549, abs=40)      # median of the two rail frames
+    assert calibrate.learn_ceiling(fr[:2]) is None and calibrate.learn_ceiling([]) is None
+
+
+def test_calibration_prints_the_peak_table_counts_accepted_claps_and_saves_the_ceiling(tmp_path):
+    port = LoudFirstPort(seed=3)
+    link = Link(port).start()
+    said = []
+    try:
+        res = calibrate.run_calibration(link, lambda p: "", [0, 4, 0], out=said.append, quiet_s=0.4,
+                                        clap_timeout=2.0, on_ready=port.clap)
+    finally:
+        link.close()
+    text = "\n".join(said)
+    assert "accepted 3 of 3 claps (rejected" in text                       # N ACCEPTED claps per position, not attempts
+    assert "accepted tries" in text and "loudest frame of each accepted clap" in text
+    assert " 2/2 " in text and " 1/1 " in text                             # front 2 of 2 requested, back 1 of 1
+    assert [p for p, _, _ in res["claps"]] == [0, 4, 0] and "ceiling" in res
+    out = tmp_path / "calibration.local.json"
+    res["gains"] = res["gains"] or [1.0, 1.0, 1.0, 1.0]
+    res["ceiling"] = 2582.0
+    calibrate.save_calibration(res, out)
+    assert json.loads(out.read_text())["ceiling"] == 2582.0

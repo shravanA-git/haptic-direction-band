@@ -118,11 +118,15 @@ def main(argv=None) -> int:
     app = App(link, AlertLog(alert_path), recall_mode=a.recall)
     try:
         app.live.gains = direction.load_calibration()
+        app.live.ceiling = direction.load_ceiling()
         src = direction.calibration_path()
         if app.live.gains:
             print(f"[hdb] mic calibration from app/{src.name}: gains {app.live.gains}"
                   + ("  (this wearer's local file)" if src == direction.CALIBRATION_LOCAL_FILE
                      else "  (shared default; python -m tools.calibrate --save writes a local one)"))
+            if app.live.ceiling:
+                print(f"[hdb] mic ceiling {app.live.ceiling:.0f}: frames at or above "
+                      f"{direction.CEILING_FRAC * app.live.ceiling:.0f} count as clipped")
         else:
             print("[hdb] no mic calibration file: channels are not gain-matched")
     except (ValueError, KeyError) as e:

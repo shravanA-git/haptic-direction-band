@@ -70,6 +70,15 @@ def calibration_path() -> Optional[Path]:
     return None
 
 
+def load_ceiling(path=None) -> Optional[float]:
+    """This hat's learned saturation level from the same gains file (written by tools/calibrate), or None."""
+    path = Path(path) if path is not None else calibration_path()
+    if path is None or not path.exists():
+        return None
+    c = json.loads(path.read_text()).get("ceiling")
+    return float(c) if c else None
+
+
 def load_calibration(path=None) -> Optional[list]:
     """Per-channel sensitivity correction (front, right, back, left). With no path:
     app/calibration.local.json (written by `python -m tools.calibrate --save`, gitignored) in
@@ -159,6 +168,7 @@ class LiveEstimator:
         self.keep_ms, self.pad_ms, self.stale_s = keep_ms, pad_ms, stale_s
         self.gains = gains          # from load_calibration(); None = uncorrected
         self.centroids = centroids  # from load_centroids(); None = analytic 8-way
+        self.ceiling: Optional[float] = None   # from load_ceiling(); None = the fixed flat-frame rule only
         self._motor_spans: deque = deque(maxlen=64)   # laptop-monotonic (start_s, end_s) of motor pulses
         self.clock = clock or ClockSync()
         self._frames: deque = deque()
@@ -215,7 +225,8 @@ class LiveEstimator:
         if now - last_rx > self.stale_s:
             return Estimate(None, None, 0.0, 0.0, 0, f"MIC stream stale ({now - last_rx:.1f} s)"), win
         skip = self._skip_ms(start_s, end_s)
-        return estimate(frames, *win, gains=self.gains, centroids=self.centroids, skip_ms=skip), win
+        return estimate(frames, *win, gains=self.gains, centroids=self.centroids, skip_ms=skip,
+                        ceiling=self.ceiling), win
 
 
 
@@ -241,6 +252,10 @@ CENTROIDS_FILE = Path(__file__).resolve().parent / "centroids.json"
 MOTOR_MARGIN_MS = 120     # frames this long after a motor pulse (spin-down, bleed) are skipped
 SATURATED = 3900          # a frame with any channel at or above this is clipped (ADC max 4095): its
                           # ratios are meaningless, so it is excluded, not used
+FLAT_LEVEL = 2200         # ...and the real hat flattens lower (preamp rails / 11 dB ADC range, ~2400-2650):
+FLAT_CONTRAST = 0.15      # a frame above FLAT_LEVEL whose four channels are within 15% is saturated
+CEILING_FRAC = 0.95       # with a learned ceiling (calibration.local.json "ceiling"), >= 95% of it is saturated
+CONTRAST_FULL = 0.25      # frames with excess contrast below this are down-weighted, cubed (c/0.25)^3
 SATURATED_REASON = "saturated: sound too loud for the mics"
 SMOOTH_MIN_FRAMES = 8     # 3-frame smoothing of the spike only for windows long enough to need it
                           # (a 60-80 ms clap has 3-4 frames; smoothing left too few)
@@ -250,18 +265,32 @@ def _in_spans(ms: float, spans: Sequence) -> bool:
     return any(a <= ms <= b for a, b in spans)
 
 
-def is_saturated(levels: Sequence[float]) -> bool:
-    return max(levels) >= SATURATED
+def contrast(levels: Sequence[float]) -> float:
+    """(max - min) / max over the four channels, 0 = perfectly flat."""
+    m = max(levels)
+    return (m - min(levels)) / m if m > 0 else 0.0
 
 
-def noise_floor(frames: Sequence[dict], start_ms: int, end_ms: int, skip: Sequence = ()):
+def is_saturated(levels: Sequence[float], ceiling: Optional[float] = None) -> bool:
+    """A clipped frame: any channel at the ADC ceiling, or at the hat's learned ceiling, or well above
+    FLAT_LEVEL with all four channels nearly equal (they have flattened against the rails)."""
+    m = max(levels)
+    if m >= SATURATED:
+        return True
+    if ceiling and m >= CEILING_FRAC * ceiling:
+        return True
+    return m >= FLAT_LEVEL and contrast(levels) < FLAT_CONTRAST
+
+
+def noise_floor(frames: Sequence[dict], start_ms: int, end_ms: int, skip: Sequence = (),
+                ceiling: Optional[float] = None):
     """(median, sigma) per channel, absolute units, from the quiet frames before the name."""
-    ok = lambda f: not _in_spans(f["ms"], skip) and not is_saturated(f["levels"])     # noqa: E731
+    ok = lambda f: not _in_spans(f["ms"], skip) and not is_saturated(f["levels"], ceiling)   # noqa: E731
     pre = [f["levels"] for f in frames if start_ms - PRE_ROLL_MS <= f["ms"] < start_ms and ok(f)]
     if len(pre) < MIN_PRE_FRAMES:     # short recording: everything outside the window, then everything
         pre = [f["levels"] for f in frames if (f["ms"] < start_ms or f["ms"] > end_ms) and ok(f)]
         if len(pre) < 3:
-            pre = [f["levels"] for f in frames if not is_saturated(f["levels"])] or \
+            pre = [f["levels"] for f in frames if not is_saturated(f["levels"], ceiling)] or \
                   [f["levels"] for f in frames]
     med, sig = [], []
     for ch in zip(*pre):
@@ -303,12 +332,13 @@ def classify_centroid(vec, centroids: dict, margin: float = None) -> tuple:
 def estimate(frames: Sequence[dict], start_ms: int, end_ms: int,
              gains: Optional[Sequence[float]] = None, centroids: Optional[dict] = None,
              skip_ms: Sequence = (), algo: Optional[str] = None,
-             min_frames: Optional[int] = None) -> Estimate:
+             min_frames: Optional[int] = None, ceiling: Optional[float] = None) -> Estimate:
     """Robust name direction (see the module docstring). gains: per-channel sensitivity
     correction (tools/calibrate.py), multiplies each channel's excess. centroids: {motor:
     (east, north)} from load_centroids(); skip_ms: [(a, b)] band-clock spans when a motor was on.
     min_frames: spike frames needed (default 2; calibration claps are one informative frame, so
-    tools/calibrate and tools/learn_centroids pass 1)."""
+    tools/calibrate and tools/learn_centroids pass 1). ceiling: this hat's learned saturation level
+    (load_ceiling()); frames at 95% of it are clipped even when not perfectly flat."""
     if (algo or ALGORITHM) == "v1":
         return estimate_v1(frames, start_ms, end_ms, gains)
     skip = list(skip_ms)
@@ -318,7 +348,7 @@ def estimate(frames: Sequence[dict], start_ms: int, end_ms: int,
     # Clipped frames carry no direction, and neither does what follows them: after a clap or shout
     # pins the mics at 4095 the decay frames read near-equal on all four channels (real hat, Nov 14).
     # So only frames BEFORE the first clipped one are evidence.
-    first_clip = next((f["ms"] for f in in_win if is_saturated(f["levels"])), None)
+    first_clip = next((f["ms"] for f in in_win if is_saturated(f["levels"], ceiling)), None)
     win = [f for f in in_win if first_clip is None or f["ms"] < first_clip]
     nsat = len(in_win) - len(win)
     min_frames = MIN_FRAMES if min_frames is None else max(1, int(min_frames))
@@ -329,7 +359,7 @@ def estimate(frames: Sequence[dict], start_ms: int, end_ms: int,
         return Estimate(None, angle, snr, cons, used, reason, margin, vector, nsat)
     if not win:
         return generic("no frames in window (stale?)")
-    med, sig = noise_floor(frames, start_ms, end_ms, skip)
+    med, sig = noise_floor(frames, start_ms, end_ms, skip, ceiling)
     g = list(gains) if gains is not None else [1.0, 1.0, 1.0, 1.0]
     ex = []                                    # per frame: gated, gain-matched excess, front/right/back/left
     for f in win:
@@ -338,10 +368,18 @@ def estimate(frames: Sequence[dict], start_ms: int, end_ms: int,
     tot = [sum(e) for e in ex]
     if max(tot) <= 0:
         return generic("too few loud frames")
-    sm = ([sum(tot[max(0, i - 1):i + 2]) / 3 for i in range(len(tot))]      # 3-frame smoothing
-          if len(tot) >= SMOOTH_MIN_FRAMES else list(tot))
+    # A frame whose four channels are nearly equal says little about direction (loud decay, reverb, a
+    # mic near its rails). Weight by the contrast of its excess over the floor, both when choosing the
+    # spike and when averaging: otherwise loud flat frames outvote the one directional frame.
+    fac = [min(1.0, contrast([max((v - m) * k, 0.0) for v, m, k in zip(f["levels"], med, g)])
+               / CONTRAST_FULL) ** 3 for f in win]     # cubic: many flat frames must not add up to a majority
+    tw = [t * c for t, c in zip(tot, fac)]
+    if max(tw) <= 0:
+        return generic("conflicting directions", snr=0.0)
+    sm = ([sum(tw[max(0, i - 1):i + 2]) / 3 for i in range(len(tw))]        # 3-frame smoothing
+          if len(tw) >= SMOOTH_MIN_FRAMES else list(tw))
     peak = max(sm)
-    keep = [i for i in range(len(tot)) if sm[i] >= SPIKE_FRAC * peak and tot[i] > 0]
+    keep = [i for i in range(len(tw)) if sm[i] >= SPIKE_FRAC * peak and tw[i] > 0]
     noise = math.sqrt(sum(s * s for s in sig))
     snr = (sum(tot[i] for i in keep) / len(keep)) / noise if keep else 0.0
     if len(keep) < min_frames or snr < MIN_SNR:
@@ -351,7 +389,8 @@ def estimate(frames: Sequence[dict], start_ms: int, end_ms: int,
         f_, r_, b_, l_ = ex[i]
         x, y = (r_ - l_) / tot[i], (f_ - b_) / tot[i]
         if math.hypot(x, y) > 1e-6:
-            vec.append((x, y, tot[i]))
+            vec.append((x, y, tw[i]))
+    vec = [v for v in vec if v[2] > 0]
     if len(vec) < min_frames:
         return generic("too few loud frames", snr=snr, used=len(vec))
     w_all = sum(w for _, _, w in vec)
