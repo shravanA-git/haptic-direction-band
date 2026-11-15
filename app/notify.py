@@ -40,7 +40,7 @@ def pattern(cue: str, motor: Optional[int] = None, category: Optional[str] = Non
         if motor is None:
             raise ValueError("directional cue needs a motor")
         return haptics.directional(motor)
-    return {"generic": haptics.generic_attention, "centered": haptics.centered,
+    return {"generic": haptics.generic_attention, "centered": haptics.centered, "found": haptics.found,
             "lost": haptics.lost, "sound": haptics.taught_sound,
             "ack": haptics.target_ack, "unknown": haptics.target_unknown}[cue]()
 
@@ -294,7 +294,7 @@ class Caregiver:
         if src == "name" and cue in ("directional", "generic"):
             return (f"name called from the {rec['direction']}" if rec.get("direction")
                     else "name called (direction unclear)")
-        if src == "find" and cue == "centered":
+        if src == "find" and cue in ("centered", "found"):
             target = rec.get("target") or "object"
             now = self.clock()
             if now - self._found.get(target, -1e18) < self.FOUND_REPEAT_S:

@@ -140,6 +140,8 @@ def describe_alert(rec: dict) -> tuple:
                 "three long front buzzes: stop", True)
     if src == "find":
         target = rec.get("target") or "the object"
+        if cue == "found":
+            return (f"reached {target}", "one long pattern: front with each side, then a long front", False)
         if cue == "centered":
             return (f"found {target}, straight ahead", "two quick front buzzes", False)
         if cue == "lost":
@@ -295,6 +297,7 @@ class BandTools:
             ("Your name called", notify.pattern("directional", 6)),
             ("Name called, direction unclear", notify.pattern("generic")),
             ("Object found, straight ahead", notify.pattern("centered")),
+            ("Reached the object", notify.pattern("found")),
             ("Object lost", notify.pattern("lost")),
             ("Got it, looking", notify.pattern("ack")),
             ("Cannot look for that", notify.pattern("unknown")),

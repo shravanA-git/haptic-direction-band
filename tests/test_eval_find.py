@@ -37,6 +37,8 @@ class Truth:
         if self.swap:
             cx = W - cx
         half = 150 if not getattr(self, "small", False) else 30    # 47% of the frame vs 9%
+        if getattr(self, "approach", False) and lab == "center":   # walking toward it: the box grows 3x
+            half = 50 + (i - a) * 2
         return [(cx - half, 100, cx + half, 200, 0.9)]
 
 
@@ -103,11 +105,17 @@ def test_no_clips_skips_part_b(tmp_path, capsys):
 
 def test_hot_cold_pulses_per_second_and_sides(tmp_path):
     segs = ef.parse_labels(LABELS, tmp_path)[0]["segments"]
-    big = ef.score_clips(write(tmp_path), detector=Truth(segs), frames_for=frames_for)["all"]
+    steady = ef.score_clips(write(tmp_path), detector=Truth(segs), frames_for=frames_for)["all"]
     small = Truth(segs)
     small.small = True
-    cold = ef.score_clips(write(tmp_path), detector=small, frames_for=frames_for)["all"]
-    assert big["centered_pps"] >= 3.0 > cold["centered_pps"]       # bigger box = hotter
-    assert big["wrong_cue"] == 0.0 and big["off_side"] <= 15.0
-    assert ef.verdict(big)["centered_pps"] == "PASS" and ef.verdict(cold)["centered_pps"] == "FAIL"
+    small_steady = ef.score_clips(write(tmp_path), detector=small, frames_for=frames_for)["all"]
+    near = Truth(segs)
+    near.approach = True
+    approaching = ef.score_clips(write(tmp_path), detector=near, frames_for=frames_for)["all"]
+    # closeness is RELATIVE to the starting size: a big box and a small box held steady pulse the same,
+    # and walking toward the object is what speeds the pulses up
+    assert steady["centered_pps"] == small_steady["centered_pps"] >= 1.5
+    assert approaching["centered_pps"] > steady["centered_pps"] + 0.5
+    assert steady["wrong_cue"] == 0.0 and steady["off_side"] <= 15.0
+    assert ef.verdict(steady)["centered_pps"] == "PASS"
     assert ef.LEFT_MOTORS == {6, 7} and ef.RIGHT_MOTORS == {1, 2}

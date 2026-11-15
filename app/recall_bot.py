@@ -171,7 +171,7 @@ def _describe(a: dict) -> str:
             "name call, direction unclear (generic buzz)"
     elif a["source"] == "find":
         what = {"directional": f"turn {a.get('direction', '?')}", "centered": "centered",
-                "lost": "target lost"}.get(a.get("cue"), a.get("cue"))
+                "found": "reached it", "lost": "target lost"}.get(a.get("cue"), a.get("cue"))
         if a.get("target"):
             what = f"{a['target']}: {what}"
     elif a["source"] == "sound":

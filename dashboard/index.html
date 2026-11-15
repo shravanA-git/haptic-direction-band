@@ -389,6 +389,7 @@ const PHONE_CODES = {          // [on, off, on, ...] in ms
   urgent:  {ms: [400, 150, 400, 150, 400], say: "obstacle ahead: three long"},
   nudge:   {ms: [200],                     say: "attention, no clear side: one 200 ms"},
   ack:     {ms: [80],                      say: "got it, looking: one 80 ms"},
+  found:   {ms: [450, 100, 450, 100, 800], say: "reached it: long, long, longer"},
   lost:    {ms: [300, 200, 300],           say: "lost the object: two 300 ms"},
   unknown: {ms: [80, 80, 80, 80, 80],      say: "can't look for that: three quick"},
 };
@@ -397,7 +398,7 @@ const canVibrate = typeof navigator.vibrate === "function";
 // Tone per cue: pitch says what kind, stereo pan says which side. The iPhone
 // silent switch mutes these, so the flash is the primary signal there.
 const TONE_HZ = {front: 880, right: 660, left: 660, back: 440, urgent: 1250, nudge: 520,
-                 ack: 1000, lost: 330, unknown: 300};
+                 ack: 1000, found: 780, lost: 330, unknown: 300};
 const PAN = {right: 1, left: -1};
 let phoneBuzz = localStorage.getItem("hdb-phonebuzz") === "on";
 let audio = null;
@@ -449,7 +450,7 @@ function phoneCode(a) {          // an alert-log record -> PHONE_CODES key, or n
   if (a.source === "avoid" && a.cue === "generic") return "urgent";
   if (a.cue === "generic") return "nudge";
   if (a.cue === "centered") return "front";
-  if (["ack", "lost", "unknown"].includes(a.cue)) return a.cue;
+  if (["ack", "lost", "unknown", "found"].includes(a.cue)) return a.cue;
   if (a.motor === null || a.motor === undefined) return "nudge";
   return sideOf(a.motor);
 }

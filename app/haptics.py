@@ -24,6 +24,10 @@ TEST_MS = 150
 CENTERED_PULSE_MS = 100   # PROVISIONAL
 CENTERED_GAP_MS = 100     # PROVISIONAL (HDB-Protocol suggestion, not agreed)
 LOST_STEPS = [(0, FRONT, 600)]  # PROVISIONAL (HDB-Protocol suggestion, not agreed)
+# FOUND (find-an-object finished: centered and close for a second): a long, unmistakable pattern, played
+# once. Front with the left side, then front with the right side, then a long front. At most 2 motors
+# at once, every pulse <= 1000 ms. PROVISIONAL.
+FOUND_STEPS = [(0, FRONT, 450), (0, 6, 450), (550, FRONT, 450), (550, 2, 450), (1100, FRONT, 800)]
 # Teach a Sound: a sweep around the cardinals, so it can't be read as a side.
 SOUND_STEPS = [(0, 0, 80), (120, 2, 80), (240, 4, 80), (360, 6, 80)]  # PROVISIONAL
 # One pattern per sound category (app.listen.categorize), so the wearer can
@@ -77,6 +81,10 @@ def centered() -> Cue:
 
 def lost() -> Cue:
     return list(LOST_STEPS)
+
+
+def found() -> Cue:
+    return list(FOUND_STEPS)
 
 
 def taught_sound(category: str = None) -> Cue:

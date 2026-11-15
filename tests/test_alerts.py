@@ -56,7 +56,7 @@ def test_guide_reports_every_cue_with_latency():
     g.on_decision(D(state="left", confidence=0.8, target="banana", t=10.0), now=10.05)
     g.tick(now=11.4)                      # cold (no offset/size): next pulse after ~1.2 s
     g.on_decision(D(state="centered", confidence=0.9, target="banana", t=11.5), now=11.52)
-    g.on_decision(D(state="lost", confidence=0.0, target="banana", t=12.0), now=12.0)
+    g.on_decision(D(state="lost", confidence=0.0, target="banana", t=12.5), now=12.5)   # a real loss: > 0.7 s on
     assert [(k, m, i["repeat"]) for k, m, i in got] == [
         ("directional", 6, False), ("directional", 6, True), ("centered", None, False), ("lost", None, False)]
     assert got[0][2]["latency_ms"] == pytest.approx(50) and got[1][2]["latency_ms"] is None

@@ -86,7 +86,8 @@ TARGETS = {
     "seen_open": (">=", 60.0),
     "side_acc": (">=", 95.0),
     "wrong_cue": ("<=", 2.0),
-    "centered_pps": (">=", 3.0),      # hot/cold: pulses/s while held centered
+    "centered_pps": (">=", 1.5),      # hot/cold: pulses/s while held centered at a steady distance
+                                      # (closeness is relative to the starting size: ~1.7/s steady, up to 5/s approaching)
     "cue_s": ("<=", 0.5),
     "lost_s": ("<=", 2.5),
     "flips_min": ("<=", 6.0),
