@@ -1,4 +1,4 @@
-# Haptic Direction Band
+# PulsePath (Haptic Direction Band)
 
 **An assistive headband that turns vision and sound into touch.** A webcam, four microphones, four vibration
 motors and a touch pad on a hat, connected over USB to a laptop that does the heavy thinking.
